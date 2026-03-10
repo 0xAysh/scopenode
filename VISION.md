@@ -543,34 +543,42 @@ If user action is required, say exactly what command to run.
 
 ## What we build in (rough order)
 
-Core pipeline (correctness first):
+Phase 1 — MVP (RPC-backed, correct pipeline):
 1. Block header parsing — using `alloy` types and RLP support.
 2. Bloom filter scan — using `alloy`'s bloom filter from parsed headers.
-3. Beacon light client — sync headers trustlessly via sync committee (`helios` or `lighthouse` crates).
-4. Portal Network client — fetch receipts via `ethportal-api` / `trin` crates or compatible libraries.
-5. Merkle verification — verify `receiptsRoot` proofs using `alloy`'s trie utilities.
-6. ABI decoding — decode event logs using `alloy-sol-types` / `alloy-dyn-abi`.
-7. SQLite storage layer — store verified events with `reorged`, `source`, `block_hash` columns.
-8. JSON-RPC server — serve data at `localhost:8545`.
+3. Parallel receipt fetching — `buffer_unordered(32)` + batch consecutive blocks.
+4. Merkle verification — verify `receiptsRoot` proofs using `alloy`'s trie utilities.
+5. ABI decoding — decode event logs using `alloy-sol-types` / `alloy-dyn-abi`.
+6. SQLite storage layer — store verified events with `reorged`, `source`, `block_hash` columns.
+7. JSON-RPC server — serve data at `localhost:8545`.
+8. Progress TUI — real numbers, ETA, pipeline stages.
+9. Resumable sync — store cursor in SQLite, resume on restart.
+10. `--dry-run` — bloom scan only, report estimate before committing to full sync.
+11. `scopenode status` — show what's indexed, sync state, DB size.
+12. `scopenode query` — query local data from terminal.
 
-Reliability:
-10. Reorg handler — detect chain splits during live sync, soft-invalidate affected events.
-11. Portal Network fallback — retry logic, optional `fallback_rpc` with continued Merkle verification.
-12. Proxy contract detector — EIP-1967 storage slot check, ABI redirect.
-13. Live sync — watch new blocks in real-time, reorg-aware.
+Phase 2 — Trustless (no API keys required):
+13. Beacon light client — sync headers trustlessly via sync committee (`helios`, pinned version behind `HeaderSource` trait).
+14. Portal Network client — fetch receipts via `ethportal-api` / `trin` crates.
+15. ERA1 archive support — local flat-file fallback for historical blocks Portal can't serve.
+16. Fallback RPC — optional last resort, still Merkle-verified.
+17. Proxy contract detector — EIP-1967 storage slot check, ABI redirect.
+18. `scopenode validate` — catch config errors before a long sync starts.
+19. `scopenode abi` — show available events for a contract.
 
-Developer experience:
-14. Progress TUI — real numbers, ETA, pipeline stages, peer count, events found.
-15. Resumable sync — store cursor in SQLite, resume on restart.
-16. `--dry-run` — bloom scan only, report estimate before committing to full sync.
-17. `scopenode validate` — catch config errors before a long sync starts.
-18. `scopenode status` — show what's indexed, sync state, DB size.
-19. `scopenode query` — query local data from terminal, export CSV/JSON/Parquet.
-20. REST API at `:8546` — `GET /events`, `GET /status`, `GET /stream/events` (SSE).
-21. Webhook support — POST new events to a URL during live sync.
+Phase 3a — Reliability (production-grade core):
+20. Live sync — watch new blocks in real-time after historical sync completes.
+21. Reorg handler — detect chain splits, soft-invalidate affected events.
 22. `scopenode doctor` — diagnose peers, beacon health, DB integrity.
-23. `scopenode init` — interactive wizard, generates config.toml.
-24. Claude API integration — optional, natural language → TOML config.
+23. `scopenode retry` — re-fetch all pending_retry blocks.
+24. Full progress TUI refinement — peer count, events found, speed.
+
+Phase 3b — Developer surface area (additive features):
+25. REST API at `:8546` — `GET /events`, `GET /status`, `GET /stream/events` (SSE).
+26. Webhook support — POST new events to a URL during live sync.
+27. `scopenode init` — interactive wizard, generates config.toml.
+28. `scopenode export` — CSV/JSON/Parquet output.
+29. Claude API integration — optional, natural language → TOML config (last priority).
 
 ---
 
@@ -652,27 +660,51 @@ is being used.
 
 ---
 
-## Portal Network fallback
+## Data source fallback chain
 
 Portal Network is real but peer availability is uneven, especially for older
-historical data. We don't paper over this — we handle it explicitly.
+historical data. We don't paper over this — we handle it with a layered
+fallback chain. Every source feeds into the same Merkle verification step.
 
-Strategy:
-1. Request from Portal peers, retry up to 3 different peers
-2. If all fail: log a warning, record the block as `pending_retry`
-3. Optional: `fallback_rpc` in config — if set, use it for failed blocks only
+Strategy (tried in order per block):
+1. Portal Network peers — retry up to 3 different peers
+2. ERA1 archives — if `era1_dir` is configured and the block falls within a
+   locally available archive file
+3. `fallback_rpc` — if configured, used as last resort
+4. If all fail: log a warning, record the block as `pending_retry`
+
+### ERA1 archives
+
+ERA1 files are flat-file archives of historical Ethereum data published by the
+Ethereum Foundation. Each file covers ~8192 blocks and contains headers, block
+bodies, and receipts. The files are checksummed and available via HTTP mirrors,
+BitTorrent, and IPFS.
+
+ERA1 solves the biggest gap in Portal Network coverage: old historical data.
+Portal peers may not serve blocks from 2020, but an ERA1 file downloaded once
+covers that range forever. Fully offline after download, no peers needed.
+
+Verification is identical: extract receipts from the ERA1 file, rebuild the
+Merkle Patricia Trie, check root against the header's `receiptsRoot`. Same
+math, different transport.
 
 ```toml
 [node]
 port = 8545
-fallback_rpc = "https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY"  # optional
+era1_dir = "~/.scopenode/era1"  # optional, local ERA1 archive directory
+fallback_rpc = "https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY"  # optional, last resort
 ```
 
-When fallback is used, mark that receipt as `source = "rpc"` vs `source = "portal"`
-in an internal log. The verification step (Merkle check) still runs regardless
-of source — we verify everything.
+Every receipt is tagged with its source: `source = "portal"`, `source = "era1"`,
+or `source = "rpc"`. The `scopenode status` output shows the breakdown:
 
-The goal: never silently miss events. Either verify + store, or loudly fail.
+```
+Sources: 38,412 blocks from Portal (94%)  |  2,100 from ERA1 (5%)  |  419 from RPC (1%)
+```
+
+The verification step (Merkle check) runs regardless of source — we verify
+everything. The goal: never silently miss events. Either verify + store, or
+loudly fail.
 
 ---
 
