@@ -12,6 +12,33 @@ This phase also adds proxy contract detection and the `scopenode validate` /
 
 ---
 
+## Staging environment
+
+The `--data-dir` flag and `SCOPENODE_DATA_DIR` env var are inherited from
+Phase 1. Use them throughout this phase.
+
+Add Phase 2 fields to `config.test.toml` for testing trustless sources:
+
+```toml
+# config.test.toml additions for Phase 2
+[node]
+port = 8545
+data_dir = "~/.scopenode-staging"
+consensus_rpc = "https://www.lightclientdata.org"  # free public beacon API
+# portal_rpc = "http://localhost:8547"             # if running trin locally
+# era1_dir = "~/.scopenode-staging/era1"           # if testing ERA1 fallback
+fallback_rpc = "https://eth.llamarpc.com"          # last-resort during testing
+```
+
+Snapshot the staging DB before switching header source from RPC to Helios —
+makes it easy to roll back if the beacon sync takes too long or errors:
+
+```bash
+cp ~/.scopenode-staging/scopenode.db ~/.scopenode-staging/pre-helios.db.snap
+```
+
+---
+
 ## What changes from Phase 1
 
 | Component | Phase 1 | Phase 2 |

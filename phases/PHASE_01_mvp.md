@@ -8,6 +8,7 @@ at `localhost:8545` — a real, usable tool. We use standard Ethereum RPC for
 headers and receipts here (Helios + Portal Network come in Phase 2).
 
 **What "done" looks like:**
+
 ```bash
 scopenode sync config.toml
 # syncs Uniswap V3 Swap events, stores in SQLite
@@ -22,23 +23,125 @@ cast logs --rpc-url http://localhost:8545 \
 
 ---
 
+## Staging environment (implement this first, before any pipeline code)
+
+Before writing pipeline logic, wire in the staging environment so every
+feature can be tested safely — isolated from any future production data.
+
+### What "staging" means here
+
+SQLite is a single file. A staging environment is just a different directory:
+
+```
+~/.scopenode/          ← production (never touch during development)
+~/.scopenode-staging/  ← staging (blow away freely)
+```
+
+### How to switch environments
+
+Two mechanisms, applied in order (last wins):
+1. `data_dir` in config file
+2. `--data-dir` CLI flag (overrides config)
+3. `SCOPENODE_DATA_DIR` env var (overrides flag)
+
+```bash
+# staging — explicit flag
+scopenode sync config.test.toml --data-dir ~/.scopenode-staging
+
+# staging — env var (useful in scripts)
+SCOPENODE_DATA_DIR=~/.scopenode-staging scopenode sync config.test.toml
+
+# production (no flag needed — data_dir in config or default)
+scopenode sync config.toml
+```
+
+### `config.test.toml`
+
+Keep this file in the repo root. Add to `.gitignore` if it contains API keys.
+
+```toml
+# config.test.toml — small range, fast to sync
+[node]
+port = 8545
+data_dir = "~/.scopenode-staging"
+
+[[contracts]]
+name = "Uniswap V3 ETH/USDC (test)"
+address = "0x8ad599c3A0ff1De082011EFDDc58f1908eb6e6D8"
+events = ["Swap", "Mint", "Burn"]
+from_block = 17000000
+to_block = 17000100   # 100 blocks — completes in ~30 seconds
+```
+
+### Snapshot and restore
+
+SQLite is a single file — snapshot = `cp`. Use this before any test that
+mutates data or before trying a schema change.
+
+```bash
+# Save current state
+cp ~/.scopenode-staging/scopenode.db ~/.scopenode-staging/scopenode.db.snap
+
+# Restore to saved state
+cp ~/.scopenode-staging/scopenode.db.snap ~/.scopenode-staging/scopenode.db
+
+# Clean slate
+rm ~/.scopenode-staging/scopenode.db
+```
+
+`scopenode snapshot` / `scopenode restore` are added as proper CLI commands
+in Phase 3a. For now, the `cp` workflow is sufficient.
+
+### `.gitignore` additions
+
+```
+config.test.toml          # may contain API keys
+*.db                      # never commit SQLite files
+*.db.snap                 # never commit snapshots
+.env
+```
+
+### Typical dev workflow
+
+```bash
+# 1. Sync a small test range (fast)
+scopenode sync config.test.toml
+
+# 2. Verify events stored correctly
+scopenode status
+scopenode query --limit 5
+
+# 3. Test the RPC server
+scopenode serve config.test.toml &
+cast logs --rpc-url http://localhost:8545 \
+  --address 0x8ad599c3... \
+  --from-block 17000000 --to-block 17000100
+
+# 4. Need a clean slate? Just delete the staging DB
+rm ~/.scopenode-staging/scopenode.db
+```
+
+---
+
 ## Stack decisions
 
-| Concern | Choice | Why |
-|---|---|---|
-| Ethereum types | `alloy` | Standard across reth, lighthouse ecosystem |
-| Header + receipt source | `alloy` provider (public RPC) | Simple for MVP, replaced in Phase 2 |
-| ABI decoding | `alloy-dyn-abi` | Runtime decoding for arbitrary ABIs |
-| Merkle verification | `alloy-trie` | Same as reth — well-tested |
-| Storage | `sqlx` + SQLite | Zero setup, excellent for local read-heavy workloads |
-| JSON-RPC server | `jsonrpsee` | Standard in the Rust Ethereum ecosystem |
-| Async | `tokio` | The standard |
-| CLI | `clap` v4 | Derive API, clean |
-| Progress | `indicatif` | The standard progress bar library |
-| HTTP client | `reqwest` | For Etherscan ABI fetching |
-| Error handling | `thiserror` (libs) + `anyhow` (binary) | Standard pattern |
-| Logging | `tracing` + `tracing-subscriber` | Async-aware, structured |
-| Config | `serde` + `toml` | Standard |
+
+| Concern                 | Choice                                 | Why                                                  |
+| ----------------------- | -------------------------------------- | ---------------------------------------------------- |
+| Ethereum types          | `alloy`                                | Standard across reth, lighthouse ecosystem           |
+| Header + receipt source | `alloy` provider (public RPC)          | Simple for MVP, replaced in Phase 2                  |
+| ABI decoding            | `alloy-dyn-abi`                        | Runtime decoding for arbitrary ABIs                  |
+| Merkle verification     | `alloy-trie`                           | Same as reth — well-tested                           |
+| Storage                 | `sqlx` + SQLite                        | Zero setup, excellent for local read-heavy workloads |
+| JSON-RPC server         | `jsonrpsee`                            | Standard in the Rust Ethereum ecosystem              |
+| Async                   | `tokio`                                | The standard                                         |
+| CLI                     | `clap` v4                              | Derive API, clean                                    |
+| Progress                | `indicatif`                            | The standard progress bar library                    |
+| HTTP client             | `reqwest`                              | For Etherscan ABI fetching                           |
+| Error handling          | `thiserror` (libs) + `anyhow` (binary) | Standard pattern                                     |
+| Logging                 | `tracing` + `tracing-subscriber`       | Async-aware, structured                              |
+| Config                  | `serde` + `toml`                       | Standard                                             |
+
 
 ---
 
@@ -147,8 +250,7 @@ use std::path::PathBuf;
 use url::Url;
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Config {
+#[serde(deny_unknown_fields)]wpub struct Config {
     pub node: NodeConfig,
     pub contracts: Vec<ContractConfig>,
 }
@@ -214,17 +316,17 @@ Ethereum block headers are ~500 bytes. The two fields that drive our entire
 pipeline:
 
 - `logs_bloom` (256 bytes) — a 2048-bit bloom filter that compactly represents
-  every address and topic that emitted an event in this block. We use this to
-  skip 85-90% of blocks without making any network call.
-
+every address and topic that emitted an event in this block. We use this to
+skip 85-90% of blocks without making any network call.
 - `receipts_root` (32 bytes) — the Merkle Patricia Trie root of all receipts in
-  this block. We verify fetched receipts against this root to prove they're real.
+this block. We verify fetched receipts against this root to prove they're real.
 
 Both fields are in the `alloy::rpc::types::Header` type. We store them in SQLite.
 
 ### Bloom filters (the math)
 
 A Bloom filter is a 2048-bit array. To add an item:
+
 1. `keccak256(item)` → 32 bytes
 2. Take bytes `[0,1]`, `[2,3]`, `[4,5]` → 3 pairs → each `mod 2048` → 3 bit positions
 3. Set those 3 bits to 1
@@ -233,6 +335,7 @@ To check membership: compute the same 3 positions. If all 3 are 1 → might be p
 If any is 0 → definitely not present.
 
 Ethereum's `logsBloom` in each header is built by running this algorithm for:
+
 - Every contract address that emitted any log
 - Every topic (indexed param) of every log
 
@@ -245,6 +348,7 @@ positives (~15%). 100x speedup over fetching every block's receipts.
 ### ABI encoding and event logs
 
 Solidity events are stored in Ethereum logs. Each log has:
+
 - `address` — the contract that emitted it
 - `topics` — up to 4 × 32-byte words
   - `topics[0]` is always `keccak256("EventName(type1,type2,...)")` — the "event selector"
@@ -252,6 +356,7 @@ Solidity events are stored in Ethereum logs. Each log has:
 - `data` — ABI-encoded non-indexed parameters
 
 ABI encoding (for non-indexed params in `data`):
+
 - Fixed-size types (uint256, address, bool, bytes32) → 32-byte word, left-padded
 - Dynamic types (string, bytes, arrays) → 32-byte offset pointer, then length, then data
 
@@ -260,6 +365,7 @@ ABI encoding (for non-indexed params in `data`):
 ### Merkle Patricia Trie (receipts_root)
 
 The `receipts_root` is the root hash of a Merkle Patricia Trie where:
+
 - Keys: RLP-encoded transaction indices (0, 1, 2, ...)
 - Values: RLP-encoded receipts
 
@@ -659,6 +765,10 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
 
+    /// Override data directory from config (also: SCOPENODE_DATA_DIR env var)
+    #[arg(long, global = true, env = "SCOPENODE_DATA_DIR")]
+    pub data_dir: Option<PathBuf>,
+
     #[arg(short, long, global = true, action = ArgAction::Count)]
     pub verbose: u8,
 
@@ -684,6 +794,20 @@ pub enum Command {
         #[arg(long, default_value = "table")] output: String,
     },
 }
+```
+
+In `main.rs`, after loading config, apply the override before opening the DB:
+
+```rust
+// Apply CLI/env data_dir override (takes precedence over config file)
+if let Some(dir) = cli.data_dir {
+    config.node.data_dir = Some(dir);
+}
+let data_dir = config.node.data_dir
+    .clone()
+    .unwrap_or_else(|| dirs::home_dir().unwrap().join(".scopenode"));
+std::fs::create_dir_all(&data_dir)?;
+let db = Db::open(data_dir.join("scopenode.db")).await?;
 ```
 
 ### Progress display
@@ -721,6 +845,8 @@ Unit tests:
   - Config parses valid TOML
   - Config rejects unknown fields
   - Config catches invalid block ranges
+  - CLI --data-dir overrides config data_dir
+  - SCOPENODE_DATA_DIR env var overrides --data-dir
   - BloomTarget.matches() — true when address + topic present
   - BloomTarget.matches() — false when address absent
   - BloomTarget.matches() — false when no topics match
@@ -728,6 +854,12 @@ Unit tests:
   - verify_receipts() — fails on tampered receipts
   - EventAbi.topic0() — correct keccak256 for known events
   - EventAbi.signature() — correct canonical form
+
+Staging smoke tests (run against ~/.scopenode-staging, fast):
+  - scopenode sync config.test.toml completes without error
+  - Events stored match expected count for known block range
+  - Sync is resumable: interrupt halfway, re-run, picks up from cursor
+  - scopenode status shows correct event counts after sync
 
 Integration tests (require network, --ignored):
   - Sync 10 blocks of Uniswap V3, verify event count matches Etherscan
@@ -738,16 +870,18 @@ Integration tests (require network, --ignored):
 
 ## Definition of done
 
-- [ ] `cargo build` passes with zero warnings (`#![deny(warnings)]`)
-- [ ] `cargo test` passes (all non-network tests)
-- [ ] `cargo clippy -- -D warnings` passes
-- [ ] `scopenode sync config.toml --dry-run` shows bloom estimate and asks to confirm
-- [ ] `scopenode sync config.toml` syncs 100 blocks end-to-end
-- [ ] Events stored in SQLite match what Etherscan shows for those blocks
-- [ ] `eth_getLogs` via `cast` or viem returns correct events from local SQLite
-- [ ] Sync is resumable: interrupt and re-run, picks up where it left off
-- [ ] Error messages are human-readable (no hex dumps, no Rust panic output)
-- [ ] `scopenode status` shows indexed contracts and event counts
+- `cargo build` passes with zero warnings (`#![deny(warnings)]`)
+- `cargo test` passes (all non-network tests)
+- `cargo clippy -- -D warnings` passes
+- `--data-dir` and `SCOPENODE_DATA_DIR` correctly override config `data_dir`
+- `config.test.toml` exists and works against `~/.scopenode-staging`
+- `scopenode sync config.test.toml --dry-run` shows bloom estimate and confirms before proceeding
+- `scopenode sync config.test.toml` syncs 100 blocks end-to-end against staging dir
+- Events stored in staging SQLite match what Etherscan shows for those blocks
+- `eth_getLogs` via `cast` or viem returns correct events from staging node
+- Sync is resumable: interrupt and re-run, picks up where it left off
+- Error messages are human-readable (no hex dumps, no Rust panic output)
+- `scopenode status` shows indexed contracts and event counts
 
 ---
 

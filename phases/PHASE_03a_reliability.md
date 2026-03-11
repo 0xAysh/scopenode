@@ -13,13 +13,41 @@ everything is healthy.
 
 ---
 
+## Staging environment
+
+The `--data-dir` / `SCOPENODE_DATA_DIR` setup from Phase 1 continues to apply.
+Add a live-sync entry to `config.test.toml` for testing:
+
+```toml
+# config.test.toml — live sync test contract (low volume)
+[[contracts]]
+name = "Uniswap V3 ETH/USDC (live test)"
+address = "0x8ad599c3A0ff1De082011EFDDc58f1908eb6e6D8"
+events = ["Swap"]
+from_block = 17000000
+# no to_block = live sync
+```
+
+To test reorg handling safely against staging: snapshot before the test,
+inject a synthetic reorg via the DB (flip a block hash), verify detection
+and recovery, then restore.
+
+```bash
+cp ~/.scopenode-staging/scopenode.db ~/.scopenode-staging/pre-reorg-test.db.snap
+# ... run reorg test ...
+cp ~/.scopenode-staging/pre-reorg-test.db.snap ~/.scopenode-staging/scopenode.db
+```
+
+---
+
 ## What we build
 
 1. **Live sync** — watch new blocks after historical sync completes
 2. **Reorg handling** — detect chain splits, soft-delete affected events
-3. **`scopenode doctor`** — diagnose peers, beacon health, DB integrity
-4. **`scopenode retry`** — re-fetch all `pending_retry` blocks
-5. **Full progress TUI refinement** — peer count, events found, speed, source breakdown
+3. **`scopenode snapshot` / `scopenode restore`** — proper CLI for DB snapshots
+4. **`scopenode doctor`** — diagnose peers, beacon health, DB integrity
+5. **`scopenode retry`** — re-fetch all `pending_retry` blocks
+6. **Full progress TUI refinement** — peer count, events found, speed, source breakdown
 
 ---
 
@@ -179,6 +207,103 @@ pub enum ReorgStatus {
     Reorg { orphaned: Vec<B256>, new_chain: Vec<ScopeHeader> },
 }
 ```
+
+### `scopenode snapshot` / `scopenode restore` commands
+
+Promote the manual `cp` workflow from Phase 1 into proper CLI commands.
+These are thin wrappers — no special format, just a timestamped copy of
+the SQLite file.
+
+```rust
+// crates/scopenode/src/commands/snapshot.rs
+
+pub async fn snapshot(data_dir: &Path, label: Option<String>) -> Result<()> {
+    let db_path = data_dir.join("scopenode.db");
+    if !db_path.exists() {
+        return Err(anyhow::anyhow!("No database at {}", db_path.display()));
+    }
+
+    let label = label.unwrap_or_else(|| {
+        chrono::Local::now().format("%Y%m%d_%H%M%S").to_string()
+    });
+    let snap_path = data_dir.join(format!("scopenode.{label}.snap"));
+
+    std::fs::copy(&db_path, &snap_path)?;
+    println!("Snapshot saved: {}", snap_path.display());
+    Ok(())
+}
+
+pub async fn restore(data_dir: &Path, label: Option<String>) -> Result<()> {
+    let snaps = list_snapshots(data_dir)?;
+
+    let snap_path = if let Some(label) = label {
+        data_dir.join(format!("scopenode.{label}.snap"))
+    } else {
+        // No label — show list and prompt
+        if snaps.is_empty() {
+            println!("No snapshots found in {}", data_dir.display());
+            return Ok(());
+        }
+        println!("Available snapshots:");
+        for (i, s) in snaps.iter().enumerate() {
+            println!("  [{i}] {}", s.display());
+        }
+        // prompt user to pick one
+        let idx: usize = dialoguer::Select::new()
+            .with_prompt("Restore which snapshot?")
+            .items(&snaps.iter().map(|p| p.display().to_string()).collect::<Vec<_>>())
+            .interact()?;
+        snaps[idx].clone()
+    };
+
+    if !snap_path.exists() {
+        return Err(anyhow::anyhow!("Snapshot not found: {}", snap_path.display()));
+    }
+
+    let db_path = data_dir.join("scopenode.db");
+    // Auto-snapshot current DB before overwriting
+    if db_path.exists() {
+        let auto = data_dir.join("scopenode.before_restore.snap");
+        std::fs::copy(&db_path, &auto)?;
+        println!("Auto-snapshot of current DB: {}", auto.display());
+    }
+
+    std::fs::copy(&snap_path, &db_path)?;
+    println!("Restored from: {}", snap_path.display());
+    Ok(())
+}
+
+fn list_snapshots(data_dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut snaps: Vec<_> = std::fs::read_dir(data_dir)?
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".snap"))
+        .map(|e| e.path())
+        .collect();
+    snaps.sort();
+    Ok(snaps)
+}
+```
+
+CLI additions:
+
+```rust
+// Add to Command enum in cli.rs
+
+/// Save a snapshot of the current database
+Snapshot {
+    /// Optional label (default: timestamp)
+    #[arg(long)]
+    label: Option<String>,
+},
+/// Restore database from a snapshot
+Restore {
+    /// Snapshot label to restore (omit to pick interactively)
+    #[arg(long)]
+    label: Option<String>,
+},
+```
+
+---
 
 ### `scopenode doctor` command
 
@@ -365,6 +490,8 @@ Integration (--ignored):
 - [ ] Live sync runs indefinitely in background after historical sync
 - [ ] Reorg detected and handled: orphaned events marked `reorged = 1`, hidden
   from all query interfaces
+- [ ] `scopenode snapshot` saves a timestamped copy of the DB
+- [ ] `scopenode restore` restores from a snapshot (auto-snapshots current DB first)
 - [ ] `scopenode doctor` shows portal, beacon, ERA1, DB, and network status
 - [ ] `scopenode retry` re-fetches all `pending_retry` blocks
 - [ ] Progress TUI shows source breakdown (Portal / ERA1 / RPC)

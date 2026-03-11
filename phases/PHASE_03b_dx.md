@@ -12,6 +12,23 @@ SSE and webhooks depend on the live event broadcast channel).
 
 ---
 
+## Staging environment
+
+All features in this phase are testable against `~/.scopenode-staging` using
+`--data-dir` / `SCOPENODE_DATA_DIR`. Before testing the init wizard or export
+commands against staging, snapshot the DB:
+
+```bash
+scopenode snapshot --label before-3b-test
+# ... test ...
+scopenode restore --label before-3b-test  # if needed
+```
+
+The `scopenode init` wizard should default to `~/.scopenode-staging` when
+`SCOPENODE_DATA_DIR` is set, making it safe to run interactively in dev.
+
+---
+
 ## What we build
 
 1. **REST API at `:8546`** — `GET /events`, `GET /status`, `GET /contracts`, SSE stream
