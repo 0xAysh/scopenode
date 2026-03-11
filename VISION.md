@@ -61,18 +61,9 @@ Example users:
 
 ## How it works (the pipeline)
 
-### Input — natural language or TOML
+### Input — TOML config
 
-User can describe what they want in plain English:
-
-```bash
-scopenode -m "Give me all Swap events from 0x8ad599c3... from block 17000000 to 17555000"
-```
-
-Claude API parses the intent, looks up the ABI from Etherscan, generates a
-config, confirms with the user, then starts syncing.
-
-Or they can write the TOML directly:
+Write a TOML config file describing what you want:
 
 ```toml
 [node]
@@ -85,6 +76,9 @@ events = ["Swap", "Mint", "Burn"]
 from = "17000000"
 to = "17555000"
 ```
+
+Alternatively, use `scopenode init` — an interactive wizard that asks
+questions and generates the config for you.
 
 ### Step 1 — Header Sync
 
@@ -114,9 +108,9 @@ blocks that turn out empty, but we never miss a block that matters.
 
 ### Step 3 — Receipt Fetching (contract mode)
 
-For each block that passed the bloom scan, request full receipts from Portal
-Network peers — a purpose-built P2P network for serving historical Ethereum data
-without running a full node.
+For each block that passed the bloom scan, request full receipts from devp2p
+peers — full nodes on the main Ethereum P2P network via the ETH wire protocol
+(`GetReceipts` message).
 
 This is the slow step. A block's receipts contain the result of every
 transaction: gas used, success/fail, and every log (event) emitted.
@@ -153,7 +147,7 @@ Receipts verified. Now scan all logs inside them. Keep only:
 ### Step 6 — ABI Decoding + Storage
 
 Raw log data is ABI-encoded binary. Decode it using the ABI fetched from
-Etherscan into named, typed fields. Store in SQLite with full context
+Sourcify into named, typed fields. Store in SQLite with full context
 (block number, tx hash, decoded fields).
 
 ### Step 7 — JSON-RPC Server
@@ -180,13 +174,10 @@ background forever.
 ## Architecture diagram
 
 ```
-Natural language / TOML config
+TOML config
          |
          v
-   [Claude API]  <-- parse intent, resolve names, generate config
-         |
-         v
-   [Etherscan]  <-- fetch ABI once (event signatures, param types)
+   [Sourcify]  <-- fetch ABI once (event signatures, param types)
          |
          v
 +--------+--------+
@@ -203,7 +194,7 @@ Natural language / TOML config
          |
          v
 +--------+--------+
-| Receipt Fetcher |  <-- Portal Network (P2P, no RPC provider)
+| Receipt Fetcher |  <-- devp2p (ETH wire protocol)
 |  (matching      |
 |   blocks only)  |
 +--------+--------+
@@ -244,19 +235,16 @@ Install is a single command:
 cargo install scopenode
 ```
 
-Then either:
+Then either write a `config.toml` directly, or use the init wizard:
 ```bash
-# natural language (requires ANTHROPIC_API_KEY)
-scopenode -m "Give me all Swap events from Uniswap V3 ETH/USDC from block 17000000 to now"
-
-# or init wizard — asks questions, generates config.toml
+# interactive wizard — asks questions, generates config.toml
 scopenode init
 ```
 
 `scopenode init` walks through:
 - Contract address (validates format)
 - Auto-detects if it's a proxy, shows the implementation
-- Fetches ABI from Etherscan, lists available events, lets you pick
+- Fetches ABI from Sourcify, lists available events, lets you pick
 - Block range (with human labels: "last 30 days", "all time", or specific blocks)
 - Writes `config.toml` and asks "start syncing now? [Y/n]"
 
@@ -296,7 +284,7 @@ Dry run complete for Uniswap V3 ETH/USDC (0x8ad599c3...)
   Bloom matches:   48,231 blocks (8.7% hit rate)
   False positives: ~15% estimated (bloom filter)
   Net fetches:     ~41,000 receipt fetches needed
-  Estimated time:  2.1 – 3.4 hours (Portal Network, 4 peers)
+  Estimated time:  2.1 – 3.4 hours (devp2p, 4 peers)
   Estimated events: unknown until fetched
 
 Start sync? [Y/n]
@@ -451,7 +439,7 @@ Contracts indexed:
     Status: syncing... (78% — ETA 42min)
 
 Node:  localhost:8545 (JSON-RPC)  |  localhost:8546 (REST)
-Peers: 6 Portal Network peers
+Peers: 6 devp2p peers
 DB:    /Users/you/.scopenode/data.db (286 MB)
 ```
 
@@ -464,11 +452,11 @@ scopenode validate config.toml
 
 ✓ Contract address format valid: 0x8ad599c3...
 ✓ Proxy detected → using implementation ABI (0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640)
-✓ ABI fetched from Etherscan (4 events: Swap, Mint, Burn, Flash)
+✓ ABI fetched from Sourcify (4 events: Swap, Mint, Burn, Flash)
 ✓ Requested events found in ABI: Swap ✓  Mint ✓  Burn ✓
 ✓ Block range valid: 17000000 → 17555000
 ✗ from_block 17000000 is before Uniswap V3 deploy (block 12369621) — range is valid but will return no events before 12369621
-! fallback_rpc not set — Portal peer failures will leave blocks as pending_retry
+! fallback_rpc not set — devp2p peer failures will leave blocks as pending_retry
 
 Config looks good. Run `scopenode sync config.toml` to start.
 ```
@@ -480,7 +468,7 @@ Config looks good. Run `scopenode sync config.toml` to start.
 ```bash
 scopenode doctor
 
-Portal Network connectivity
+devp2p connectivity
   Peers discovered:   12
   Peers responsive:   9 / 12
   Receipt fetch test: ✓ (block 17000001, 340ms)
@@ -496,8 +484,8 @@ Database
   Pending retry:      3 blocks
 
 Network
-  Portal bootstrap:   ✓ connected
-  Etherscan API:      ✓ reachable
+  devp2p bootstrap:   ✓ connected
+  Sourcify API:       ✓ reachable
   Fallback RPC:       not configured
 
 All systems operational.
@@ -558,9 +546,9 @@ Phase 1 — MVP (RPC-backed, correct pipeline):
 12. `scopenode query` — query local data from terminal.
 
 Phase 2 — Trustless (no API keys required):
-13. Beacon light client — sync headers trustlessly via sync committee (`helios`, pinned version behind `HeaderSource` trait).
-14. Portal Network client — fetch receipts via `ethportal-api` / `trin` crates.
-15. ERA1 archive support — local flat-file fallback for historical blocks Portal can't serve.
+13. Beacon light client (live sync only) — Helios, multiple consensus endpoints, required agreement before accepting headers.
+14. devp2p networking — `reth-network` + `reth-eth-wire` for `GetReceipts` from mainnet peers.
+15. ERA1 archive support — local flat-file fallback for historical blocks devp2p peers can't serve.
 16. Fallback RPC — optional last resort, still Merkle-verified.
 17. Proxy contract detector — EIP-1967 storage slot check, ABI redirect.
 18. `scopenode validate` — catch config errors before a long sync starts.
@@ -578,7 +566,6 @@ Phase 3b — Developer surface area (additive features):
 26. Webhook support — POST new events to a URL during live sync.
 27. `scopenode init` — interactive wizard, generates config.toml.
 28. `scopenode export` — CSV/JSON/Parquet output.
-29. Claude API integration — optional, natural language → TOML config (last priority).
 
 ---
 
@@ -606,8 +593,8 @@ We use reliable, battle-tested libraries for all lower-level primitives.
 | ABI decoding | `alloy-dyn-abi` / `alloy-sol-types` | Decode event logs into named fields |
 | Bloom filter | `alloy` (via `Header::logs_bloom`) | Already in the header type |
 | Merkle Patricia Trie | `alloy-trie` | Verify `receiptsRoot` proofs |
-| Beacon light client | `helios` | Trustless header sync via sync committee |
-| Portal Network | `ethportal-api` / `trin` crates | P2P receipt fetching |
+| Beacon light client | `helios` | Trustless header sync via sync committee (live sync only) |
+| devp2p networking | `reth-network` + `reth-eth-wire` + `reth-discv4` | devp2p peer management + ETH wire protocol + peer discovery |
 | Keccak256 / BLS | `sha3`, `lighthouse` BLS crates | Never roll your own crypto |
 | SQLite | `sqlx` with `sqlite` feature | Async, compile-time checked queries |
 | JSON-RPC server | `jsonrpsee` | Standard in the Rust Ethereum ecosystem |
@@ -646,13 +633,13 @@ Detection:
 - Read EIP-1967 storage slot `0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc`
   from the proxy address at any recent block
 - If non-zero, that 32-byte value (last 20 bytes) is the implementation address
-- Fetch the implementation's ABI from Etherscan instead
+- Fetch the implementation's ABI from Sourcify instead
 
-Config override (for non-standard proxies or unverified contracts):
+Config override (for non-standard proxies or contracts not on Sourcify):
 ```toml
 [[contracts]]
 address = "0x..."
-abi_override = "./abis/MyContract.json"   # local file, bypasses Etherscan
+abi_override = "./abis/MyContract.json"   # local file, bypasses Sourcify
 ```
 
 Warn the user in the CLI when a proxy is detected and which implementation ABI
@@ -662,12 +649,13 @@ is being used.
 
 ## Data source fallback chain
 
-Portal Network is real but peer availability is uneven, especially for older
-historical data. We don't paper over this — we handle it with a layered
-fallback chain. Every source feeds into the same Merkle verification step.
+devp2p peer availability is uneven for older historical data — non-archive
+nodes prune old receipts. We don't paper over this — we handle it with a
+layered fallback chain. Every source feeds into the same Merkle verification
+step.
 
 Strategy (tried in order per block):
-1. Portal Network peers — retry up to 3 different peers
+1. devp2p peers (mainnet full nodes, ETH wire protocol) — retry up to 3 different peers
 2. ERA1 archives — if `era1_dir` is configured and the block falls within a
    locally available archive file
 3. `fallback_rpc` — if configured, used as last resort
@@ -680,9 +668,9 @@ Ethereum Foundation. Each file covers ~8192 blocks and contains headers, block
 bodies, and receipts. The files are checksummed and available via HTTP mirrors,
 BitTorrent, and IPFS.
 
-ERA1 solves the biggest gap in Portal Network coverage: old historical data.
-Portal peers may not serve blocks from 2020, but an ERA1 file downloaded once
-covers that range forever. Fully offline after download, no peers needed.
+ERA1 solves the biggest gap in devp2p coverage: old historical data. Non-archive
+devp2p peers prune old receipts, but an ERA1 file downloaded once covers that
+range forever. Fully offline after download, no peers needed.
 
 Verification is identical: extract receipts from the ERA1 file, rebuild the
 Merkle Patricia Trie, check root against the header's `receiptsRoot`. Same
@@ -695,36 +683,16 @@ era1_dir = "~/.scopenode/era1"  # optional, local ERA1 archive directory
 fallback_rpc = "https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY"  # optional, last resort
 ```
 
-Every receipt is tagged with its source: `source = "portal"`, `source = "era1"`,
+Every receipt is tagged with its source: `source = "devp2p"`, `source = "era1"`,
 or `source = "rpc"`. The `scopenode status` output shows the breakdown:
 
 ```
-Sources: 38,412 blocks from Portal (94%)  |  2,100 from ERA1 (5%)  |  419 from RPC (1%)
+Sources: 38,412 blocks from devp2p (94%)  |  2,100 from ERA1 (5%)  |  419 from RPC (1%)
 ```
 
 The verification step (Merkle check) runs regardless of source — we verify
 everything. The goal: never silently miss events. Either verify + store, or
 loudly fail.
-
----
-
-## Claude API — optional, not required
-
-Natural language input (`-m` flag) requires `ANTHROPIC_API_KEY` in environment.
-If not set, scopenode still works fully via TOML config.
-
-TOML is the primary interface. Claude is a convenience layer on top.
-
-```bash
-# this always works
-scopenode sync config.toml
-
-# this requires ANTHROPIC_API_KEY
-scopenode -m "Give me all Swap events from 0x8ad..."
-```
-
-The Claude step only runs during config generation. Once config is written to
-disk, all subsequent syncs are fully offline and free.
 
 ---
 

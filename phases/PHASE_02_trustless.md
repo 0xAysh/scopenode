@@ -1,14 +1,21 @@
-# Phase 2 — Trustless (Beacon Light Client + Portal Network)
+# Phase 2 — Trustless (devp2p + Beacon Light Client)
 
 ## Goal
 
 Replace the Phase 1 RPC dependencies with trustless P2P sources. After this
-phase, scopenode runs without any API key or centralized provider. Headers come
-from the beacon chain (verified by BLS signatures of 512 validators). Receipts
-come from the Portal Network (verified against the Merkle root in the header).
+phase, scopenode runs without any API key or centralized provider:
 
-This phase also adds proxy contract detection and the `scopenode validate` /
-`scopenode abi` commands.
+- **Headers (historical):** fetched from devp2p peers — mainnet full nodes using
+  the ETH wire protocol. Multiple peers queried; agreement required.
+- **Headers (live sync):** Helios beacon light client — verified by BLS
+  signatures of 512 validators. Multiple `consensus_rpc` endpoints configured;
+  agreement required before accepting sync committee updates.
+- **Receipts:** fetched from devp2p peers using `GetReceipts` ETH wire message.
+  Fallback: ERA1 archives → `fallback_rpc` (last resort).
+- **ABIs:** fetched from Sourcify — Ethereum Foundation's open ABI registry, no
+  API key required.
+
+Everything is Merkle-verified before storage. The source does not affect trust.
 
 ---
 
@@ -24,17 +31,20 @@ Add Phase 2 fields to `config.test.toml` for testing trustless sources:
 [node]
 port = 8545
 data_dir = "~/.scopenode-staging"
-consensus_rpc = "https://www.lightclientdata.org"  # free public beacon API
-# portal_rpc = "http://localhost:8547"             # if running trin locally
-# era1_dir = "~/.scopenode-staging/era1"           # if testing ERA1 fallback
-fallback_rpc = "https://eth.llamarpc.com"          # last-resort during testing
+# consensus_rpc — one or more beacon APIs for live sync (free public endpoints)
+# Must all agree on sync committee updates before accepting them.
+consensus_rpc = [
+    "https://www.lightclientdata.org",
+    "https://sync-mainnet.beaconcha.in",
+]
+# era1_dir = "~/.scopenode-staging/era1"   # optional, ERA1 archive directory
+fallback_rpc = "https://eth.llamarpc.com"   # last-resort during testing
 ```
 
-Snapshot the staging DB before switching header source from RPC to Helios —
-makes it easy to roll back if the beacon sync takes too long or errors:
+Snapshot the staging DB before switching header source:
 
 ```bash
-cp ~/.scopenode-staging/scopenode.db ~/.scopenode-staging/pre-helios.db.snap
+cp ~/.scopenode-staging/scopenode.db ~/.scopenode-staging/pre-phase2.db.snap
 ```
 
 ---
@@ -43,10 +53,11 @@ cp ~/.scopenode-staging/scopenode.db ~/.scopenode-staging/pre-helios.db.snap
 
 | Component | Phase 1 | Phase 2 |
 |---|---|---|
-| Header source | `alloy` provider (public RPC) | `helios` beacon light client (pinned, behind `HeaderSource` trait) |
-| Receipt source | `alloy` provider (public RPC) | Portal Network → ERA1 archives → fallback RPC |
-| Fallback | None | Layered: Portal (3 peers) → ERA1 (local files) → `fallback_rpc` (all Merkle-verified) |
-| ABI source | Etherscan direct | Etherscan + proxy detection |
+| Header source (historical) | `alloy` provider (public RPC) | devp2p peers — 3+ peers must agree (`GetBlockHeaders`) |
+| Header source (live) | `alloy` provider (public RPC) | Helios beacon light client — multiple `consensus_rpc` endpoints must agree |
+| Receipt source | `alloy` provider (public RPC) | devp2p peers (`GetReceipts`) → ERA1 archives → `fallback_rpc` |
+| ABI source | Etherscan | Sourcify (EF, no API key) → `abi_override` fallback |
+| Proxy detection | None | `eth_getStorageAt` via `fallback_rpc` (setup-only, one-time) |
 
 Everything else — bloom scan, Merkle verification, ABI decoding, SQLite
 storage, JSON-RPC server — is unchanged.
@@ -55,158 +66,176 @@ storage, JSON-RPC server — is unchanged.
 
 ## Concepts to understand deeply
 
-### The beacon chain and why it enables trustless light clients
+### The Ethereum devp2p network
 
-Before the Merge (Sep 2022): Ethereum used proof-of-work. Light clients had to
-verify PoW hashes — doable but slow and trust-limited.
+The Ethereum execution layer uses a P2P network called devp2p. Every full node
+is on it. It has two layers:
 
-After the Merge: Ethereum uses proof-of-stake via the beacon chain. Every ~12
-seconds, a validator proposes a block and a sync committee of 512 randomly
-selected validators signs it with BLS signatures.
+1. **Discovery (discv4):** UDP-based Kademlia DHT. Nodes announce themselves
+   via signed ENR records. Used to find peers.
 
-The key insight: to verify a block header, you only need:
-1. The aggregated BLS public key of the current sync committee (64 bytes)
-2. Their 96-byte aggregated BLS signature over the block header
-3. A Merkle proof that this sync committee is the legitimate one
+2. **RLPx (TCP):** Encrypted, authenticated TCP connections between peers.
+   After connecting, peers run sub-protocols. We use the ETH sub-protocol.
 
-This is the Ethereum light client protocol (EIP-3526 / Altair). 512 validators
-must collude to deceive you — essentially the security of the entire network.
+The ETH sub-protocol (ETH/68) includes:
+- `GetBlockHeaders` / `BlockHeaders` — request headers by number or hash
+- `GetBlockBodies` / `BlockBodies` — request transaction lists
+- `GetReceipts` / `Receipts` — request block receipts
+
+Full nodes are abundant (tens of thousands), always online, and serve this
+data as part of normal chain sync. We connect as a peer and request exactly
+what we need.
+
+**Peer reciprocity:** Full nodes expect peers to also serve data. We announce
+ourselves honestly but serve nothing (we have nothing to serve). In practice
+peers tolerate this for short-lived data requests, but we should connect to
+multiple peers and rotate to avoid being seen as a leech.
+
+### RLPx — the transport
+
+RLPx is an ECIES-encrypted, MAC-authenticated TCP protocol. The handshake:
+
+1. Initiator sends auth message (ECIES encrypted with recipient's public key)
+2. Recipient sends auth-ack (ECIES encrypted with initiator's public key)
+3. Both derive session keys from the handshake material (ECDH)
+4. From here, all messages are frame-encrypted (AES-256-CTR + MAC)
+
+After RLPx, the ETH sub-protocol handshake (`Status` message) exchanges:
+- protocol version, network ID, total difficulty, genesis hash, best block hash
+
+This confirms we're on the same network (mainnet, chain ID 1).
+
+### `GetReceipts` — how we fetch receipts
+
+The ETH wire protocol message `GetReceipts` takes a list of block hashes and
+returns the receipts for those blocks. This is exactly what we need.
+
+Receipts from devp2p peers are **not trusted** — we verify them against the
+`receipts_root` in the block header using the same Merkle Patricia Trie
+verification as Phase 1. A lying peer produces a root mismatch and gets
+skipped; we try another peer.
+
+### Multi-peer header agreement (historical sync)
+
+For historical blocks (finalized, older than 64 blocks): the canonical chain
+is cryptographically fixed. Any honest full node will return the same header
+for a given block number.
+
+Our approach: query 3+ independent peers for the same header. If they all
+return the same `hash`, `receipts_root`, `logs_bloom` — accept it. If any
+disagree — drop the outlier and try a different peer.
+
+This gives us trustless historical headers without Helios. No beacon API
+needed for historical data.
+
+### Helios — for live sync only
+
+For live sync (watching new blocks as they arrive), we need to know the
+current canonical head. For this we use Helios — the beacon light client.
+
+Helios (by a16z) implements the Altair light client protocol:
+1. Bootstraps from a recent finalized checkpoint block hash
+2. Syncs sync committee updates forward (~1KB per 27-hour period)
+3. Verifies each new block header via BLS signature of the sync committee
+4. 512 validators must collude to deceive us
+
+**Multiple consensus endpoints:** We configure 2+ public beacon APIs. For
+each sync committee update, we fetch from all configured endpoints and require
+them to return identical data before accepting. This eliminates single-point-
+of-trust while still using free public infrastructure.
+
+```toml
+consensus_rpc = [
+    "https://www.lightclientdata.org",
+    "https://sync-mainnet.beaconcha.in",
+]
+```
+
+If they disagree: log an error, pause live sync, alert the user.
+
+The checkpoint trust assumption: we bootstrap from a recent finalized block
+hash published by multiple independent sources. This is the standard Ethereum
+light client protocol design (EIP-3526 / Altair). After the initial bootstrap,
+all verification is cryptographic.
 
 ### BLS signatures and aggregation
 
-BLS (Boneh-Lynn-Shacham) signatures have a unique property: multiple signatures
-can be **aggregated** into a single 96-byte signature. Verifying one aggregated
-signature over N messages is nearly as fast as verifying a single signature.
+BLS (Boneh-Lynn-Shacham) signatures have a unique property: multiple
+signatures can be **aggregated** into a single 96-byte signature. Verifying
+one aggregated signature over N messages is nearly as fast as verifying one.
 
 This is why sync committees work: 512 individual BLS signatures → 1 aggregated
-signature → fast verification by a light client.
+signature → fast verification. We use `helios` which uses the `blst` crate
+(the reference BLS implementation). Never implement BLS yourself.
 
-We use `helios` which uses the `blst` crate (the reference BLS implementation
-used by all major Ethereum clients). Never implement BLS yourself.
+### Sourcify — decentralized ABI registry
 
-### Helios — the Ethereum light client
+Sourcify (sourcify.dev) is the Ethereum Foundation's open, decentralized
+contract verification platform. Unlike Etherscan:
 
-`helios` (by a16z) implements the Altair light client protocol in Rust. It:
-1. **Bootstraps** from a trusted checkpoint (a recent finalized block hash,
-   published widely and verifiable from multiple sources)
-2. **Syncs** sync committee updates forward (each update is ~1KB, covering ~27 hours)
-3. **Verifies** every new block header using the current sync committee BLS signature
-4. **Exposes** an alloy-compatible provider interface
+- **No API key required** — fully open
+- **Run by EF** — not a commercial provider
+- **Open source** — the server and data are both open
+- **Covers most major contracts** — Uniswap, Aave, USDC, etc.
 
-Checkpoint sync: instead of syncing every block since genesis, we start from a
-recent trusted checkpoint. The sync period is ~27 hours (256 epochs × 32 slots).
-From the checkpoint, we need only ~1KB per period to stay current.
-
-Free public checkpoint providers:
-- `https://sync-mainnet.beaconcha.in`
-- `https://mainnet.checkpoint.sigp.io`
-
-```toml
-# config.toml additions
-[node]
-# Public beacon chain API for light client sync
-consensus_rpc = "https://www.lightclientdata.org"
+API:
+```
+GET https://sourcify.dev/server/files/any/1/{address}
 ```
 
-### Portal Network — decentralized historical data
+Returns a JSON object with `files` array. The ABI is in the file named
+`metadata.json` under `output.abi`, or in a standalone `ABI.json`.
 
-The Portal Network is a DHT (Distributed Hash Table) built on top of `discv5`
-(the same peer discovery protocol used by Ethereum nodes). Its purpose: serve
-historical Ethereum data (headers, bodies, receipts) without each node needing
-the full history.
-
-Three sub-protocols, we care about **History Network**:
-- Keys: content keys derived from block hashes
-- Values: RLP-encoded headers, block bodies, or receipts
-- Distribution: each node stores a slice of history (radius-based)
-
-Content key format for block receipts: `[0x02] || block_hash` (33 bytes)
-
-The Portal Network is built by the Ethereum Foundation Portal team and
-implemented in Rust by `trin`.
-
-### discv5 — how peers are found
-
-`discv5` is a Kademlia-based peer discovery protocol. It:
-1. Bootstraps from well-known bootnode ENRs (Ethereum Node Records — signed
-   identity documents containing IP, port, protocol info)
-2. Builds a routing table of peers organized by XOR distance
-3. Finds content by querying peers closest to the content ID (`sha256(content_key)`)
-
-We use the `discv5` crate (the same one used by Lighthouse, Lodestar, Trin).
-
-### Fallback chain
-
-Portal Network peer availability is uneven, especially for old data. We handle
-this with a layered fallback chain. Every layer feeds into the same Merkle
-verification — the source doesn't affect trust.
-
-Strategy (per block, tried in order):
-1. Portal Network — up to 3 different peers
-2. ERA1 archives — local flat files, if `era1_dir` is configured
-3. `fallback_rpc` — if configured, last resort
-4. If all fail: mark `pending_retry`, log warning
-
-Every receipt is tagged: `source = "portal"` / `"era1"` / `"rpc"`.
-`scopenode status` shows the breakdown so users know how decentralized their
-data actually is.
-
-### ERA1 archives
-
-ERA1 files are flat-file archives of historical Ethereum data published by the
-Ethereum Foundation. Each file covers ~8192 consecutive blocks and contains
-block headers, bodies, and receipts in a compact binary format.
-
-Key properties:
-- **Checksummed** — file integrity is verifiable independent of any peer
-- **Available via HTTP mirrors, BitTorrent, and IPFS** — multiple redundant sources
-- **Covers all historical data** — unlike Portal, which depends on peer availability
-- **One-time download** — after download, no network needed for covered blocks
-- **Same verification** — extract receipts, rebuild Merkle Patricia Trie, check
-  against `receiptsRoot`. Same math, different transport.
-
-ERA1 solves the biggest gap in Portal coverage: old historical data. A user
-syncing Uniswap from block 12M can download the relevant ERA1 files once and
-never depend on Portal peer availability for that range.
-
-File naming: `mainnet-NNNNN-XXXXXXXX.era1` where `NNNNN` = `block_num / 8192`.
-
-Critically: receipts from any source still go through Merkle verification.
-We never trust any source — we verify all receipts against `receipts_root`.
+If a contract is not on Sourcify: scopenode logs an error and requires the
+user to set `abi_override` in their config file. We do not fall back to
+Etherscan — Etherscan requires an API key and is a centralized provider.
 
 ### Proxy contracts (EIP-1967)
 
-Many major contracts are proxies:
-- USDC: proxy → implementation
-- Aave V3: proxy → implementation
-- Compound: proxy → implementation
-
-The proxy emits events but the ABI lives at the implementation address.
-
-EIP-1967 storage slot (standard proxy slot):
+Many contracts are proxies. Detection requires reading a storage slot:
 ```
 keccak256("eip1967.proxy.implementation") - 1
 = 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc
 ```
 
-Read this slot via `eth_getStorageAt(proxy_address, slot)`. If non-zero, the
-last 20 bytes are the implementation address. Fetch the implementation's ABI.
+This is a one-time setup check — not a data integrity concern. We use the
+`fallback_rpc` (if configured) for this single `eth_getStorageAt` call.
+
+If `fallback_rpc` is not configured and proxy detection is needed: warn the
+user and tell them to either set `fallback_rpc` (temporarily) or set
+`abi_override` manually in their config.
+
+### ERA1 archives
+
+ERA1 files are flat-file archives of historical Ethereum data (headers,
+bodies, receipts) published by the Ethereum Foundation. Each covers ~8192
+blocks.
+
+ERA1 fills the gap where devp2p peers may not serve receipts — non-archive
+nodes prune receipts for old blocks. Download the relevant ERA1 files once
+via `scopenode download-era1` (added in Phase 3a) and have them forever.
+
+Verification is identical: extract receipts, rebuild Merkle Patricia Trie,
+check root against header's `receiptsRoot`. Same math, different transport.
 
 ---
 
 ## Implementation
 
-### Helios integration
+### Crates added in Phase 2
 
-We pin a specific `helios` version and wrap it behind a `HeaderSource` trait.
-If Helios introduces breaking changes or we need to swap in a different backend
-(e.g. `ethereum-consensus` from the Lighthouse team), only the trait
-implementation changes — the pipeline never touches Helios types directly.
+```toml
+# Workspace additions for Phase 2
+reth-network    = { version = "1", default-features = false }
+reth-eth-wire   = { version = "1", default-features = false }
+reth-discv4     = { version = "1", default-features = false }
+helios-client   = { version = "=0.8", features = ["ethereum"] }
+```
 
-The checkpoint trust assumption is accepted: we bootstrap from a recent
-finalized block hash published by multiple independent sources (beaconcha.in,
-Sigma Prime, etc.). This is the standard Ethereum light client protocol design,
-not a weakness.
+Note: `reth-*` crates are modular — we use only the networking layer. No
+state execution, no storage, no EVM.
+
+### `HeaderSource` trait
 
 ```rust
 // crates/scopenode-core/src/headers.rs (updated)
@@ -216,27 +245,50 @@ use async_trait::async_trait;
 
 /// Trait for fetching verified block headers.
 /// Phase 1: RpcHeaderSource (public RPC)
-/// Phase 2: BeaconHeaderSource (helios, trustless)
-/// Swappable without touching pipeline code.
+/// Phase 2 historical: DevP2PHeaderSource (multi-peer agreement)
+/// Phase 2 live: BeaconHeaderSource (helios, multiple consensus endpoints)
 #[async_trait]
 pub trait HeaderSource: Send + Sync {
     async fn get_header(&self, block: u64) -> Result<Option<ScopeHeader>, HeaderError>;
     async fn get_latest_block_number(&self) -> Result<u64, HeaderError>;
 }
 
-// Pin helios to a specific version in Cargo.toml:
-//   helios = { version = "=0.8.x", features = ["..."] }
+/// Historical header source: queries multiple devp2p peers and requires agreement.
+pub struct DevP2PHeaderSource {
+    network: Arc<NetworkHandle>,
+    min_agreement: usize,  // default: 3 peers must return same header
+}
 
+#[async_trait]
+impl HeaderSource for DevP2PHeaderSource {
+    async fn get_header(&self, block: u64) -> Result<Option<ScopeHeader>, HeaderError> {
+        let responses = self.network
+            .get_block_headers_from_peers(block, self.min_agreement + 1)
+            .await?;
+
+        // Require min_agreement peers to return the same header hash
+        let agreed = find_majority(&responses, self.min_agreement)?;
+        Ok(agreed.map(ScopeHeader::from))
+    }
+
+    async fn get_latest_block_number(&self) -> Result<u64, HeaderError> {
+        // Ask peers for their best block number from their Status message
+        self.network.best_block_number().await.map_err(HeaderError::Network)
+    }
+}
+
+/// Live sync header source: Helios beacon light client with multiple consensus endpoints.
 pub struct BeaconHeaderSource {
     client: helios_client::Client<helios_consensus::ethereum::EthereumConsensus>,
 }
 
 impl BeaconHeaderSource {
-    pub async fn new(consensus_rpc: &str, execution_rpc: &str) -> Result<Self, HeaderError> {
+    pub async fn new(consensus_rpcs: &[String]) -> Result<Self, HeaderError> {
+        // Helios verifies BLS signatures; we validate by checking multiple RPC endpoints
+        // agree on sync committee updates before accepting them.
         let mut client = helios_client::ClientBuilder::new()
             .network(helios_client::networks::Network::Mainnet)
-            .consensus_rpc(consensus_rpc)
-            .execution_rpc(execution_rpc)
+            .consensus_rpc(&consensus_rpcs[0])  // primary
             .build()
             .map_err(|e| HeaderError::Build(e.to_string()))?;
 
@@ -246,86 +298,122 @@ impl BeaconHeaderSource {
         Ok(Self { client })
     }
 }
+```
 
-#[async_trait]
-impl HeaderSource for BeaconHeaderSource {
-    async fn get_header(&self, block: u64) -> Result<Option<ScopeHeader>, HeaderError> {
-        let block = self.client
-            .get_block_by_number(block.into(), false)
-            .await
-            .map_err(|e| HeaderError::Fetch(e.to_string()))?;
+### devp2p network setup
 
-        Ok(block.map(|b| ScopeHeader::from(b.header)))
+```rust
+// crates/scopenode-core/src/network.rs
+
+use reth_discv4::{Discv4, Discv4Config, DEFAULT_DISCOVERY_PORT};
+use reth_network::{NetworkConfig, NetworkManager};
+use reth_eth_wire::EthVersion;
+
+pub struct ScopeNetwork {
+    handle: NetworkHandle,
+}
+
+impl ScopeNetwork {
+    pub async fn start() -> Result<Self, NetworkError> {
+        let secret_key = secp256k1::SecretKey::new(&mut rand::thread_rng());
+
+        let discv4_config = Discv4Config::builder()
+            .add_boot_nodes(reth_discv4::bootnodes::mainnet_nodes())
+            .build();
+
+        let network_config = NetworkConfig::builder(secret_key)
+            .discovery(discv4_config)
+            .build();
+
+        let manager = NetworkManager::new(network_config).await?;
+        let handle = manager.handle().clone();
+
+        tokio::spawn(manager);
+
+        // Wait for initial peer discovery
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        tracing::info!(peers = handle.num_connected_peers(), "devp2p network started");
+
+        Ok(Self { handle })
     }
 
-    async fn get_latest_block_number(&self) -> Result<u64, HeaderError> {
-        self.client
-            .get_block_number()
-            .await
-            .map_err(|e| HeaderError::Fetch(e.to_string()))
+    /// Request block receipts from devp2p peers.
+    /// Tries up to `max_peers` peers; returns first valid (Merkle-verified) result.
+    pub async fn get_receipts(
+        &self,
+        block_hash: B256,
+        expected_root: B256,
+        block_num: u64,
+    ) -> Result<(Vec<Receipt>, String), NetworkError> {
+        let peers = self.handle.get_peers(5);
+
+        for peer_id in peers {
+            match self.handle.request_receipts(peer_id, vec![block_hash]).await {
+                Ok(receipts) => {
+                    match verify_receipts(&receipts, expected_root, block_num) {
+                        Ok(()) => return Ok((receipts, format!("devp2p:{peer_id}"))),
+                        Err(e) => {
+                            tracing::warn!(
+                                peer = %peer_id, block = block_num, err = %e,
+                                "Peer sent invalid receipts"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(peer = %peer_id, block = block_num, err = %e,
+                        "Receipt request failed");
+                }
+            }
+        }
+
+        Err(NetworkError::AllPeersFailed(block_num))
     }
 }
 ```
 
 ### Receipt fetching — layered fallback chain
 
-Receipts are fetched through a three-layer fallback chain. Every layer feeds
-into the same Merkle verification — the source doesn't affect trust.
-
 ```
-Portal Network (3 peers) → ERA1 archives (local files) → fallback RPC (last resort)
+devp2p peers (mainnet full nodes) → ERA1 archives (local files) → fallback RPC (last resort)
 ```
 
-Each receipt is tagged with its source for transparency in `scopenode status`.
+Every layer feeds into the same Merkle verification.
 
 ```rust
 // crates/scopenode-core/src/receipts.rs (updated)
 
-use alloy_primitives::B256;
-use std::path::PathBuf;
-
-/// Content key for block receipts in Portal History Network
-fn receipts_key(block_hash: &B256) -> Vec<u8> {
-    let mut key = vec![0x02u8]; // receipts type prefix
-    key.extend_from_slice(block_hash.as_slice());
-    key
-}
-
 pub enum ReceiptSource {
-    Portal,
+    DevP2P,
     Era1,
     Rpc,
 }
 
 pub struct ReceiptFetcher {
-    portal_client: reqwest::Client,
-    portal_endpoint: String,
+    network: Arc<ScopeNetwork>,
     era1_dir: Option<PathBuf>,
     fallback: Option<Arc<dyn Provider>>,
 }
 
 impl ReceiptFetcher {
-    pub async fn fetch(&self, block_num: u64, block_hash: B256)
-        -> Result<(Vec<Receipt>, ReceiptSource), ReceiptError>
-    {
-        // Layer 1: Portal Network (up to 3 peers)
-        for attempt in 0..3 {
-            match self.try_portal(block_hash).await {
-                Ok(receipts) => return Ok((receipts, ReceiptSource::Portal)),
-                Err(e) => {
-                    tracing::warn!(
-                        block = block_num,
-                        attempt,
-                        err = %e,
-                        "Portal fetch failed"
-                    );
-                }
+    pub async fn fetch(
+        &self,
+        block_num: u64,
+        block_hash: B256,
+        expected_root: B256,
+    ) -> Result<(Vec<Receipt>, ReceiptSource), ReceiptError> {
+
+        // Layer 1: devp2p peers
+        match self.network.get_receipts(block_hash, expected_root, block_num).await {
+            Ok((receipts, _peer)) => return Ok((receipts, ReceiptSource::DevP2P)),
+            Err(e) => {
+                tracing::warn!(block = block_num, err = %e, "devp2p receipt fetch failed");
             }
         }
 
         // Layer 2: ERA1 archive (local flat files, if configured)
         if let Some(ref era1_dir) = self.era1_dir {
-            match self.try_era1(era1_dir, block_num).await {
+            match self.try_era1(era1_dir, block_num, expected_root).await {
                 Ok(receipts) => {
                     tracing::info!(block = block_num, "Loaded from ERA1 archive");
                     return Ok((receipts, ReceiptSource::Era1));
@@ -338,58 +426,96 @@ impl ReceiptFetcher {
 
         // Layer 3: Fallback RPC (last resort, if configured)
         if let Some(ref provider) = self.fallback {
-            tracing::info!(block = block_num, "Trying fallback RPC");
+            tracing::warn!(block = block_num, "Using fallback RPC — not ideal");
             let receipts = provider.get_block_receipts(block_num.into())
                 .await
                 .map_err(|e| ReceiptError::Rpc(e.to_string()))?
                 .ok_or(ReceiptError::NotFound(block_num))?;
+
+            // Still Merkle-verify even from fallback RPC
+            verify_receipts(&receipts, expected_root, block_num)
+                .map_err(|e| ReceiptError::Verification(block_num, e.to_string()))?;
+
             return Ok((receipts, ReceiptSource::Rpc));
         }
 
         Err(ReceiptError::AllFailed(block_num))
     }
 
-    async fn try_portal(&self, block_hash: B256) -> Result<Vec<Receipt>, ReceiptError> {
-        let key = format!("0x{}", hex::encode(receipts_key(&block_hash)));
-        let resp: serde_json::Value = self.portal_client
-            .post(&self.portal_endpoint)
-            .json(&serde_json::json!({
-                "jsonrpc": "2.0",
-                "method": "portal_historyGetContent",
-                "params": [key],
-                "id": 1
-            }))
-            .send().await.map_err(ReceiptError::Http)?
-            .json().await.map_err(ReceiptError::Http)?;
-
-        let content = resp["result"]["content"].as_str()
-            .ok_or(ReceiptError::NotAvailable)?;
-
-        let raw = hex::decode(content.trim_start_matches("0x"))
-            .map_err(|_| ReceiptError::Decode)?;
-
-        decode_receipts_rlp(&raw)
-    }
-
-    async fn try_era1(&self, era1_dir: &Path, block_num: u64) -> Result<Vec<Receipt>, ReceiptError> {
-        // ERA1 files cover ~8192 blocks each.
-        // Filename: mainnet-NNNNN-XXXXXXXX.era1
-        //   where NNNNN = block_num / 8192 (zero-padded)
+    async fn try_era1(
+        &self,
+        era1_dir: &Path,
+        block_num: u64,
+        expected_root: B256,
+    ) -> Result<Vec<Receipt>, ReceiptError> {
         let epoch = block_num / 8192;
         let pattern = format!("mainnet-{epoch:05}-");
 
         let file = std::fs::read_dir(era1_dir)
             .map_err(|_| ReceiptError::Era1NotFound(block_num))?
             .filter_map(Result::ok)
-            .find(|entry| entry.file_name().to_string_lossy().starts_with(&pattern))
+            .find(|e| e.file_name().to_string_lossy().starts_with(&pattern))
             .ok_or(ReceiptError::Era1NotFound(block_num))?;
 
         let data = std::fs::read(file.path())
             .map_err(|_| ReceiptError::Era1Read(block_num))?;
 
-        decode_era1_receipts(&data, block_num)
+        let receipts = decode_era1_receipts(&data, block_num)?;
+
+        // Still Merkle-verify
+        verify_receipts(&receipts, expected_root, block_num)
+            .map_err(|e| ReceiptError::Verification(block_num, e.to_string()))?;
+
+        Ok(receipts)
     }
 }
+```
+
+### ABI fetching — Sourcify
+
+```rust
+// crates/scopenode-core/src/abi.rs (updated)
+
+const SOURCIFY_API: &str = "https://sourcify.dev/server/files/any/1";
+
+pub struct SourcifyClient {
+    http: reqwest::Client,
+}
+
+impl SourcifyClient {
+    pub async fn fetch_events(&self, address: Address) -> Result<Vec<EventAbi>, AbiError> {
+        let url = format!("{SOURCIFY_API}/{address:?}");
+        let resp: serde_json::Value = self.http
+            .get(&url)
+            .send().await
+            .map_err(|e| AbiError::Http(e.to_string()))?
+            .json().await
+            .map_err(|e| AbiError::Http(e.to_string()))?;
+
+        // Sourcify returns { status, files: [{ name, path, content }] }
+        // ABI is in metadata.json under output.abi
+        let files = resp["files"].as_array().ok_or(AbiError::NotOnSourcify(address))?;
+
+        let abi_json = files.iter()
+            .find(|f| f["name"].as_str() == Some("metadata.json"))
+            .and_then(|f| f["content"].as_str())
+            .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok())
+            .and_then(|m| m["output"]["abi"].as_array().cloned())
+            .ok_or(AbiError::AbiNotFound(address))?;
+
+        parse_events_from_abi(&abi_json)
+    }
+}
+
+// If contract not on Sourcify, require abi_override in config.
+// Error message tells user exactly what to do:
+//
+// "ABI not found on Sourcify for 0x8ad...
+//  Add to your config:
+//    [[contracts]]
+//    address = \"0x8ad...\"
+//    abi_override = \"./abis/contract.json\"
+//  Download ABI from Etherscan or the project's GitHub."
 ```
 
 ### Proxy detection
@@ -400,10 +526,20 @@ impl ReceiptFetcher {
 const EIP1967_SLOT: &str =
     "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc";
 
+/// Detect EIP-1967 proxy. Uses fallback_rpc for the eth_getStorageAt call.
+/// This is a one-time setup check — not a data integrity concern.
 pub async fn resolve_abi_address(
     address: Address,
-    provider: &impl Provider,
+    fallback_rpc: Option<&Arc<dyn Provider>>,
 ) -> Result<Address, AbiError> {
+    let provider = match fallback_rpc {
+        Some(p) => p,
+        None => {
+            tracing::debug!(addr = %address, "No fallback_rpc — skipping proxy check");
+            return Ok(address);
+        }
+    };
+
     let slot: B256 = EIP1967_SLOT.parse().unwrap();
     let value = provider.get_storage_at(address, slot.into()).await
         .map_err(|e| AbiError::Rpc(e.to_string()))?;
@@ -412,17 +548,32 @@ pub async fn resolve_abi_address(
     let impl_addr = Address::from_slice(&bytes[12..]);
 
     if impl_addr == Address::ZERO {
-        Ok(address) // Not a proxy
+        Ok(address)
     } else {
         tracing::info!(
             proxy = %address,
             implementation = %impl_addr,
             "Proxy detected (EIP-1967) — using implementation ABI"
         );
-        // Store impl address in contracts table
         Ok(impl_addr)
     }
 }
+```
+
+### Config additions
+
+```toml
+[node]
+port = 8545
+# consensus_rpc — list of beacon APIs for live sync (requires agreement)
+consensus_rpc = [
+    "https://www.lightclientdata.org",
+    "https://sync-mainnet.beaconcha.in",
+]
+# era1_dir — local ERA1 archive directory (run `scopenode download-era1` to populate)
+# era1_dir = "~/.scopenode/era1"
+# fallback_rpc — last resort for receipts AND proxy detection (still Merkle-verified)
+# fallback_rpc = "https://eth.llamarpc.com"
 ```
 
 ### `scopenode validate` command
@@ -430,45 +581,55 @@ pub async fn resolve_abi_address(
 ```rust
 // crates/scopenode/src/commands/validate.rs
 
-use console::style;
-
-pub async fn run(config_path: PathBuf) -> Result<()> {
+pub async fn run(config_path: PathBuf, fallback_rpc: Option<Arc<dyn Provider>>) -> Result<()> {
     let config = Config::from_file(&config_path)?;
+    let sourcify = SourcifyClient::new();
     let mut all_ok = true;
 
     for contract in &config.contracts {
-        println!("Checking {} ({})...\n", contract.name.as_deref().unwrap_or("contract"), contract.address);
+        println!("Checking {} ({})...\n",
+            contract.name.as_deref().unwrap_or("contract"),
+            contract.address);
 
-        // Address format (already validated by Config::from_file)
         println!("  {} Contract address valid", style("✓").green());
 
-        // Proxy detection
-        match resolve_abi_address(contract.address, &provider).await {
+        // Proxy detection (requires fallback_rpc)
+        match resolve_abi_address(contract.address, fallback_rpc.as_ref()).await {
             Ok(addr) if addr != contract.address => {
-                println!("  {} Proxy detected → using implementation ABI ({})", style("✓").green(), addr);
+                println!("  {} Proxy detected → using implementation ABI ({})",
+                    style("✓").green(), addr);
             }
             Ok(_) => println!("  {} Not a proxy", style("✓").green()),
             Err(e) => {
-                println!("  {} Proxy check failed: {}", style("!").yellow(), e);
+                println!("  {} Proxy check skipped: {}", style("!").yellow(), e);
             }
         }
 
-        // ABI fetch
-        match etherscan.fetch_events(contract.address).await {
+        // ABI fetch from Sourcify
+        match sourcify.fetch_events(contract.address).await {
             Ok(events) => {
-                println!("  {} ABI fetched ({} events: {})",
+                println!("  {} ABI fetched from Sourcify ({} events: {})",
                     style("✓").green(),
                     events.len(),
-                    events.iter().map(|e| e.name.as_str()).collect::<Vec<_>>().join(", ")
-                );
-                // Check requested events exist in ABI
+                    events.iter().map(|e| e.name.as_str()).collect::<Vec<_>>().join(", "));
                 for event_name in &contract.events {
                     if events.iter().any(|e| &e.name == event_name) {
-                        println!("  {} Event '{}' found in ABI", style("✓").green(), event_name);
+                        println!("  {} Event '{}' found", style("✓").green(), event_name);
                     } else {
-                        println!("  {} Event '{}' NOT found in ABI", style("✗").red(), event_name);
+                        println!("  {} Event '{}' NOT found in ABI",
+                            style("✗").red(), event_name);
                         all_ok = false;
                     }
+                }
+            }
+            Err(AbiError::NotOnSourcify(_)) => {
+                if contract.abi_override.is_some() {
+                    println!("  {} Using abi_override (not on Sourcify)",
+                        style("✓").green());
+                } else {
+                    println!("  {} Not on Sourcify — add abi_override to config",
+                        style("✗").red());
+                    all_ok = false;
                 }
             }
             Err(e) => {
@@ -477,17 +638,9 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
             }
         }
 
-        // Block range
-        println!("  {} Block range: {} → {}",
-            style("✓").green(),
-            contract.from_block,
-            contract.to_block.map(|b| b.to_string()).unwrap_or_else(|| "live".into())
-        );
-
-        // Warn if no fallback_rpc
         if config.node.fallback_rpc.is_none() {
-            println!("  {} fallback_rpc not set — Portal failures will leave blocks as pending_retry",
-                style("!").yellow());
+            println!("  {} fallback_rpc not set — proxy detection skipped, old block receipt \
+                fallback unavailable", style("!").yellow());
         }
 
         println!();
@@ -511,11 +664,17 @@ pub async fn run(address: String) -> Result<()> {
     let addr: Address = address.parse()
         .map_err(|_| anyhow::anyhow!("Invalid address: {}", address))?;
 
-    let api_key = std::env::var("ETHERSCAN_API_KEY").ok();
-    let client = EtherscanClient::new(api_key);
+    let client = SourcifyClient::new();
+    println!("Fetching ABI from Sourcify for {addr}...\n");
 
-    println!("Fetching ABI for {addr}...\n");
-    let events = client.fetch_events(addr).await?;
+    let events = client.fetch_events(addr).await
+        .map_err(|e| match e {
+            AbiError::NotOnSourcify(_) => anyhow::anyhow!(
+                "Contract not verified on Sourcify.\n\
+                 Use --abi-file to provide a local ABI JSON file."
+            ),
+            e => anyhow::Error::from(e),
+        })?;
 
     for e in &events {
         println!("  {} {}", e.name, e.signature());
@@ -532,42 +691,30 @@ pub async fn run(address: String) -> Result<()> {
 
 ---
 
-## Config additions
-
-```toml
-[node]
-port = 8545
-# Beacon chain consensus RPC for Helios (free public endpoints)
-consensus_rpc = "https://www.lightclientdata.org"
-# Optional: Portal Network trin endpoint (defaults to bundled trin)
-# portal_rpc = "http://localhost:8547"
-# Optional: local ERA1 archive directory (covers historical blocks Portal can't serve)
-# era1_dir = "~/.scopenode/era1"
-# Optional: fallback RPC — last resort when Portal and ERA1 both fail (still Merkle-verified)
-# fallback_rpc = "https://eth.llamarpc.com"
-```
-
----
-
 ## Tests
 
 ```
 Unit:
-  - receipts_key() produces correct 33-byte content key
-  - resolve_abi_address() returns same address when not a proxy
-  - HeaderSource trait: RpcHeaderSource and BeaconHeaderSource both conform
-  - ReceiptFetcher: falls through Portal → ERA1 → RPC correctly (mocked)
-  - ReceiptFetcher: returns ERA1 source tag when loaded from archive
+  - SourcifyClient: parses ABI correctly from known metadata.json structure
+  - SourcifyClient: returns NotOnSourcify error for unknown address (mocked 404)
+  - DevP2PHeaderSource: returns error when fewer than min_agreement peers respond
+  - DevP2PHeaderSource: rejects header when peers disagree
+  - DevP2PHeaderSource: accepts header when 3+ peers agree
+  - ReceiptFetcher: falls through devp2p → ERA1 → RPC correctly (mocked)
+  - ReceiptFetcher: Merkle verification runs on ERA1 receipts
+  - ReceiptFetcher: Merkle verification runs on fallback RPC receipts
+  - resolve_abi_address: returns same address when not a proxy (mocked storage)
+  - resolve_abi_address: returns impl address for EIP-1967 proxy
+  - resolve_abi_address: returns original address when no fallback_rpc configured
   - ERA1 epoch calculation: block 0 → epoch 0, block 8191 → epoch 0, block 8192 → epoch 1
 
 Integration (--ignored, require network):
-  - Helios fetches and verifies block 17000000 header
-    (receipts_root matches known value)
-  - Portal Network returns receipts for a known block
-  - Receipts from Portal pass Merkle verification
+  - devp2p connects to mainnet peers and discovers 5+ nodes
+  - GetBlockHeaders returns correct header for block 17000000 (check known hash)
+  - GetReceipts returns receipts that pass Merkle verification for a known block
+  - Sourcify returns valid ABI for Uniswap V3 pool address
   - ERA1 file loads and decodes receipts for a known block
-  - Receipts from ERA1 pass Merkle verification
-  - USDC proxy detection → finds implementation address
+  - USDC proxy detection → finds implementation address (requires fallback_rpc)
 ```
 
 ---
@@ -575,40 +722,45 @@ Integration (--ignored, require network):
 ## Definition of done
 
 - [ ] `scopenode sync config.toml` works without any RPC API key
-- [ ] Headers verified by beacon sync committee (Helios, pinned version)
+- [ ] Headers for historical sync: 3+ devp2p peers must agree on header hash
+- [ ] Headers for live sync: Helios verified by beacon sync committee
+- [ ] Multiple `consensus_rpc` endpoints configured; disagreement halts live sync
 - [ ] `HeaderSource` trait abstracts header backend — swappable without pipeline changes
-- [ ] Receipts fetched from Portal Network when available
-- [ ] ERA1 archives used as fallback when Portal fails and `era1_dir` is configured
+- [ ] Receipts fetched from devp2p peers using `GetReceipts` ETH wire message
+- [ ] ERA1 archives used as fallback when devp2p fails and `era1_dir` configured
 - [ ] Fallback RPC kicks in as last resort (with warning in logs)
-- [ ] Every receipt tagged with source (`portal`, `era1`, `rpc`)
+- [ ] Every receipt tagged with source (`devp2p`, `era1`, `rpc`)
 - [ ] Merkle verification runs on ALL receipts regardless of source
+- [ ] ABI fetched from Sourcify — no Etherscan, no API key
+- [ ] If not on Sourcify: clear error telling user to set `abi_override`
+- [ ] Proxy detection uses `fallback_rpc` for `eth_getStorageAt` (setup-only)
 - [ ] `scopenode validate config.toml` catches bad event names, shows proxy info
-- [ ] `scopenode abi 0x...` shows events with correct topic0 hashes
-- [ ] Proxy contracts (USDC, Aave) correctly resolve to implementation ABI
+- [ ] `scopenode abi 0x...` fetches from Sourcify, shows events with topic0 hashes
 
 ---
 
 ## What you learn in this phase
 
-**Beacon chain:** Post-Merge consensus, validator slots and epochs, why sync
-committees exist and how BLS aggregation makes them efficient, what a checkpoint
-is and why checkpoint sync is safe.
+**devp2p:** RLPx transport (ECIES, MAC, frame encryption), discv4 peer
+discovery (Kademlia DHT, ENR records, signed identity), the ETH wire protocol
+(`Status` handshake, `GetBlockHeaders`, `GetReceipts`), peer reciprocity and
+why full nodes tolerate light consumers.
 
-**BLS signatures:** How Boneh-Lynn-Shacham works, why signature aggregation is
-possible and why it's used in Ethereum, why you should never implement it yourself.
+**Multi-peer agreement:** Why agreement across independent peers is a strong
+trustless guarantee for finalized data, how to detect and handle disagreeing
+peers, the importance of peer diversity.
 
-**Portal Network:** DHT architecture, discv5 peer discovery, Kademlia routing,
-ENR records, content key format, why Portal can serve historical data without
-storing everything.
+**Beacon chain:** Post-Merge consensus, validator slots and epochs, sync
+committees, BLS aggregation, checkpoint sync safety, why multiple consensus
+endpoints strengthen the trust model.
 
-**Proxy patterns:** Why EIP-1967 exists, what delegate calls are, how the storage
-slot convention standardizes proxy detection, the distinction between proxy
-address (where events come from) and implementation address (where ABI lives).
+**Sourcify vs Etherscan:** Why decentralized open registries matter, the
+tradeoffs of Sourcify coverage vs convenience, why `abi_override` is the right
+escape hatch.
+
+**Proxy patterns:** EIP-1967 storage slot convention, delegate calls, why
+proxy detection is a setup concern (not a data integrity concern), why using
+fallback_rpc for one-time setup checks is acceptable.
 
 **ERA1 archives:** Flat-file format for historical Ethereum data, epoch-based
-file naming, how to extract receipts from the binary format, why offline
-archives complement P2P networks for historical coverage.
-
-**Production reliability:** Why layered-fallback-with-verification is the right
-pattern (trust no source, verify everything), source tracking in SQLite, trait
-abstraction for swappable backends, retry semantics.
+file naming, why offline archives complement P2P networks for old data.

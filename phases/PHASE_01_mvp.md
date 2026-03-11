@@ -2,16 +2,25 @@
 
 ## Goal
 
-Get a fully working end-to-end pipeline in the simplest possible way. By the
-end of this phase, scopenode can sync verified Ethereum events and serve them
-at `localhost:8545` — a real, usable tool. We use standard Ethereum RPC for
-headers and receipts here (Helios + Portal Network come in Phase 2).
+Build a fully working end-to-end pipeline that embodies the vision from day
+one. By the end of this phase, scopenode connects directly to the Ethereum
+P2P network, fetches headers and receipts from devp2p peers, verifies them
+cryptographically, and serves the results at `localhost:8545` — no RPC
+provider, no API keys, no trusted third parties.
+
+Phase 1 is simpler than Phase 2 in degree, not in kind:
+- No multi-peer agreement (connect to a few peers, Merkle verification catches
+  bad data automatically)
+- No ERA1 fallback (devp2p only)
+- Historical sync only (no live sync — that's Phase 3a)
+- No proxy detection (use `abi_override` if needed)
 
 **What "done" looks like:**
 
 ```bash
 scopenode sync config.toml
-# syncs Uniswap V3 Swap events, stores in SQLite
+# connects to Ethereum devp2p network, syncs Uniswap V3 Swap events,
+# verifies Merkle proofs, stores in SQLite — no API key required
 
 # In another terminal:
 cast logs --rpc-url http://localhost:8545 \
@@ -57,7 +66,7 @@ scopenode sync config.toml
 
 ### `config.test.toml`
 
-Keep this file in the repo root. Add to `.gitignore` if it contains API keys.
+Keep this file in the repo root. Add to `.gitignore`.
 
 ```toml
 # config.test.toml — small range, fast to sync
@@ -95,9 +104,9 @@ in Phase 3a. For now, the `cp` workflow is sufficient.
 ### `.gitignore` additions
 
 ```
-config.test.toml          # may contain API keys
-*.db                      # never commit SQLite files
-*.db.snap                 # never commit snapshots
+config.test.toml
+*.db
+*.db.snap
 .env
 ```
 
@@ -125,23 +134,22 @@ rm ~/.scopenode-staging/scopenode.db
 
 ## Stack decisions
 
-
-| Concern                 | Choice                                 | Why                                                  |
-| ----------------------- | -------------------------------------- | ---------------------------------------------------- |
-| Ethereum types          | `alloy`                                | Standard across reth, lighthouse ecosystem           |
-| Header + receipt source | `alloy` provider (public RPC)          | Simple for MVP, replaced in Phase 2                  |
-| ABI decoding            | `alloy-dyn-abi`                        | Runtime decoding for arbitrary ABIs                  |
-| Merkle verification     | `alloy-trie`                           | Same as reth — well-tested                           |
-| Storage                 | `sqlx` + SQLite                        | Zero setup, excellent for local read-heavy workloads |
-| JSON-RPC server         | `jsonrpsee`                            | Standard in the Rust Ethereum ecosystem              |
-| Async                   | `tokio`                                | The standard                                         |
-| CLI                     | `clap` v4                              | Derive API, clean                                    |
-| Progress                | `indicatif`                            | The standard progress bar library                    |
-| HTTP client             | `reqwest`                              | For Etherscan ABI fetching                           |
-| Error handling          | `thiserror` (libs) + `anyhow` (binary) | Standard pattern                                     |
-| Logging                 | `tracing` + `tracing-subscriber`       | Async-aware, structured                              |
-| Config                  | `serde` + `toml`                       | Standard                                             |
-
+| Concern | Choice | Why |
+|---|---|---|
+| Ethereum types | `alloy` | Standard across reth, lighthouse ecosystem |
+| P2P networking | `reth-network` + `reth-eth-wire` + `reth-discv4` | Modular devp2p — peer discovery + ETH wire protocol |
+| ABI source | Sourcify (`sourcify.dev`) | EF-run, no API key, open |
+| ABI decoding | `alloy-dyn-abi` | Runtime decoding for arbitrary ABIs |
+| Merkle verification | `alloy-trie` | Same as reth — well-tested |
+| Storage | `sqlx` + SQLite | Zero setup, excellent for local read-heavy workloads |
+| JSON-RPC server | `jsonrpsee` | Standard in the Rust Ethereum ecosystem |
+| Async | `tokio` | The standard |
+| CLI | `clap` v4 | Derive API, clean |
+| Progress | `indicatif` | The standard progress bar library |
+| HTTP client | `reqwest` | For Sourcify ABI fetching |
+| Error handling | `thiserror` (libs) + `anyhow` (binary) | Standard pattern |
+| Logging | `tracing` + `tracing-subscriber` | Async-aware, structured |
+| Config | `serde` + `toml` | Standard |
 
 ---
 
@@ -169,9 +177,10 @@ scopenode/
     │       ├── config.rs
     │       ├── error.rs
     │       ├── pipeline.rs     # orchestrates all stages
+    │       ├── network.rs      # devp2p peer management + GetReceipts/GetBlockHeaders
     │       ├── headers.rs      # header fetching + bloom scan
-    │       ├── receipts.rs     # receipt fetching + verification
-    │       ├── abi.rs          # etherscan fetch + event decoding
+    │       ├── receipts.rs     # receipt fetching + Merkle verification
+    │       ├── abi.rs          # Sourcify fetch + event decoding
     │       └── types.rs        # shared types
     ├── scopenode-storage/  # SQLite
     │   └── src/
@@ -202,23 +211,26 @@ members = [
 resolver = "2"
 
 [workspace.dependencies]
-alloy = { version = "0.9", features = ["full"] }
-alloy-primitives = "0.8"
-alloy-dyn-abi = "0.8"
-alloy-trie = "0.7"
-tokio = { version = "1", features = ["full"] }
-thiserror = "2"
-anyhow = "1"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-toml = "0.8"
-tracing = "0.1"
+alloy             = { version = "0.9", features = ["full"] }
+alloy-primitives  = "0.8"
+alloy-dyn-abi     = "0.8"
+alloy-trie        = "0.7"
+reth-network      = { version = "1", default-features = false }
+reth-eth-wire     = { version = "1", default-features = false }
+reth-discv4       = { version = "1", default-features = false }
+tokio             = { version = "1", features = ["full"] }
+thiserror         = "2"
+anyhow            = "1"
+serde             = { version = "1", features = ["derive"] }
+serde_json        = "1"
+toml              = "0.8"
+tracing           = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-clap = { version = "4", features = ["derive"] }
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
-sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio", "migrate"] }
-indicatif = "0.17"
-hex = "0.4"
+clap              = { version = "4", features = ["derive"] }
+reqwest           = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+sqlx              = { version = "0.8", features = ["sqlite", "runtime-tokio", "migrate"] }
+indicatif         = "0.17"
+hex               = "0.4"
 ```
 
 ### Config
@@ -227,16 +239,16 @@ hex = "0.4"
 # config.example.toml
 [node]
 port = 8545
-rest_port = 8546  # Phase 3
-data_dir = "~/.scopenode"  # optional, defaults to this
-# fallback_rpc = "https://eth.llamarpc.com"  # Phase 2: used only when Portal fails
+rest_port = 8546          # Phase 3b
+data_dir = "~/.scopenode" # optional, defaults to this
 
 [[contracts]]
 name = "Uniswap V3 ETH/USDC"
 address = "0x8ad599c3A0ff1De082011EFDDc58f1908eb6e6D8"
 events = ["Swap", "Mint", "Burn"]
 from_block = 17000000
-to_block = 17000100  # small range for testing; omit for live sync
+to_block = 17000100       # omit for live sync (Phase 3a)
+# abi_override = "./abis/MyContract.json"  # if not on Sourcify
 ```
 
 ### Config types + validation
@@ -250,7 +262,8 @@ use std::path::PathBuf;
 use url::Url;
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]wpub struct Config {
+#[serde(deny_unknown_fields)]
+pub struct Config {
     pub node: NodeConfig,
     pub contracts: Vec<ContractConfig>,
 }
@@ -263,7 +276,7 @@ pub struct NodeConfig {
     #[serde(default = "default_rest_port")]
     pub rest_port: u16,
     pub data_dir: Option<PathBuf>,
-    pub fallback_rpc: Option<Url>,  // Phase 2
+    pub fallback_rpc: Option<Url>, // Phase 2: last resort + proxy detection
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -274,8 +287,8 @@ pub struct ContractConfig {
     pub events: Vec<String>,
     pub from_block: u64,
     pub to_block: Option<u64>,
-    pub webhook: Option<Url>,       // Phase 3
-    pub abi_override: Option<PathBuf>,
+    pub webhook: Option<Url>,         // Phase 3b
+    pub abi_override: Option<PathBuf>, // local ABI JSON — bypasses Sourcify
 }
 
 impl Config {
@@ -310,18 +323,65 @@ fn default_port() -> u16 { 8545 }
 fn default_rest_port() -> u16 { 8546 }
 ```
 
+### The Ethereum devp2p network
+
+Ethereum's execution layer P2P network (devp2p) is how all full nodes
+communicate. It has two layers:
+
+**Discovery (discv4):** UDP-based Kademlia DHT. Nodes sign and broadcast
+their identity as ENR records (Ethereum Node Records — IP, port, public key).
+We bootstrap from well-known mainnet bootnodes and discover peers from there.
+
+**RLPx (TCP):** Encrypted, authenticated TCP connections. After discovery,
+we open a TCP connection, perform an ECIES handshake to establish session keys,
+then run the ETH sub-protocol on top.
+
+The ETH sub-protocol messages we care about:
+- `GetBlockHeaders` / `BlockHeaders` — request headers by block number or hash
+- `GetReceipts` / `Receipts` — request receipts for a list of block hashes
+
+Full nodes serve these as part of their normal operation. Tens of thousands
+of them exist on mainnet. We connect to a handful and rotate as needed.
+
+`reth-discv4` handles peer discovery. `reth-network` + `reth-eth-wire` handle
+RLPx transport and the ETH sub-protocol. We never implement crypto ourselves.
+
 ### What's in a block header (and why we care)
 
-Ethereum block headers are ~500 bytes. The two fields that drive our entire
-pipeline:
+Ethereum block headers are ~500 bytes. The two fields that drive our pipeline:
 
 - `logs_bloom` (256 bytes) — a 2048-bit bloom filter that compactly represents
-every address and topic that emitted an event in this block. We use this to
-skip 85-90% of blocks without making any network call.
-- `receipts_root` (32 bytes) — the Merkle Patricia Trie root of all receipts in
-this block. We verify fetched receipts against this root to prove they're real.
+  every address and topic that emitted an event in this block. We use this to
+  skip 85-90% of blocks without fetching anything.
+- `receipts_root` (32 bytes) — the Merkle Patricia Trie root of all receipts
+  in this block. We verify fetched receipts against this root to prove they
+  are real.
 
-Both fields are in the `alloy::rpc::types::Header` type. We store them in SQLite.
+Both fields are in the `alloy::rpc::types::Header` type. We store them in
+SQLite after fetching them from devp2p peers.
+
+### Why devp2p is trustless for historical data
+
+For finalized blocks (older than ~12 minutes / 64 blocks), the canonical chain
+is cryptographically fixed by the beacon chain. Any honest full node returns
+the same header for a given block number.
+
+But we don't need to trust peers at all — even for headers. Here's why:
+
+The `receipts_root` in the header commits to all receipts in the block. When
+a peer sends us receipts, we rebuild the Merkle Patricia Trie from those
+receipts and check that the root matches the `receipts_root` in the header.
+
+If a peer sends a fake header AND fake receipts that match each other — we'd
+have a problem. But the header's `parent_hash` chain connects all the way back
+to genesis, and headers are tiny (500 bytes) with a well-defined structure.
+In Phase 1, we request headers from multiple peers and accept the majority.
+In Phase 2, multi-peer agreement is formalized and hardened.
+
+The fundamental invariant: **Merkle verification catches any peer that
+tampers with receipts.** A peer can't make fake events look real without
+knowing the preimage of the `receipts_root`, which is computationally
+infeasible.
 
 ### Bloom filters (the math)
 
@@ -331,19 +391,18 @@ A Bloom filter is a 2048-bit array. To add an item:
 2. Take bytes `[0,1]`, `[2,3]`, `[4,5]` → 3 pairs → each `mod 2048` → 3 bit positions
 3. Set those 3 bits to 1
 
-To check membership: compute the same 3 positions. If all 3 are 1 → might be present.
-If any is 0 → definitely not present.
+To check membership: compute the same 3 positions. If all 3 are 1 → might be
+present. If any is 0 → definitely not present.
 
-Ethereum's `logsBloom` in each header is built by running this algorithm for:
+Ethereum's `logsBloom` in each header is built by running this for every
+contract address and every topic of every log in the block.
 
-- Every contract address that emitted any log
-- Every topic (indexed param) of every log
+So we ask "did contract 0x8ad... maybe emit anything in block 17000042?"
+by checking if the address bits are set. Zero false negatives. ~15% false
+positives. 85-90% of blocks skipped with no network call.
 
-So we can ask "did contract 0x8ad... maybe emit anything in block 17000042?"
-by checking if the address bits are all set. Zero false negatives. Some false
-positives (~15%). 100x speedup over fetching every block's receipts.
-
-`alloy_primitives::Bloom` implements this. Use `bloom.contains_input(BloomInput::Raw(bytes))`.
+`alloy_primitives::Bloom` implements this. Use
+`bloom.contains_input(BloomInput::Raw(bytes))`.
 
 ### ABI encoding and event logs
 
@@ -351,27 +410,40 @@ Solidity events are stored in Ethereum logs. Each log has:
 
 - `address` — the contract that emitted it
 - `topics` — up to 4 × 32-byte words
-  - `topics[0]` is always `keccak256("EventName(type1,type2,...)")` — the "event selector"
+  - `topics[0]` is always `keccak256("EventName(type1,type2,...)")` — the event selector
   - `topics[1..3]` are indexed parameters (zero-padded to 32 bytes)
 - `data` — ABI-encoded non-indexed parameters
 
 ABI encoding (for non-indexed params in `data`):
-
 - Fixed-size types (uint256, address, bool, bytes32) → 32-byte word, left-padded
 - Dynamic types (string, bytes, arrays) → 32-byte offset pointer, then length, then data
 
-`alloy-dyn-abi` decodes this at runtime given the ABI JSON.
+`alloy-dyn-abi` decodes this at runtime given the ABI JSON from Sourcify.
+
+### Sourcify — ABI source
+
+Sourcify (sourcify.dev) is the Ethereum Foundation's open contract
+verification platform. No API key. API:
+
+```
+GET https://sourcify.dev/server/files/any/1/{address}
+```
+
+Returns a JSON object with `files`. The ABI lives in `metadata.json` under
+`output.abi`. Parse event entries (those with `"type": "event"`).
+
+If a contract is not on Sourcify: scopenode errors with a clear message
+telling the user to set `abi_override` in their config.
 
 ### Merkle Patricia Trie (receipts_root)
 
 The `receipts_root` is the root hash of a Merkle Patricia Trie where:
-
 - Keys: RLP-encoded transaction indices (0, 1, 2, ...)
 - Values: RLP-encoded receipts
 
 MPT nodes are RLP-encoded and hashed with keccak256. The root hash commits to
-the entire set of receipts. If we rebuild this trie from the fetched receipts
-and get the same root as in the header → the receipts are authentic.
+the entire receipt set. Rebuild the trie from fetched receipts, check root
+against header — if they match, the receipts are authentic.
 
 `alloy-trie`'s `HashBuilder` builds this trie incrementally. Items must be
 inserted in key order.
@@ -416,8 +488,8 @@ CREATE TABLE IF NOT EXISTS events (
     raw_topics      TEXT NOT NULL,   -- JSON array of hex strings
     raw_data        TEXT NOT NULL,   -- hex string
     decoded         TEXT NOT NULL,   -- JSON object of named fields
-    source          TEXT NOT NULL,   -- 'rpc' (Phase 1), 'portal' (Phase 2)
-    reorged         INTEGER NOT NULL DEFAULT 0,  -- Phase 3
+    source          TEXT NOT NULL,   -- 'devp2p' | 'era1' | 'rpc'
+    reorged         INTEGER NOT NULL DEFAULT 0,  -- Phase 3a
     UNIQUE (tx_hash, log_index)
 );
 
@@ -437,7 +509,7 @@ CREATE TABLE IF NOT EXISTS contracts (
     address          TEXT PRIMARY KEY,
     name             TEXT,
     abi_json         TEXT,
-    impl_address     TEXT   -- non-null if proxy
+    impl_address     TEXT   -- non-null if proxy (Phase 2)
 );
 ```
 
@@ -448,21 +520,114 @@ CREATE TABLE IF NOT EXISTS contracts (
 ```
 Config
   ↓
-ABI Fetch (Etherscan)     ← once per contract, cached in SQLite
+ABI Fetch (Sourcify)      ← once per contract, cached in SQLite
   ↓
-Header Sync               ← alloy provider, batch of 200 concurrent
+Header Sync               ← devp2p GetBlockHeaders, batch of 64 concurrent
   ↓ (stored in SQLite)
 Bloom Scan                ← pure CPU, local
   ↓ (bloom_candidates in SQLite)
-Receipt Fetch             ← alloy provider (Phase 2: Portal Network)
+Receipt Fetch             ← devp2p GetReceipts (batch up to 16 hashes/request)
   ↓
-Merkle Verify             ← alloy-trie, against receiptsRoot
+Merkle Verify             ← alloy-trie, against receipts_root in header
   ↓
 Event Extract + Decode    ← alloy-dyn-abi
   ↓
 SQLite Store              ← idempotent (INSERT OR IGNORE)
   ↓
 JSON-RPC serve            ← eth_getLogs from SQLite
+```
+
+### devp2p network setup
+
+```rust
+// crates/scopenode-core/src/network.rs
+
+use reth_discv4::{Discv4, Discv4Config};
+use reth_network::{NetworkConfig, NetworkManager, NetworkHandle};
+
+pub struct ScopeNetwork {
+    handle: NetworkHandle,
+}
+
+impl ScopeNetwork {
+    pub async fn start() -> Result<Self, NetworkError> {
+        let secret_key = secp256k1::SecretKey::new(&mut rand::thread_rng());
+
+        let discv4_config = Discv4Config::builder()
+            .add_boot_nodes(reth_discv4::bootnodes::mainnet_nodes())
+            .build();
+
+        let network_config = NetworkConfig::builder(secret_key)
+            .discovery(discv4_config)
+            .build();
+
+        let manager = NetworkManager::new(network_config).await?;
+        let handle = manager.handle().clone();
+        tokio::spawn(manager);
+
+        // Wait briefly for initial peer discovery
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        tracing::info!(peers = handle.num_connected_peers(), "devp2p ready");
+
+        Ok(Self { handle })
+    }
+
+    /// Fetch block headers for a range. Tries connected peers; skips failed ones.
+    pub async fn get_headers(
+        &self,
+        from: u64,
+        to: u64,
+    ) -> Result<Vec<ScopeHeader>, NetworkError> {
+        let peers = self.handle.get_peers(3);
+        for peer in peers {
+            match self.handle.request_block_headers(peer, from, to).await {
+                Ok(headers) if !headers.is_empty() => {
+                    return Ok(headers.into_iter().map(ScopeHeader::from).collect());
+                }
+                Ok(_) => continue,
+                Err(e) => tracing::warn!(peer = %peer, err = %e, "Header request failed"),
+            }
+        }
+        Err(NetworkError::HeadersFailed(from, to))
+    }
+
+    /// Fetch receipts for a batch of block hashes. Tries peers; Merkle-verifies each.
+    /// GetReceipts supports batching — up to 16 hashes per request.
+    pub async fn get_receipts(
+        &self,
+        blocks: &[(u64, B256, B256)], // (block_num, block_hash, receipts_root)
+    ) -> Vec<ReceiptResult> {
+        let hashes: Vec<B256> = blocks.iter().map(|(_, h, _)| *h).collect();
+        let peers = self.handle.get_peers(5);
+
+        for peer in peers {
+            match self.handle.request_receipts(peer, hashes.clone()).await {
+                Ok(batch) => {
+                    return batch.into_iter()
+                        .zip(blocks.iter())
+                        .map(|(receipts, (num, hash, root))| {
+                            match verify_receipts(&receipts, *root, *num) {
+                                Ok(()) => ReceiptResult::Ok(*num, *hash, receipts),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        block = num, peer = %peer, err = %e,
+                                        "Merkle verification failed — peer sent bad data"
+                                    );
+                                    ReceiptResult::Failed(*num)
+                                }
+                            }
+                        })
+                        .collect();
+                }
+                Err(e) => {
+                    tracing::warn!(peer = %peer, err = %e, "Receipt request failed");
+                }
+            }
+        }
+
+        blocks.iter().map(|(num, _, _)| ReceiptResult::Failed(*num)).collect()
+    }
+}
 ```
 
 ### Pipeline implementation sketch
@@ -472,9 +637,9 @@ JSON-RPC serve            ← eth_getLogs from SQLite
 
 pub struct Pipeline {
     config: Config,
-    provider: Arc<dyn Provider>,  // alloy provider
+    network: Arc<ScopeNetwork>,
     db: Db,
-    abi_cache: AbiCache,
+    abi_cache: AbiCache,  // backed by Sourcify
 }
 
 impl Pipeline {
@@ -491,22 +656,23 @@ impl Pipeline {
         dry_run: bool,
         progress: &SyncProgress,
     ) -> Result<()> {
-        let from = contract.from_block;
-        let to = contract.to_block
-            .unwrap_or(self.provider.get_block_number().await?);
-
-        // 1. ABI: fetch from Etherscan, cache in SQLite
+        // 1. ABI: fetch from Sourcify (or abi_override), cache in SQLite
         let events = self.abi_cache.get_or_fetch(contract).await?;
         let targets = build_bloom_targets(&events, &contract.events);
 
-        // 2. Headers: sync range, skip already-stored (resumable)
-        self.sync_headers(from, to, progress).await?;
+        // Determine to_block: use config value or ask peers for latest
+        let to = contract.to_block
+            .unwrap_or(self.network.best_block_number().await?);
 
-        // 3. Bloom scan: find candidates, store in bloom_candidates
-        let candidates = self.bloom_scan(contract.address, &targets, from, to).await?;
+        // 2. Headers: sync range via devp2p, resumable
+        self.sync_headers(contract.from_block, to, progress).await?;
+
+        // 3. Bloom scan: pure CPU, from SQLite
+        let candidates = self.bloom_scan(contract.address, &targets,
+            contract.from_block, to).await?;
 
         if dry_run {
-            print_dry_run_result(from, to, candidates.len());
+            print_dry_run_result(contract.from_block, to, candidates.len());
             return Ok(());
         }
 
@@ -516,24 +682,26 @@ impl Pipeline {
         Ok(())
     }
 
-    async fn sync_headers(&self, from: u64, to: u64, progress: &SyncProgress) -> Result<()> {
-        let cursor = self.db.get_cursor(&contract.address.to_string()).await?
-            .and_then(|c| c.headers_done_to)
+    async fn sync_headers(&self, from: u64, to: u64, progress: &SyncProgress)
+        -> Result<()>
+    {
+        let cursor = self.db.get_headers_cursor(from).await?
             .unwrap_or(from.saturating_sub(1));
 
-        let remaining: Vec<u64> = (cursor + 1..=to).collect();
+        // Fetch in batches of 64 headers (ETH wire protocol limit per request)
+        for chunk_start in (cursor + 1..=to).step_by(64) {
+            let chunk_end = (chunk_start + 63).min(to);
+            let headers = self.network.get_headers(chunk_start, chunk_end).await?;
 
-        futures::stream::iter(remaining)
-            .map(|n| self.provider.get_block_by_number(n.into(), false))
-            .buffer_unordered(200)
-            .try_for_each(|block| async {
-                if let Some(b) = block {
-                    self.db.insert_header(&b.header.into()).await?;
-                    progress.header_inc();
-                }
-                Ok::<_, anyhow::Error>(())
-            })
-            .await
+            for header in headers {
+                self.db.insert_header(&header).await?;
+                progress.header_inc();
+            }
+
+            self.db.set_headers_cursor(chunk_end).await?;
+        }
+
+        Ok(())
     }
 
     async fn bloom_scan(
@@ -542,15 +710,16 @@ impl Pipeline {
         targets: &[BloomTarget],
         from: u64,
         to: u64,
-    ) -> Result<Vec<(u64, B256)>> {
+    ) -> Result<Vec<(u64, B256, B256)>> { // (block_num, block_hash, receipts_root)
         let headers = self.db.get_headers(from, to).await?;
         let candidates: Vec<_> = headers.iter()
             .filter(|h| targets.iter().any(|t| t.matches(&h.logs_bloom)))
-            .map(|h| (h.number, h.hash))
+            .map(|h| (h.number, h.hash, h.receipts_root))
             .collect();
 
-        for (num, hash) in &candidates {
-            self.db.insert_bloom_candidate(*num, *hash, &address.to_string()).await?;
+        for (num, hash, _) in &candidates {
+            self.db.insert_bloom_candidate(*num, *hash,
+                &address.to_string()).await?;
         }
 
         Ok(candidates)
@@ -559,123 +728,53 @@ impl Pipeline {
     async fn fetch_and_store(
         &mut self,
         contract: &ContractConfig,
-        candidates: &[(u64, B256)],
+        candidates: &[(u64, B256, B256)],
         events: &[EventAbi],
         progress: &SyncProgress,
     ) -> Result<()> {
         let decoder = EventDecoder::new(events, contract.address)?;
         let addr = contract.address.to_string();
 
-        // Filter out already-fetched blocks (resumable)
-        let remaining: Vec<_> = futures::stream::iter(candidates.iter().cloned())
-            .filter_map(|(block_num, block_hash)| {
-                let db = &self.db;
-                let addr = &addr;
-                async move {
-                    if db.is_fetched(block_num, addr).await.unwrap_or(false) {
-                        None
-                    } else {
-                        Some((block_num, block_hash))
+        // Filter already-fetched blocks (resumable)
+        let remaining: Vec<_> = candidates.iter()
+            .filter(|(num, _, _)| {
+                !self.db.is_fetched_sync(*num, &addr)
+            })
+            .cloned()
+            .collect();
+
+        // GetReceipts supports batching — send up to 16 hashes per request
+        for chunk in remaining.chunks(16) {
+            let results = self.network.get_receipts(chunk).await;
+
+            for result in results {
+                match result {
+                    ReceiptResult::Ok(block_num, block_hash, receipts) => {
+                        // Merkle verification already done in get_receipts()
+                        let decoded = decoder.extract_and_decode(
+                            &receipts, block_num, block_hash);
+
+                        self.db.insert_events(&decoded, "devp2p").await?;
+                        self.db.mark_fetched(block_num, &addr).await?;
+
+                        for e in &decoded {
+                            progress.event_found(&e.event_name);
+                        }
+                        progress.receipt_inc();
+                    }
+                    ReceiptResult::Failed(block_num) => {
+                        tracing::warn!(block = block_num,
+                            "All peers failed for this block — marking pending_retry");
+                        self.db.mark_retry(block_num, &addr).await?;
                     }
                 }
-            })
-            .collect()
-            .await;
-
-        // Fetch receipts in parallel (up to 32 concurrent requests)
-        let provider = self.provider.clone();
-        let results: Vec<_> = futures::stream::iter(remaining.iter().cloned())
-            .map(|(block_num, block_hash)| {
-                let provider = provider.clone();
-                async move {
-                    let receipts = provider.get_block_receipts(block_num.into()).await;
-                    (block_num, block_hash, receipts)
-                }
-            })
-            .buffer_unordered(32)
-            .collect()
-            .await;
-
-        // Verify + decode + store (sequential — DB writes are fast, correctness matters)
-        for (block_num, block_hash, receipts_result) in results {
-            let receipts = match receipts_result? {
-                Some(r) => r,
-                None => {
-                    tracing::warn!(block = block_num, "No receipts returned");
-                    self.db.mark_retry(block_num, &addr).await?;
-                    continue;
-                }
-            };
-
-            let header = self.db.get_header(block_num).await?
-                .ok_or_else(|| anyhow::anyhow!("Header {block_num} not found in DB"))?;
-
-            match verify_receipts(&receipts, header.receipts_root, block_num) {
-                Ok(()) => {}
-                Err(e) => {
-                    tracing::warn!(block = block_num, err = %e, "Verification failed");
-                    self.db.mark_retry(block_num, &addr).await?;
-                    continue;
-                }
             }
-
-            let decoded = decoder.extract_and_decode(&receipts, block_num, block_hash);
-
-            self.db.insert_events(&decoded, "rpc").await?;
-            self.db.mark_fetched(block_num, &addr).await?;
-
-            for e in &decoded {
-                progress.event_found(&e.event_name);
-            }
-            progress.receipt_inc();
         }
 
         Ok(())
     }
 }
 ```
-
-### Batching consecutive candidate blocks
-
-When bloom-matched blocks are consecutive (common for high-activity contracts),
-we batch them into ranges and use ranged `eth_getLogs` to reduce RPC round trips.
-Individual Merkle verification still runs per block.
-
-```rust
-// crates/scopenode-core/src/pipeline.rs
-
-use std::ops::Range;
-
-/// Groups consecutive block numbers into ranges.
-/// Input:  [(100, h1), (101, h2), (102, h3), (200, h4), (201, h5)]
-/// Output: [100..103, 200..202]
-fn batch_consecutive(candidates: &[(u64, B256)]) -> Vec<Range<u64>> {
-    if candidates.is_empty() {
-        return vec![];
-    }
-
-    let mut ranges = vec![];
-    let mut start = candidates[0].0;
-    let mut end = start;
-
-    for &(num, _) in &candidates[1..] {
-        if num == end + 1 {
-            end = num;
-        } else {
-            ranges.push(start..end + 1);
-            start = num;
-            end = num;
-        }
-    }
-    ranges.push(start..end + 1);
-    ranges
-}
-```
-
-The pipeline uses batched ranges for `eth_getLogs` calls (fewer round trips)
-but still fetches full block receipts per block for Merkle verification. For
-Phase 1 this is a pragmatic optimization — batch fetching reduces wall-clock
-time by 5-10x for contracts with clustered activity.
 
 ---
 
@@ -702,7 +801,6 @@ pub trait EthApi {
 
 pub struct EthApiImpl {
     db: Db,
-    fallback_rpc: Option<String>,
 }
 
 #[async_trait::async_trait]
@@ -712,7 +810,6 @@ impl EthApiServer for EthApiImpl {
             .and_then(|a| a.first())
             .copied();
 
-        // Check if in scope
         let in_scope = if let Some(addr) = address {
             self.db.is_contract_indexed(&addr.to_string()).await.unwrap_or(false)
         } else {
@@ -720,13 +817,9 @@ impl EthApiServer for EthApiImpl {
         };
 
         if !in_scope {
-            if let Some(ref url) = self.fallback_rpc {
-                return proxy_to_rpc(url, "eth_getLogs", &filter).await;
-            }
             return Err(not_indexed_error());
         }
 
-        // Query SQLite and reconstruct Log objects
         let rows = self.db.query_events_for_filter(&filter).await
             .map_err(|e| internal_error(&e))?;
 
@@ -765,7 +858,7 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
 
-    /// Override data directory from config (also: SCOPENODE_DATA_DIR env var)
+    /// Override data directory (also: SCOPENODE_DATA_DIR env var)
     #[arg(long, global = true, env = "SCOPENODE_DATA_DIR")]
     pub data_dir: Option<PathBuf>,
 
@@ -796,10 +889,9 @@ pub enum Command {
 }
 ```
 
-In `main.rs`, after loading config, apply the override before opening the DB:
+In `main.rs`, apply the data_dir override before opening the DB:
 
 ```rust
-// Apply CLI/env data_dir override (takes precedence over config file)
 if let Some(dir) = cli.data_dir {
     config.node.data_dir = Some(dir);
 }
@@ -819,7 +911,7 @@ Stage 1/3  Header sync      █████████████████�
 Stage 2/3  Bloom scan       ████████████████████  100 / 100     done (8 hits)
 Stage 3/3  Receipt fetch    ████████░░░░░░░░░░░░    4 / 8       50%
 
-Speed: 2.1 receipts/sec  |  ETA: 2s
+devp2p peers: 4 active  |  Speed: 2.1 receipts/sec  |  ETA: 2s
 Events found: 3 Swap  |  1 Mint
 ```
 
@@ -850,20 +942,27 @@ Unit tests:
   - BloomTarget.matches() — true when address + topic present
   - BloomTarget.matches() — false when address absent
   - BloomTarget.matches() — false when no topics match
+  - verify_receipts() — passes on correct receipts (known block)
+  - verify_receipts() — fails on tampered receipts (wrong root)
   - verify_receipts() — passes on empty block (empty MPT root)
-  - verify_receipts() — fails on tampered receipts
   - EventAbi.topic0() — correct keccak256 for known events
   - EventAbi.signature() — correct canonical form
+  - SourcifyClient: parses ABI correctly from known metadata.json structure
+  - SourcifyClient: returns NotOnSourcify error for unknown address (mocked 404)
 
-Staging smoke tests (run against ~/.scopenode-staging, fast):
+Staging smoke tests (run against ~/.scopenode-staging):
   - scopenode sync config.test.toml completes without error
   - Events stored match expected count for known block range
   - Sync is resumable: interrupt halfway, re-run, picks up from cursor
   - scopenode status shows correct event counts after sync
+  - pending_retry blocks are logged when peers fail
 
 Integration tests (require network, --ignored):
-  - Sync 10 blocks of Uniswap V3, verify event count matches Etherscan
-  - eth_getLogs returns same result as public RPC for indexed range
+  - devp2p discovers and connects to 3+ mainnet peers
+  - GetBlockHeaders returns correct header for block 17000000
+  - GetReceipts returns receipts that pass Merkle verification
+  - Sourcify returns valid ABI for Uniswap V3 pool address
+  - eth_getLogs from localhost:8545 returns events for synced range
 ```
 
 ---
@@ -875,9 +974,14 @@ Integration tests (require network, --ignored):
 - `cargo clippy -- -D warnings` passes
 - `--data-dir` and `SCOPENODE_DATA_DIR` correctly override config `data_dir`
 - `config.test.toml` exists and works against `~/.scopenode-staging`
-- `scopenode sync config.test.toml --dry-run` shows bloom estimate and confirms before proceeding
-- `scopenode sync config.test.toml` syncs 100 blocks end-to-end against staging dir
-- Events stored in staging SQLite match what Etherscan shows for those blocks
+- `scopenode sync config.test.toml --dry-run` shows bloom estimate and prompts
+- `scopenode sync config.test.toml` syncs 100 blocks end-to-end via devp2p
+- Headers fetched from devp2p peers, stored in SQLite
+- Receipts fetched from devp2p peers using batched `GetReceipts`
+- Every receipt passes Merkle verification against `receipts_root` in header
+- Events stored with `source = 'devp2p'`
+- ABI fetched from Sourcify — no API key required
+- If contract not on Sourcify: clear error telling user to set `abi_override`
 - `eth_getLogs` via `cast` or viem returns correct events from staging node
 - Sync is resumable: interrupt and re-run, picks up where it left off
 - Error messages are human-readable (no hex dumps, no Rust panic output)
@@ -891,6 +995,11 @@ Integration tests (require network, --ignored):
 how `receipts_root` and `logs_bloom` work, transaction receipt format, log
 structure (address, topics, data), how events are encoded in raw bytes.
 
+**devp2p networking:** discv4 peer discovery (Kademlia DHT, ENR records),
+RLPx transport (ECIES handshake, session keys, frame encryption), the ETH wire
+protocol (`GetBlockHeaders`, `GetReceipts`), batching requests, handling peer
+failures.
+
 **Bloom filters:** The 2048-bit filter, k=3 hash functions, why false negatives
 are impossible, how false positive rate is calculated, why this gives us 85-90%
 block skipping.
@@ -899,8 +1008,9 @@ block skipping.
 indexed vs non-indexed params, the head/tail ABI encoding layout.
 
 **Merkle Patricia Tries:** How `receipts_root` is built, leaf/extension/branch
-node types, why inlining nodes < 32 bytes matters, how `alloy-trie` builds it.
+node types, why inlining nodes < 32 bytes matters, how `alloy-trie` builds it,
+why this is the fundamental trustless verification mechanism.
 
 **Rust patterns:** Workspace structure, `thiserror`/`anyhow` split, `tracing`
-spans, `sqlx` compile-time query checking, `futures::stream::buffer_unordered`
-for concurrent fetching, `INSERT OR IGNORE` for idempotency.
+spans, `sqlx` compile-time query checking, batched async requests,
+`INSERT OR IGNORE` for idempotency.

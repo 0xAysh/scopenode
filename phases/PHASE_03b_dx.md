@@ -3,9 +3,8 @@
 ## Goal
 
 Add the developer-facing features that make scopenode convenient beyond the
-core pipeline. REST API, SSE streaming, webhooks, interactive wizard, data
-export, and optional Claude API integration. Each feature is independent —
-they can be shipped in any order.
+core pipeline. REST API, SSE streaming, webhooks, interactive wizard, and data
+export. Each feature is independent — they can be shipped in any order.
 
 **Prerequisite:** Phase 3a (live sync and reorg handling must work first, since
 SSE and webhooks depend on the live event broadcast channel).
@@ -35,7 +34,6 @@ The `scopenode init` wizard should default to `~/.scopenode-staging` when
 2. **Webhooks** — POST new events to external URLs during live sync
 3. **`scopenode init`** — interactive wizard, generates config.toml
 4. **`scopenode export`** — CSV/JSON/Parquet output
-5. **Claude API integration** — optional `-m "natural language"` config generation (last priority)
 
 ---
 
@@ -68,17 +66,6 @@ A webhook is a fire-and-forget HTTP POST. Key design decisions:
 - Run in a separate `tokio::spawn` — never block live sync
 - On failure: log warning, don't crash, don't re-queue
 - Include `X-Scopenode-Event` header for routing on the receiver side
-
-### Claude API integration
-
-The `-m "natural language"` flag calls Claude API to:
-1. Parse intent (contract address, event names, block range)
-2. Look up ABI from Etherscan if address is provided
-3. Generate a `config.toml` and print it
-4. Ask user to confirm before starting sync
-
-This requires `ANTHROPIC_API_KEY` env var. If not set, the flag is unavailable
-but everything else works normally. This is the lowest-priority item in 3b.
 
 ---
 
@@ -223,13 +210,13 @@ pub async fn run() -> Result<()> {
     let addr: Address = address.parse().unwrap();
 
     println!("Checking for proxy...");
-    let abi_addr = resolve_abi_address(addr, &provider).await?;
+    let abi_addr = resolve_abi_address(addr, fallback_rpc.as_ref()).await?;
     if abi_addr != addr {
         println!("  Proxy detected → using implementation ABI from {abi_addr}");
     }
 
-    println!("Fetching ABI from Etherscan...");
-    let events = etherscan.fetch_events(abi_addr).await?;
+    println!("Fetching ABI from Sourcify...");
+    let events = SourcifyClient::new().fetch_events(abi_addr).await?;
     let event_names: Vec<&str> = events.iter().map(|e| e.name.as_str()).collect();
 
     let selected = MultiSelect::new()
@@ -312,88 +299,6 @@ pub async fn run(contract: Option<String>, event: Option<String>, format: String
 }
 ```
 
-### Claude API integration
-
-```rust
-// crates/scopenode-core/src/claude.rs
-
-use reqwest::Client;
-
-pub async fn parse_intent(message: &str) -> Result<Config, ClaudeError> {
-    let api_key = std::env::var("ANTHROPIC_API_KEY")
-        .map_err(|_| ClaudeError::NoApiKey)?;
-
-    let client = Client::new();
-
-    let system_prompt = r#"
-You are helping configure scopenode, an Ethereum event indexer.
-Given a user's description, extract:
-- contract_address (required)
-- event_names (list of event names they want)
-- from_block (starting block number or "latest - N")
-- to_block (optional ending block number; omit for live sync)
-
-Respond with JSON matching this schema:
-{
-  "contract": "0x...",
-  "events": ["EventName1", "EventName2"],
-  "from_block": 12345678,
-  "to_block": null
-}
-Only JSON. No prose.
-"#;
-
-    let resp: serde_json::Value = client
-        .post("https://api.anthropic.com/v1/messages")
-        .header("x-api-key", &api_key)
-        .header("anthropic-version", "2023-06-01")
-        .json(&serde_json::json!({
-            "model": "claude-opus-4-6",
-            "max_tokens": 1024,
-            "system": system_prompt,
-            "messages": [{ "role": "user", "content": message }]
-        }))
-        .send().await?
-        .json().await?;
-
-    let content = resp["content"][0]["text"].as_str()
-        .ok_or(ClaudeError::InvalidResponse)?;
-
-    let parsed: serde_json::Value = serde_json::from_str(content)?;
-
-    Ok(Config {
-        node: NodeConfig::default(),
-        contracts: vec![ContractConfig {
-            address: parsed["contract"].as_str().unwrap_or("").parse()?,
-            events: parsed["events"].as_array()
-                .unwrap_or(&vec![])
-                .iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect(),
-            from_block: parsed["from_block"].as_u64().unwrap_or(0),
-            to_block: parsed["to_block"].as_u64(),
-            ..Default::default()
-        }],
-    })
-}
-```
-
-Used in `main.rs`:
-```rust
-if let Some(ref message) = cli.message {
-    let config = claude::parse_intent(message).await?;
-    let toml = toml::to_string_pretty(&config)?;
-    println!("Generated config:\n\n{toml}");
-    let confirm = dialoguer::Confirm::new()
-        .with_prompt("Start sync with this config?")
-        .interact()?;
-    if confirm {
-        commands::sync::run_with_config(config, false, cli.quiet).await?;
-    }
-    return Ok(());
-}
-```
-
 ---
 
 ## REST API reference
@@ -416,8 +321,8 @@ GET /stream/events?contract=0x8ad...&event=Swap    ← SSE
 axum = "0.7"
 tower-http = { version = "0.5", features = ["cors"] }
 async-stream = "0.3"
-dialoguer = "0.11"       # interactive prompts (init wizard)
-parquet = "51"           # parquet export
+dialoguer = "0.11"    # interactive prompts (init wizard)
+parquet = "51"        # parquet export
 ```
 
 ---
@@ -431,13 +336,12 @@ Unit:
   - Webhook exponential backoff: 1s, 2s, 4s
   - Export CSV: correct headers and values for known events
   - Export JSON: valid JSON array
-  - Claude parse_intent: returns ClaudeError::NoApiKey when env var missing
 
 Integration (--ignored):
   - SSE stream receives events as they're inserted via broadcast channel
   - GET /events returns same results as eth_getLogs for indexed range
   - GET /status returns valid JSON with contract list
-  - scopenode init generates valid config.toml (mocked Etherscan response)
+  - scopenode init generates valid config.toml (mocked Sourcify response)
   - Export parquet file readable by DuckDB/pandas
 ```
 
@@ -451,7 +355,6 @@ Integration (--ignored):
 - [ ] `scopenode init` walks through wizard and produces valid config.toml
 - [ ] `scopenode export --format csv > events.csv` produces valid CSV
 - [ ] `scopenode export --format parquet > events.parquet` produces valid Parquet
-- [ ] `scopenode -m "..."` generates config from natural language (with API key)
 - [ ] All previous phase tests still pass
 
 ---
@@ -467,6 +370,3 @@ must not propagate, exponential backoff, making external integrations reliable.
 **CLI UX:** What makes a tool feel professional — confirmations before
 destructive actions, clear error messages with suggested next steps, interactive
 prompts with validation, multiple output formats.
-
-**LLM integration:** How to write effective system prompts for structured output,
-JSON schema validation, graceful degradation when API key is absent.

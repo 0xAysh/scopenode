@@ -313,8 +313,8 @@ Restore {
 use console::style;
 
 pub async fn run() -> Result<()> {
-    println!("Portal Network connectivity");
-    match test_portal_connectivity().await {
+    println!("devp2p connectivity");
+    match test_devp2p_connectivity().await {
         Ok((discovered, responsive, test_ms)) => {
             println!("  Peers discovered:   {discovered}");
             println!("  Peers responsive:   {responsive} / {discovered}");
@@ -356,8 +356,8 @@ pub async fn run() -> Result<()> {
     }
 
     println!("\nNetwork");
-    println!("  Portal bootstrap:  {}", check_icon(test_portal_bootstrap().await.is_ok()));
-    println!("  Etherscan API:     {}", check_icon(test_etherscan().await.is_ok()));
+    println!("  devp2p bootstrap:  {}", check_icon(test_devp2p_bootstrap().await.is_ok()));
+    println!("  Sourcify API:      {}", check_icon(test_sourcify().await.is_ok()));
 
     Ok(())
 }
@@ -417,6 +417,95 @@ pub async fn run() -> Result<()> {
 
 ---
 
+### `scopenode download-era1` command
+
+Downloads ERA1 archive files for a block range. Calculates the exact set of
+epoch files needed, downloads from the Ethereum Foundation's HTTP mirror,
+verifies checksums, saves to `era1_dir`.
+
+```rust
+// crates/scopenode/src/commands/download_era1.rs
+
+const EF_ERA1_BASE: &str = "https://era1.ethportal.net/mainnet";
+
+pub async fn run(range: String, era1_dir: PathBuf) -> Result<()> {
+    let (from, to) = parse_range(&range)?;
+    let epochs: Vec<u64> = epoch_range(from, to);
+
+    println!("Need {} ERA1 file(s) for blocks {from}–{to}", epochs.len());
+    std::fs::create_dir_all(&era1_dir)?;
+
+    let client = reqwest::Client::new();
+    let pb = ProgressBar::new(epochs.len() as u64);
+
+    for epoch in epochs {
+        let filename = format!("mainnet-{epoch:05}-00000000.era1");
+        let dest = era1_dir.join(&filename);
+
+        if dest.exists() {
+            tracing::info!("{filename} already downloaded, skipping");
+            pb.inc(1);
+            continue;
+        }
+
+        let url = format!("{EF_ERA1_BASE}/{filename}");
+        tracing::info!("Downloading {url}");
+
+        let bytes = client.get(&url).send().await?.bytes().await?;
+        // Verify checksum against known checksums file
+        verify_era1_checksum(&bytes, epoch)?;
+        std::fs::write(&dest, &bytes)?;
+
+        pb.inc(1);
+    }
+
+    pb.finish_with_message("ERA1 download complete");
+    println!("Files saved to {}", era1_dir.display());
+    println!("Add to your config: era1_dir = \"{}\"", era1_dir.display());
+    Ok(())
+}
+
+/// Calculate ERA1 epochs needed for a block range.
+/// Each ERA1 file covers 8192 blocks.
+fn epoch_range(from: u64, to: u64) -> Vec<u64> {
+    let first = from / 8192;
+    let last = to / 8192;
+    (first..=last).collect()
+}
+```
+
+CLI addition:
+```rust
+/// Download ERA1 archive files for a block range
+DownloadEra1 {
+    /// Block range, e.g. "17000000-17555000"
+    #[arg(long)]
+    range: String,
+    /// Directory to save ERA1 files (default: era1_dir from config or ~/.scopenode/era1)
+    #[arg(long)]
+    dir: Option<PathBuf>,
+},
+```
+
+---
+
+### RPC fallback warning
+
+After a sync completes, count blocks by source. If `source = "rpc"` exceeds
+10% of total fetched blocks, print a warning:
+
+```
+Warning: 23% of blocks (9,430) came from fallback RPC.
+Your data is verified but sourced from a centralized provider for those blocks.
+To fix: run `scopenode download-era1 --range 17000000-17555000 --dir ~/.scopenode/era1`
+then add era1_dir to your config and re-run `scopenode retry`.
+```
+
+This runs automatically at the end of every sync. No user action needed to
+see it — it surfaces the issue clearly with the exact command to fix it.
+
+---
+
 ## `scopenode status` output (updated for 3a)
 
 ```
@@ -432,9 +521,9 @@ Contracts indexed:
     Range:  block 16291127 → live
     Status: syncing... (78% — ETA 42min)
 
-Sources: 38,412 blocks from Portal (94%)  |  2,100 from ERA1 (5%)  |  419 from RPC (1%)
+Sources: 38,412 blocks from devp2p (94%)  |  2,100 from ERA1 (5%)  |  419 from RPC (1%)
 Node:  localhost:8545 (JSON-RPC)
-Peers: 6 Portal Network peers
+Peers: 6 devp2p peers
 DB:    ~/.scopenode/data.db (286 MB)
 ```
 
@@ -449,8 +538,8 @@ Stage 1/3  Header sync      █████████████████�
 Stage 2/3  Bloom scan       ████████████████████  555,000 / 555,000   done (48,231 hits)
 Stage 3/3  Receipt fetch    ████████░░░░░░░░░░░░   21,847 / 41,000    53%
 
-Peers: 5 active  |  Speed: 14.2 receipts/sec  |  ETA: 1h 23m
-Sources: Portal 18,200 (83%)  |  ERA1 3,400 (16%)  |  RPC 247 (1%)
+devp2p peers: 5 active  |  Speed: 14.2 receipts/sec  |  ETA: 1h 23m
+Sources: devp2p 18,200 (83%)  |  ERA1 3,400 (16%)  |  RPC 247 (1%)
 Events found so far: 12,439 Swap  |  844 Mint  |  601 Burn
 Failed blocks (pending retry): 3
 ```
@@ -476,6 +565,9 @@ Unit:
   - ReorgDetector: buffer never exceeds FINALITY_DEPTH
   - LiveEvent serializes to valid JSON
 
+  - epoch_range(17000000, 17555000) returns correct epoch list
+  - download-era1 skips already-downloaded files
+
 Integration (--ignored):
   - Live sync receives and processes at least 1 new block
   - Reorg: insert events for block A, mark reorged, verify hidden from queries
@@ -492,9 +584,11 @@ Integration (--ignored):
   from all query interfaces
 - [ ] `scopenode snapshot` saves a timestamped copy of the DB
 - [ ] `scopenode restore` restores from a snapshot (auto-snapshots current DB first)
-- [ ] `scopenode doctor` shows portal, beacon, ERA1, DB, and network status
+- [ ] `scopenode doctor` shows devp2p peers, beacon, ERA1, DB, and network status
 - [ ] `scopenode retry` re-fetches all `pending_retry` blocks
-- [ ] Progress TUI shows source breakdown (Portal / ERA1 / RPC)
+- [ ] Progress TUI shows source breakdown (devp2p / ERA1 / RPC)
+- [ ] `scopenode download-era1 --range X-Y` downloads and checksums ERA1 files
+- [ ] Sync completion warns if >10% of blocks came from fallback RPC
 - [ ] All previous phase tests still pass
 
 ---
