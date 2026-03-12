@@ -1,0 +1,17 @@
+[package]
+name = "scopenode-rpc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+jsonrpsee        = { workspace = true }
+tokio            = { workspace = true }
+thiserror        = { workspace = true }
+serde            = { workspace = true }
+serde_json       = { workspace = true }
+tracing          = { workspace = true }
+alloy            = { workspace = true }
+alloy-primitives = { workspace = true }
+async-trait      = { workspace = true }
+scopenode-storage = { workspace = true }
+anyhow            = { workspace = true }

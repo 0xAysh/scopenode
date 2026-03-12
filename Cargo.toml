@@ -1,0 +1,33 @@
+[workspace]
+members = [
+    "crates/scopenode",
+    "crates/scopenode-core",
+    "crates/scopenode-storage",
+    "crates/scopenode-rpc",
+]
+resolver = "2"
+
+[workspace.dependencies]
+alloy             = { version = "1.7", features = ["full"] }
+alloy-primitives  = "1.5"
+alloy-dyn-abi     = "1.5"
+alloy-trie        = "0.9"
+tokio             = { version = "1", features = ["full"] }
+thiserror         = "2"
+anyhow            = "1"
+serde             = { version = "1", features = ["derive"] }
+serde_json        = "1"
+toml              = "0.8"
+tracing           = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap              = { version = "4", features = ["derive", "env"] }
+reqwest           = { version = "0.13", features = ["json", "rustls"], default-features = false }
+sqlx              = { version = "0.8", features = ["sqlite", "runtime-tokio", "migrate"] }
+indicatif         = "0.18"
+async-trait       = "0.1"
+dirs              = "6"
+url               = { version = "2", features = ["serde"] }
+jsonrpsee         = { version = "0.26", features = ["server", "macros"] }
+scopenode-core    = { path = "crates/scopenode-core" }
+scopenode-storage = { path = "crates/scopenode-storage" }
+scopenode-rpc     = { path = "crates/scopenode-rpc" }

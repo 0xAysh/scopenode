@@ -1,0 +1,6 @@
+/target
+*.db
+*.db.snap
+config.test.toml
+.env
+.claude

@@ -1,0 +1,12 @@
+[node]
+port = 8545
+rest_port = 8546
+data_dir = "~/.scopenode"
+
+[[contracts]]
+name = "Uniswap V3 ETH/USDC"
+address = "0x8ad599c3A0ff1De082011EFDDc58f1908eb6e6D8"
+events = ["Swap", "Mint", "Burn"]
+from_block = 17000000
+to_block = 17000100
+# abi_override = "./abis/MyContract.json"

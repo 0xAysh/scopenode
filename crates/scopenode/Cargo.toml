@@ -1,0 +1,22 @@
+[package]
+name = "scopenode"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "scopenode"
+path = "src/main.rs"
+
+[dependencies]
+scopenode-core    = { workspace = true }
+scopenode-storage = { workspace = true }
+scopenode-rpc     = { workspace = true }
+tokio             = { workspace = true }
+anyhow            = { workspace = true }
+clap              = { workspace = true }
+tracing           = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde_json        = { workspace = true }
+dirs              = { workspace = true }
+indicatif         = { workspace = true }
+alloy-primitives  = { workspace = true }
