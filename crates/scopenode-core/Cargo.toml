@@ -19,3 +19,12 @@ async-trait       = { workspace = true }
 url               = { workspace = true }
 indicatif         = { workspace = true }
 scopenode-storage = { workspace = true }
+# devp2p
+reth-network             = { workspace = true }
+reth-network-api         = { workspace = true }
+reth-network-peers       = { workspace = true }
+reth-network-p2p         = { workspace = true }
+reth-eth-wire            = { workspace = true }
+reth-storage-api         = { workspace = true }
+reth-ethereum-primitives = { workspace = true }
+tokio-stream             = { workspace = true }
