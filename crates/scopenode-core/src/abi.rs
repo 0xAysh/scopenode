@@ -315,17 +315,15 @@ impl AbiCache {
         // Serialize the full ABI to JSON for storage. We store ALL events from
         // the ABI (not just the configured subset) so future re-runs with different
         // event configs don't need to re-fetch.
+        // IMPORTANT: must include `components` for tuple types or the cache will
+        // return incomplete ABIs and tuple decoding will fail on second run.
         let abi_json = serde_json::to_string(
             &all_events
                 .iter()
                 .map(|e| {
                     serde_json::json!({
                         "name": e.name,
-                        "inputs": e.inputs.iter().map(|i| serde_json::json!({
-                            "name": i.name,
-                            "type": i.ty,
-                            "indexed": i.indexed,
-                        })).collect::<Vec<_>>(),
+                        "inputs": e.inputs.iter().map(serialize_event_input).collect::<Vec<_>>(),
                     })
                 })
                 .collect::<Vec<_>>(),
@@ -351,6 +349,8 @@ fn parse_cached_events(address: Address, cached_json: &str) -> Result<Vec<EventA
         .iter()
         .filter_map(|entry| {
             let name = entry["name"].as_str()?.to_string();
+            // Use serde_json::from_value so components are restored correctly —
+            // EventInput derives Deserialize which handles nested `components`.
             let inputs = entry["inputs"]
                 .as_array()
                 .map(|arr| {
@@ -364,6 +364,22 @@ fn parse_cached_events(address: Address, cached_json: &str) -> Result<Vec<EventA
         .collect();
 
     Ok(events)
+}
+
+/// Serialize a single [`EventInput`] to a JSON value, including nested `components`.
+///
+/// Must be used when caching ABIs in SQLite. Omitting `components` would
+/// corrupt the cache for any contract using tuple-typed parameters.
+fn serialize_event_input(i: &EventInput) -> Value {
+    serde_json::json!({
+        "name": i.name,
+        "type": i.ty,
+        "indexed": i.indexed,
+        // Recursively serialize components for tuple types.
+        // Empty array for non-tuple types — serde_json::from_value::<EventInput>
+        // will deserialize it back as an empty Vec via #[serde(default)].
+        "components": i.components.iter().map(serialize_event_input).collect::<Vec<_>>(),
+    })
 }
 
 /// Filter a list of `EventAbi` values to only the names requested in the config.
@@ -544,8 +560,12 @@ fn decode_indexed_param(ty: &str, topic: &B256) -> Value {
             // Return as hex string to preserve precision for large values.
             // JavaScript Number loses precision above 2^53, which is well below
             // uint256's max of ~1.16 × 10^77. Clients should parse as BigInt.
+            // Special-case 0: trim_start_matches('0') on all-zeros would give "",
+            // producing "0x" which is invalid. Use "0x0" instead.
             let hex = alloy_primitives::hex::encode(topic.as_slice());
-            Value::String(format!("0x{}", hex.trim_start_matches('0')))
+            let trimmed = hex.trim_start_matches('0');
+            let trimmed = if trimmed.is_empty() { "0" } else { trimmed };
+            Value::String(format!("0x{}", trimmed))
         }
         t if t.starts_with("bytes") && t.len() > 5 => {
             // Fixed-size bytes (bytes1..bytes32) — stored left-aligned in the topic.

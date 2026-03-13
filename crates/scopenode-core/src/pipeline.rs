@@ -15,6 +15,7 @@
 //! already-stored data is never duplicated.
 
 use crate::abi::{AbiCache, EventDecoder};
+use crate::types::StoredEvent as CoreEvent;
 use crate::config::{Config, ContractConfig};
 use crate::error::CoreError;
 use crate::headers::BloomScanner;
@@ -35,8 +36,8 @@ pub struct Pipeline<N: EthNetwork> {
     /// The loaded TOML config.
     config: Config,
 
-    /// Data transport — Phase 1: [`crate::network::RpcNetwork`].
-    /// Phase 2: `DevP2PNetwork` (reth-network + reth-eth-wire).
+    /// Data transport — [`crate::network::DevP2PNetwork`] (devp2p peers).
+    /// Phase 2: extended with multi-peer agreement and ERA1 fallback.
     network: Arc<N>,
 
     /// SQLite database handle (Clone-safe, internally Arc-wrapped).
@@ -140,7 +141,7 @@ impl<N: EthNetwork + 'static> Pipeline<N> {
             .unwrap_or(from);
 
         let candidates = self
-            .bloom_scan(contract, &targets, bloom_start.min(from), to, progress)
+            .bloom_scan(contract, &targets, bloom_start, to, progress)
             .await?;
 
         if dry_run {
@@ -296,12 +297,14 @@ impl<N: EthNetwork + 'static> Pipeline<N> {
         let hits = candidates.len();
         pb.finish_with_message(format!("done ({hits} hits)"));
 
-        // Mark bloom scan as complete up to `to` in the cursor.
+        // Mark bloom scan complete. Pass None for headers_done_to so the upsert
+        // CASE WHEN logic in SQLite preserves the existing headers_done_to value
+        // (which may be ahead of the bloom scan range).
         let cursor = SyncCursor {
             contract: addr_str.clone(),
             from_block: contract.from_block,
             to_block: contract.to_block,
-            headers_done_to: Some(to),
+            headers_done_to: None,
             bloom_done_to: Some(to),
             receipts_done_to: None,
         };
@@ -391,36 +394,8 @@ impl<N: EthNetwork + 'static> Pipeline<N> {
                         let stored_events =
                             decoder.extract_and_decode(&receipts, block_num, block_hash);
 
-                        // Convert core StoredEvent (u64, Address, Bytes) to storage
-                        // StoredEvent (i64, String, hex-string). SQLite uses strings for
-                        // hashes (0x-prefixed hex) and i64 for block numbers. U256 fields
-                        // in decoded JSON are already stringified by the ABI decoder.
                         let storage_events: Vec<scopenode_storage::models::StoredEvent> =
-                            stored_events
-                                .iter()
-                                .map(|e| scopenode_storage::models::StoredEvent {
-                                    contract: e.contract.to_checksum(None),
-                                    event_name: e.event_name.clone(),
-                                    topic0: e.topic0.to_string(),
-                                    block_number: e.block_number as i64,
-                                    block_hash: e.block_hash.to_string(),
-                                    tx_hash: e.tx_hash.to_string(),
-                                    tx_index: e.tx_index as i64,
-                                    log_index: e.log_index as i64,
-                                    // Serialize topics as JSON array of hex strings for readability.
-                                    raw_topics: serde_json::to_string(
-                                        &e.raw_topics
-                                            .iter()
-                                            .map(|t| t.to_string())
-                                            .collect::<Vec<_>>(),
-                                    )
-                                    .unwrap_or_default(),
-                                    // Encode raw data as a hex string for SQLite text storage.
-                                    raw_data: alloy_primitives::hex::encode(&e.raw_data),
-                                    decoded: e.decoded.to_string(),
-                                    source: e.source.clone(),
-                                })
-                                .collect();
+                            stored_events.iter().map(core_to_storage_event).collect();
 
                         total_events += storage_events.len();
                         self.db.insert_events(&storage_events).await?;
@@ -465,5 +440,35 @@ impl<N: EthNetwork + 'static> Pipeline<N> {
         );
 
         Ok(())
+    }
+}
+
+/// Convert a core [`StoredEvent`] (alloy types, u64) to a storage [`StoredEvent`] (strings, i64).
+///
+/// SQLite stores hashes as `0x`-prefixed hex strings and block numbers as i64.
+/// Topics are stored as a JSON array of hex strings. Raw data is stored as a hex string.
+/// U256 values in `decoded` are already stringified by the ABI decoder (JS precision safe).
+fn core_to_storage_event(e: &CoreEvent) -> scopenode_storage::models::StoredEvent {
+    scopenode_storage::models::StoredEvent {
+        contract: e.contract.to_checksum(None),
+        event_name: e.event_name.clone(),
+        topic0: e.topic0.to_string(),
+        block_number: e.block_number as i64,
+        block_hash: e.block_hash.to_string(),
+        tx_hash: e.tx_hash.to_string(),
+        tx_index: e.tx_index as i64,
+        log_index: e.log_index as i64,
+        // JSON array of 0x-prefixed hex strings, e.g. ["0xddf252...", "0x0000...sender"]
+        raw_topics: serde_json::to_string(
+            &e.raw_topics
+                .iter()
+                .map(|t| t.to_string())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap_or_default(),
+        // Hex-encoded bytes (no 0x prefix) for compact SQLite TEXT storage.
+        raw_data: alloy_primitives::hex::encode(&e.raw_data),
+        decoded: e.decoded.to_string(),
+        source: e.source.clone(),
     }
 }

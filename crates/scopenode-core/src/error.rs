@@ -41,35 +41,33 @@ pub enum CoreError {
     Io(#[from] std::io::Error),
 }
 
-/// Errors from the network transport layer (header or receipt fetching).
+/// Errors from the devp2p network transport layer.
 #[derive(Debug, Error)]
 pub enum NetworkError {
-    /// No peer returned headers for this block range.
+    /// devp2p stack failed to start (NetworkManager init, discv4 bind, etc.).
+    #[error("devp2p boot failed: {0}")]
+    Boot(String),
+
+    /// Timed out waiting for enough peers to connect after boot.
     ///
-    /// In Phase 1 this means the RPC returned nothing (unusual for a healthy endpoint).
-    /// In Phase 2 this means all devp2p peers timed out or returned empty responses.
-    #[error("Failed to fetch headers for blocks {0}..{1}")]
+    /// Check internet connectivity and firewall (UDP port must be open for discv4).
+    #[error("devp2p found {found} peer(s) after timeout, need at least {wanted}")]
+    NoPeers { wanted: usize, found: usize },
+
+    /// All connected peers failed to return headers for this block range.
+    ///
+    /// Peers may not have this range (pruned node) or the range may be
+    /// too far behind for non-archive peers.
+    #[error("Failed to fetch headers for blocks {0}..{1} from any peer")]
     HeadersFailed(u64, u64),
 
-    /// Receipt fetch failed for the given reason.
-    ///
-    /// The string contains a human-readable explanation (e.g. HTTP error, peer timeout).
+    /// All connected peers failed to return receipts for one or more blocks.
     #[error("Failed to fetch receipts: {0}")]
     ReceiptsFailed(String),
 
-    /// An underlying RPC/HTTP call failed.
-    ///
-    /// Wraps the error string from `alloy` or `reqwest`. Common causes:
-    /// connection refused, timeout, JSON parse error, or rate limiting.
-    #[error("RPC request failed: {0}")]
-    Rpc(String),
-
-    /// No devp2p peers are available to serve requests.
-    ///
-    /// Phase 2 only. The node has not yet established peer connections,
-    /// or all connected peers have been disconnected.
-    #[error("No peers available")]
-    NoPeers,
+    /// A peer request failed (session error, disconnect, protocol violation).
+    #[error("Peer request failed: {0}")]
+    Peer(String),
 }
 
 /// Errors from ABI fetching or decoding.

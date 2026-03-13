@@ -289,12 +289,23 @@ impl Db {
 
     // ─── Events ────────────────────────────────────────────────────────────────
 
-    /// Bulk insert decoded events into SQLite.
+    /// Bulk insert decoded events into SQLite inside a single transaction.
     ///
-    /// Uses `INSERT OR IGNORE` on `(tx_hash, log_index)` to handle duplicate events
-    /// safely — re-running the pipeline for an already-processed block will not
-    /// create duplicate rows.
+    /// Wrapping N inserts in one transaction is dramatically faster than N
+    /// individual transactions (SQLite flushes to disk per-commit by default).
+    /// Uses `INSERT OR IGNORE` on `(tx_hash, log_index)` so re-running the
+    /// pipeline for an already-processed block never creates duplicates.
+    /// The transaction is all-or-nothing: if any insert fails, none are committed.
     pub async fn insert_events(&self, events: &[StoredEvent]) -> Result<(), DbError> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| DbError::Query(e.to_string()))?;
+
         for e in events {
             sqlx::query(
                 r#"INSERT OR IGNORE INTO events
@@ -314,10 +325,14 @@ impl Db {
             .bind(&e.raw_data)
             .bind(&e.decoded)
             .bind(&e.source)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| DbError::Query(e.to_string()))?;
         }
+
+        tx.commit()
+            .await
+            .map_err(|e| DbError::Query(e.to_string()))?;
         Ok(())
     }
 
@@ -588,13 +603,16 @@ impl Db {
 
     /// Query events for a JSON-RPC `eth_getLogs` filter.
     ///
-    /// Translates the filter's `from_block`/`to_block` into SQL range constraints.
+    /// Filters by `contract` address and optionally by `topic0` (the event selector
+    /// hash, i.e. keccak256 of the event signature). This correctly implements the
+    /// Ethereum JSON-RPC `topics[0]` filter semantics.
+    ///
     /// Only returns non-reorged events (`reorged = 0`). The `limit` guards against
     /// extremely large result sets; 10,000 is the default cap in the RPC server.
     pub async fn query_events_for_filter(
         &self,
         contract: Option<&str>,
-        event_name: Option<&str>,
+        topic0: Option<&str>,
         from_block: Option<u64>,
         to_block: Option<u64>,
         limit: usize,
@@ -604,14 +622,15 @@ impl Db {
         let limit_i = limit as i64;
 
         // Build query dynamically based on which filters are present.
+        // topic0 maps to the indexed `topic0` column, which is the event selector hash.
         let base = r#"SELECT contract, event_name, topic0, block_number, block_hash,
                              tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source
                       FROM events
                       WHERE reorged = 0"#;
 
-        let (sql, has_contract, has_event) = match (contract, event_name) {
+        let (sql, has_contract, has_topic0) = match (contract, topic0) {
             (Some(_), Some(_)) => (
-                format!("{base} AND contract = ? AND event_name = ? AND block_number >= ? AND block_number <= ? ORDER BY block_number ASC, log_index ASC LIMIT ?"),
+                format!("{base} AND contract = ? AND topic0 = ? AND block_number >= ? AND block_number <= ? ORDER BY block_number ASC, log_index ASC LIMIT ?"),
                 true, true,
             ),
             (Some(_), None) => (
@@ -628,8 +647,8 @@ impl Db {
         if has_contract {
             q = q.bind(contract.unwrap());
         }
-        if has_event {
-            q = q.bind(event_name.unwrap());
+        if has_topic0 {
+            q = q.bind(topic0.unwrap());
         }
         q = q.bind(from).bind(to).bind(limit_i);
 

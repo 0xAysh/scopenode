@@ -1,16 +1,19 @@
-//! `sync` command — runs the full pipeline and then serves the JSON-RPC server.
+//! `sync` command — runs the full pipeline, then serves the JSON-RPC server.
 //!
-//! This is the primary command. It:
-//! 1. Fetches headers, runs bloom scans, fetches + verifies + decodes receipts
-//! 2. Stores all indexed events in SQLite
-//! 3. Starts the JSON-RPC server on the configured port
-//! 4. Waits for Ctrl+C, then shuts down gracefully
+//! Steps:
+//! 1. Boot [`DevP2PNetwork`] — connects to Ethereum mainnet peers via devp2p
+//! 2. Build [`Pipeline`] and run it — headers → bloom → receipts → decode → store
+//! 3. Start the JSON-RPC server on the configured port
+//! 4. Wait for Ctrl+C, then shut down gracefully
+//!
+//! No RPC provider is used. All data comes from devp2p peers and is verified
+//! cryptographically via Merkle Patricia Trie before being stored.
 
 use anyhow::{Context, Result};
 use indicatif::MultiProgress;
 use scopenode_core::{
     config::Config,
-    network::RpcNetwork,
+    network::DevP2PNetwork,
     pipeline::Pipeline,
 };
 use scopenode_rpc::start_server;
@@ -19,24 +22,20 @@ use std::sync::Arc;
 use tracing::info;
 
 /// Run the `sync` command.
-///
-/// Steps:
-/// 1. Create the [`RpcNetwork`] transport (Phase 1 implementation of [`EthNetwork`])
-/// 2. Build the [`Pipeline`] and run it — fetches headers, bloom scans, receipts, decodes
-/// 3. After sync: start the JSON-RPC server and wait for Ctrl+C
-///
-/// If `dry_run` is `true`, the pipeline prints a bloom estimate and exits
-/// without fetching receipts or starting the server.
 pub async fn run(
     config: Config,
     db: Db,
     dry_run: bool,
     quiet: bool,
 ) -> Result<()> {
-    let network = RpcNetwork::from_env().context("Failed to create RPC network")?;
+    // Boot the devp2p stack. Connects to Ethereum mainnet peers via discv4
+    // discovery + RLPx transport. Blocks until ≥3 peers are connected.
+    // No RPC URL — no providers — no trusted third party.
+    let network = DevP2PNetwork::start()
+        .await
+        .context("Failed to start devp2p network")?;
     let network = Arc::new(network);
 
-    // Progress bars are hidden in --quiet mode (e.g. when piping output or running in CI).
     let progress = MultiProgress::new();
     if quiet {
         progress.set_draw_target(indicatif::ProgressDrawTarget::hidden());
@@ -45,7 +44,7 @@ pub async fn run(
     let port = config.node.port;
     let mut pipeline = Pipeline::new(config, network, db.clone());
 
-    println!("Starting sync...");
+    println!("Starting sync via devp2p...");
     pipeline
         .run(dry_run, &progress)
         .await
@@ -58,8 +57,6 @@ pub async fn run(
             .context("Failed to start JSON-RPC server")?;
         info!(port, "Server running. Press Ctrl+C to stop.");
 
-        // Block here forever — the server runs on background tokio tasks.
-        // ctrl_c() resolves only when SIGINT is received.
         tokio::signal::ctrl_c()
             .await
             .context("Failed to listen for Ctrl+C")?;

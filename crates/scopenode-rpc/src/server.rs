@@ -86,11 +86,22 @@ impl EthApiServer for EthApiImpl {
         let from_block = filter.get_from_block();
         let to_block = filter.get_to_block();
 
+        // Extract topic0 from the filter if provided — used to narrow the query to
+        // a specific event type. topic0 = keccak256(event signature), e.g. for
+        // Transfer(address,address,uint256) it's 0xddf252ad...
+        // If multiple topic0 values are given (OR semantics), we take the first only —
+        // multi-topic OR queries are rare and add significant query complexity.
+        let topic0_str: Option<String> = filter
+            .topics
+            .first()
+            .and_then(|t| t.iter().next())
+            .map(|t| format!("{:?}", t));
+
         let rows = self
             .db
             .query_events_for_filter(
                 contract_str.as_deref(),
-                None, // Event name filtering via topic0 is not yet implemented here.
+                topic0_str.as_deref(),
                 from_block,
                 to_block,
                 10_000, // Safety cap: prevent response size explosions.

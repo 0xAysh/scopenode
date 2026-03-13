@@ -8,12 +8,10 @@
 //! 4. **[`receipts`]** — Merkle Patricia Trie verification of fetched receipts
 //! 5. **[`pipeline`]** — orchestrates all stages end-to-end with progress bars
 //!
-//! The [`network::EthNetwork`] trait abstracts the data transport layer so that
-//! Phase 2 can swap in real devp2p peer connections without touching the pipeline.
-//!
-//! Phase 1 uses [`network::RpcNetwork`] — an alloy HTTP provider — as a
-//! temporary stand-in. All events are tagged `source = "devp2p"` in the DB so
-//! the schema stays consistent when the real transport is introduced.
+//! The [`network::EthNetwork`] trait abstracts the data transport layer.
+//! [`network::DevP2PNetwork`] implements it using reth-network (devp2p peers).
+//! No RPC provider is used at any point — all data comes from Ethereum mainnet
+//! peers and is verified cryptographically via Merkle Patricia Trie.
 
 #![deny(warnings)]
 
