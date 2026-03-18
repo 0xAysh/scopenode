@@ -51,15 +51,17 @@ use crate::error::NetworkError;
 use crate::types::ScopeHeader;
 
 // ── reth devp2p stack ────────────────────────────────────────────────────────
-use reth_eth_wire::{BlockHashOrNumber, GetReceipts, HeadersDirection, Receipts};
-use reth_network::{config::rng_secret_key, EthNetworkPrimitives, NetworkHandle, NetworkManager};
+use reth_eth_wire::{
+    BlockHashOrNumber, BlockHeaders, GetBlockHeaders, GetReceipts, HeadersDirection, Receipts,
+};
+use alloy_primitives::U256;
+use reth_ethereum_forks::Head;
+use reth_network::{config::rng_secret_key, EthNetworkPrimitives, NetworkHandle, NetworkManager, PeersInfo};
 use reth_network_api::{
     events::{NetworkEvent, PeerEvent},
-    BlockDownloaderProvider, NetworkEventListenerProvider, PeerRequest, PeerRequestSender,
-    PeersInfo,
+    NetworkEventListenerProvider, PeerRequest, PeerRequestSender,
 };
 use reth_network_peers::mainnet_nodes;
-use reth_network_p2p::headers::client::{HeadersClient, HeadersRequest};
 use reth_storage_api::noop::NoopProvider;
 
 // ── Receipt fetch result ──────────────────────────────────────────────────────
@@ -161,6 +163,7 @@ struct PeerSession {
 /// └──────────────────────────────────────────────────────────────────────────┘
 /// ```
 pub struct DevP2PNetwork {
+    #[allow(dead_code)]
     handle: NetworkHandle<EthNetworkPrimitives>,
     /// Active peer sessions keyed by PeerId.
     /// Updated by background task via `handle.event_listener()`.
@@ -186,9 +189,30 @@ impl DevP2PNetwork {
         // Build network config for Ethereum mainnet.
         // mainnet_nodes() returns the EF-maintained Ethereum mainnet bootnodes —
         // stable, well-known peers that seed the Kademlia DHT.
+        // Set head to a known post-Dencun block so the ETH Status handshake
+        // advertises the correct fork ID. Without this, the default is genesis
+        // (block 0), which produces an incompatible fork ID and causes all
+        // mainnet peers to reject our connection immediately.
+        //
+        // Block 21_000_000 (~Sep 2024): safely after Dencun (19_426_589) and
+        // all prior forks. We use a zero hash — peers accept connections as
+        // long as chain_id + fork_id match; they don't validate the head hash.
+        // Post-merge: difficulty = 0, total_difficulty = terminal TD.
+        let head = Head {
+            number: 21_000_000,
+            hash: B256::ZERO,
+            difficulty: U256::ZERO,
+            total_difficulty: U256::from_str_radix(
+                "58750003716598352816469", 10,
+            )
+            .expect("static TTD"),
+            timestamp: 1_726_070_400, // ~2024-09-11 00:00:00 UTC
+        };
+
         let network_config =
             reth_network::config::NetworkConfig::<_, EthNetworkPrimitives>::builder(secret_key)
                 .boot_nodes(mainnet_nodes())
+                .set_head(head)
                 .build(client);
 
         // Spawn NetworkManager — this task runs the full devp2p loop:
@@ -241,47 +265,81 @@ impl DevP2PNetwork {
             }
         });
 
-        // Wait for initial peer connections. discv4 bootstrap takes ~5–10s.
-        // We need at least 3 before fetching is reliable (one peer failing = ok).
-        Self::wait_for_peers(&handle, 3, Duration::from_secs(30)).await?;
+        // Wait for at least 1 connected peer. discv4 bootstrap + RLPx handshake
+        // can take 20–120s on a cold start depending on network conditions.
+        // We only need 1 to begin fetching; additional peers accumulate in the
+        // background and are picked up by the peer tracker as they connect.
+        //
+        // We watch the `peers` HashMap (populated by the background event listener)
+        // rather than `handle.num_connected_peers()`. The latter counts all TCP
+        // connections including EF bootnodes that connect/disconnect within ~1ms,
+        // so polling at 1s intervals always sees zero. The HashMap only contains
+        // peers that have completed the full ETH Status handshake and are ready
+        // to serve data.
+        Self::wait_for_peers(&handle, &peers, 1, Duration::from_secs(180)).await?;
 
+        let map_count = peers.read().await.len();
+        let conn_count = handle.num_connected_peers();
         info!(
-            peers = handle.num_connected_peers(),
-            "devp2p ready — connected to Ethereum mainnet peers"
+            map_peers = map_count,
+            conn_peers = conn_count,
+            "devp2p ready — connected to Ethereum mainnet peer(s)"
         );
+
+        // Give the network a moment to stabilise: the first peer often connects
+        // and disconnects within seconds. A 5s grace period lets additional peers
+        // come in so we have stable connections for the first header request.
+        tokio::time::sleep(Duration::from_secs(5)).await;
 
         Ok(Self { handle, peers })
     }
 
-    /// Poll until `min_peers` are connected, or `timeout` elapses.
+    /// Poll until `min_peers` have completed the ETH handshake, or `timeout` elapses.
+    ///
+    /// Primary signal: the `peers` HashMap (populated by background `NetworkEvent`
+    /// listener) — only contains peers that completed the full ETH Status handshake.
+    ///
+    /// Fallback signal: `handle.num_connected_peers()` — catches cases where the
+    /// event listener task has a race condition and misses some `ActivePeerSession`
+    /// events. If `num_connected_peers() >= min_peers` we also consider it ready,
+    /// since at least that many peers have active TCP sessions.
     async fn wait_for_peers(
         handle: &NetworkHandle<EthNetworkPrimitives>,
+        peers: &Arc<RwLock<HashMap<reth_network_peers::PeerId, PeerSession>>>,
         min_peers: usize,
         timeout: Duration,
     ) -> Result<(), NetworkError> {
         let start = Instant::now();
         loop {
-            let n = handle.num_connected_peers();
+            let map_n = peers.read().await.len();
+            let conn_n = handle.num_connected_peers();
+            // Use the higher of the two counts as evidence of connectivity.
+            let n = map_n.max(conn_n);
             if n >= min_peers {
                 return Ok(());
             }
             if start.elapsed() > timeout {
                 return Err(NetworkError::NoPeers { wanted: min_peers, found: n });
             }
-            debug!(peers = n, elapsed_s = start.elapsed().as_secs(), "waiting for devp2p peers...");
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            debug!(
+                map_peers = map_n,
+                conn_peers = conn_n,
+                elapsed_s = start.elapsed().as_secs(),
+                "waiting for devp2p peers..."
+            );
+            tokio::time::sleep(Duration::from_secs(2)).await;
         }
     }
 
-    /// Pick a connected peer session for sending a receipt request.
+    /// Return clones of all connected peer senders.
     ///
-    /// Returns the sender cloned out of the map so we don't hold the lock
-    /// while awaiting the receipt response.
-    async fn pick_peer(
+    /// Cloned out of the map so we don't hold the lock while making requests.
+    /// The returned vec may be empty if no peers are connected yet.
+    async fn all_peer_senders(
         &self,
-    ) -> Option<PeerRequestSender<PeerRequest<EthNetworkPrimitives>>> {
+    ) -> Vec<PeerRequestSender<PeerRequest<EthNetworkPrimitives>>> {
         let guard = self.peers.read().await;
-        guard.values().next().map(|s| s.sender.clone())
+        guard.values().map(|s| s.sender.clone()).collect()
     }
 }
 
@@ -291,56 +349,92 @@ impl DevP2PNetwork {
 impl EthNetwork for DevP2PNetwork {
     /// Fetch headers for `[from, to]` via `GetBlockHeaders`.
     ///
-    /// Uses `FetchClient` (from reth-network-p2p `HeadersClient` trait).
-    /// FetchClient internally manages peer selection and retries.
-    /// The pipeline calls this in chunks of 64 already, so one wire request per call.
+    /// Sends `PeerRequest::GetBlockHeaders` directly to connected peers' session
+    /// channels — same mechanism as `get_receipts_for_blocks`. This bypasses
+    /// `FetchClient` which can lose track of peers between `wait_for_peers` and
+    /// first use, causing silent empty responses.
     async fn get_headers(&self, from: u64, to: u64) -> Result<Vec<ScopeHeader>, NetworkError> {
         let count = (to - from + 1).min(64);
 
-        // fetch_client() returns a FetchClient that implements HeadersClient.
-        // It selects a peer, sends GetBlockHeaders, waits for response with retries.
-        let fetch = self
-            .handle
-            .fetch_client()
-            .await
-            .map_err(|_| NetworkError::HeadersFailed(from, to))?;
+        // Wait up to 30s for at least one peer.
+        let senders = {
+            let mut attempts = 0u32;
+            loop {
+                let s = self.all_peer_senders().await;
+                if !s.is_empty() || attempts >= 30 {
+                    break s;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                attempts += 1;
+            }
+        };
 
-        let response = fetch
-            .get_headers(HeadersRequest {
-                start: BlockHashOrNumber::Number(from),
-                limit: count,
-                direction: HeadersDirection::Rising,
-            })
-            .await
-            .map_err(|_| NetworkError::HeadersFailed(from, to))?;
-
-        // WithPeerId<Vec<Header>> — into_data() extracts the inner Vec<Header>.
-        let headers = response.into_data();
-
-        if headers.is_empty() {
+        if senders.is_empty() {
             return Err(NetworkError::HeadersFailed(from, to));
         }
 
-        // Convert alloy_consensus::Header → ScopeHeader (our internal type).
-        Ok(headers
-            .into_iter()
-            .map(|h| ScopeHeader {
-                number: h.number,
-                // hash_slow() computes keccak256(rlp(header)) — the canonical block hash.
-                hash: h.hash_slow(),
-                parent_hash: h.parent_hash,
-                timestamp: h.timestamp,
-                receipts_root: h.receipts_root,
-                logs_bloom: h.logs_bloom,
-                gas_used: h.gas_used,
-                base_fee_per_gas: h.base_fee_per_gas.map(|f| f as u128),
-            })
-            .collect())
+        // Try each peer until one returns headers.
+        for (idx, sender) in senders.iter().enumerate() {
+            let (tx, rx) = oneshot::channel();
+            let req = PeerRequest::GetBlockHeaders {
+                request: GetBlockHeaders {
+                    start_block: BlockHashOrNumber::Number(from),
+                    limit: count,
+                    skip: 0,
+                    direction: HeadersDirection::Rising,
+                },
+                response: tx,
+            };
+
+            if sender.to_session_tx.send(req).await.is_err() {
+                debug!(peer_idx = idx, "GetBlockHeaders send failed, trying next peer");
+                continue;
+            }
+
+            match rx.await {
+                Ok(Ok(BlockHeaders(headers))) => {
+                    if headers.is_empty() {
+                        debug!(peer_idx = idx, from, to, "GetBlockHeaders returned empty, trying next peer");
+                        continue;
+                    }
+
+                    // Convert alloy_consensus::Header → ScopeHeader.
+                    return Ok(headers
+                        .into_iter()
+                        .map(|h| ScopeHeader {
+                            number: h.number,
+                            // hash_slow() computes keccak256(rlp(header))
+                            hash: h.hash_slow(),
+                            parent_hash: h.parent_hash,
+                            timestamp: h.timestamp,
+                            receipts_root: h.receipts_root,
+                            logs_bloom: h.logs_bloom,
+                            gas_used: h.gas_used,
+                            base_fee_per_gas: h.base_fee_per_gas.map(|f| f as u128),
+                        })
+                        .collect());
+                }
+                Ok(Err(e)) => {
+                    debug!(peer_idx = idx, err = ?e, "GetBlockHeaders peer error, trying next");
+                    continue;
+                }
+                Err(_) => {
+                    debug!(peer_idx = idx, "GetBlockHeaders channel closed, trying next");
+                    continue;
+                }
+            }
+        }
+
+        Err(NetworkError::HeadersFailed(from, to))
     }
 
     /// Fetch receipts for a batch of blocks (up to 16) via `GetReceipts`.
     ///
-    /// Sends `PeerRequest::GetReceipts` directly to a connected peer's session channel.
+    /// Sends `PeerRequest::GetReceipts` directly to connected peers' session channels.
+    /// Tries each available peer in turn until one returns a valid response.
+    /// Most peers prune historical receipts — retrying across peers improves the
+    /// odds of hitting an archive node that has them.
+    ///
     /// The ETH wire protocol allows up to 16 block hashes per `GetReceipts` request.
     /// The pipeline already batches candidates in groups of 16 before calling here.
     ///
@@ -352,62 +446,98 @@ impl EthNetwork for DevP2PNetwork {
     ) -> Vec<ReceiptFetchResult> {
         let hashes: Vec<B256> = blocks.iter().map(|(_, h, _)| *h).collect();
 
-        let sender = match self.pick_peer().await {
-            Some(s) => s,
-            None => {
-                warn!("no connected peers for GetReceipts");
-                return blocks
-                    .iter()
-                    .map(|(n, _, _)| ReceiptFetchResult::Failed { block_num: *n })
-                    .collect();
+        // Wait up to 60s for at least 3 peers — improves odds of hitting a node
+        // that serves receipts (snap-synced nodes often return empty responses).
+        let senders = {
+            let mut attempts = 0u32;
+            loop {
+                let s = self.all_peer_senders().await;
+                let want = if attempts < 60 { 3 } else { 1 };
+                if s.len() >= want || attempts >= 90 {
+                    break s;
+                }
+                if attempts % 10 == 0 {
+                    debug!(peers = s.len(), elapsed_s = attempts, "waiting for more peers before receipt fetch...");
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                attempts += 1;
             }
         };
 
-        // Set up oneshot channel for the response.
-        let (tx, rx) = oneshot::channel();
-
-        // Send GetReceipts request directly to the peer's session channel.
-        // GetReceipts(Vec<B256>) is a tuple struct — one vec covers all requested blocks.
-        let req = PeerRequest::GetReceipts {
-            request: GetReceipts(hashes),
-            response: tx,
-        };
-
-        if sender.to_session_tx.send(req).await.is_err() {
-            warn!("GetReceipts send failed — peer disconnected");
+        if senders.is_empty() {
+            warn!("no connected peers for GetReceipts");
             return blocks
                 .iter()
                 .map(|(n, _, _)| ReceiptFetchResult::Failed { block_num: *n })
                 .collect();
         }
 
-        match rx.await {
-            Ok(Ok(Receipts(receipt_batches))) => {
-                // receipt_batches: Vec<Vec<Receipt>> — one inner Vec per block, in request order.
-                blocks
-                    .iter()
-                    .zip(receipt_batches.into_iter())
-                    .map(|(&(block_num, block_hash, _receipts_root), wire_receipts)| {
-                        let receipts = build_alloy_receipts(wire_receipts, block_num, block_hash);
-                        ReceiptFetchResult::Ok { block_num, block_hash, receipts }
-                    })
-                    .collect()
+        debug!(peers_available = senders.len(), blocks = blocks.len(), "trying GetReceipts");
+
+        // Try each peer until one returns valid receipts.
+        // Snap-synced nodes often respond with empty batches (no receipt DB).
+        // Archive nodes and full-sync nodes serve receipts for all blocks.
+        for (idx, sender) in senders.iter().enumerate() {
+            let (tx, rx) = oneshot::channel();
+            let req = PeerRequest::GetReceipts {
+                request: GetReceipts(hashes.clone()),
+                response: tx,
+            };
+
+            if sender.to_session_tx.send(req).await.is_err() {
+                debug!(peer_idx = idx, "GetReceipts send failed — peer disconnected, trying next");
+                continue;
             }
-            Ok(Err(e)) => {
-                warn!(err = ?e, "GetReceipts peer returned error");
-                blocks
-                    .iter()
-                    .map(|(n, _, _)| ReceiptFetchResult::Failed { block_num: *n })
-                    .collect()
-            }
-            Err(_) => {
-                warn!("GetReceipts response channel closed (peer disconnected)");
-                blocks
-                    .iter()
-                    .map(|(n, _, _)| ReceiptFetchResult::Failed { block_num: *n })
-                    .collect()
+
+            match rx.await {
+                Ok(Ok(Receipts(receipt_batches))) => {
+                    let outer_len = receipt_batches.len();
+                    let inner_total: usize = receipt_batches.iter().map(|v| v.len()).sum();
+                    debug!(
+                        peer_idx = idx,
+                        outer_len,
+                        inner_total,
+                        "GetReceipts response"
+                    );
+
+                    // Peer returned data. Verify it has actual receipts.
+                    // Empty outer vec or all-empty inner vecs = peer has no receipts.
+                    let has_data = receipt_batches.iter().any(|v| !v.is_empty());
+                    if !has_data {
+                        debug!(peer_idx = idx, outer_len, "GetReceipts empty — peer lacks receipt data, trying next");
+                        continue;
+                    }
+
+                    // receipt_batches: Vec<Vec<ReceiptWithBloom>> — one inner Vec per block.
+                    return blocks
+                        .iter()
+                        .zip(receipt_batches.into_iter())
+                        .map(|(&(block_num, block_hash, _receipts_root), wire_receipts)| {
+                            let receipts =
+                                build_alloy_receipts(wire_receipts, block_num, block_hash);
+                            ReceiptFetchResult::Ok { block_num, block_hash, receipts }
+                        })
+                        .collect();
+                }
+                Ok(Err(e)) => {
+                    debug!(peer_idx = idx, err = ?e, "GetReceipts peer error, trying next");
+                    continue;
+                }
+                Err(_) => {
+                    debug!(peer_idx = idx, "GetReceipts channel closed, trying next");
+                    continue;
+                }
             }
         }
+
+        warn!(
+            peers_tried = senders.len(),
+            "GetReceipts: all peers failed (likely snap-synced nodes without receipt DB)"
+        );
+        blocks
+            .iter()
+            .map(|(n, _, _)| ReceiptFetchResult::Failed { block_num: *n })
+            .collect()
     }
 
     /// Return the best block number from connected peers' Status messages.

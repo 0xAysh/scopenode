@@ -6144,6 +6144,7 @@ dependencies = [
  "indicatif",
  "reqwest 0.13.2",
  "reth-eth-wire",
+ "reth-ethereum-forks",
  "reth-ethereum-primitives",
  "reth-network",
  "reth-network-api",
