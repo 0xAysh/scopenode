@@ -279,6 +279,12 @@ impl<N: EthNetwork + 'static> Pipeline<N> {
         progress: &MultiProgress,
     ) -> Result<Vec<(u64, B256, B256)>, CoreError> {
         let headers = self.db.get_headers(from, to).await?;
+
+        // Nothing new to scan — bloom was already done for this range on a prior run.
+        if headers.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let total = headers.len() as u64;
         let pb = progress.add(ProgressBar::new(total));
         pb.set_style(
