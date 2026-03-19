@@ -28,18 +28,27 @@ pub async fn run(
     dry_run: bool,
     quiet: bool,
 ) -> Result<()> {
-    // Boot the devp2p stack. Connects to Ethereum mainnet peers via discv4
-    // discovery + RLPx transport. Blocks until ≥3 peers are connected.
-    // No RPC URL — no providers — no trusted third party.
+    let progress = MultiProgress::new();
+    if quiet {
+        progress.set_draw_target(indicatif::ProgressDrawTarget::hidden());
+    }
+
+    // Show a spinner while waiting for devp2p peers — cold start can take 1–3 min.
+    let spinner = progress.add(indicatif::ProgressBar::new_spinner());
+    spinner.set_style(
+        indicatif::ProgressStyle::default_spinner()
+            .template("{spinner:.cyan} {msg}")
+            .unwrap_or_else(|_| indicatif::ProgressStyle::default_spinner()),
+    );
+    spinner.set_message("Connecting to Ethereum mainnet peers via devp2p...");
+    spinner.enable_steady_tick(std::time::Duration::from_millis(100));
+
     let network = DevP2PNetwork::start()
         .await
         .context("Failed to start devp2p network")?;
     let network = Arc::new(network);
 
-    let progress = MultiProgress::new();
-    if quiet {
-        progress.set_draw_target(indicatif::ProgressDrawTarget::hidden());
-    }
+    spinner.finish_with_message("Connected to Ethereum mainnet peers ✓");
 
     let port = config.node.port;
     let mut pipeline = Pipeline::new(config, network, db.clone());
