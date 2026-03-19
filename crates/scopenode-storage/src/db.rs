@@ -583,6 +583,25 @@ impl Db {
         Ok(row.count)
     }
 
+    /// Count all bloom candidates for a contract (fetched + pending + unfetched).
+    ///
+    /// Used by `--dry-run` to report the total known candidate count when
+    /// resuming a sync where the bloom scan was already completed.
+    pub async fn count_bloom_candidates(&self, contract: &str) -> Result<i64, DbError> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            count: i64,
+        }
+        let row = sqlx::query_as::<_, Row>(
+            r#"SELECT COUNT(*) as count FROM bloom_candidates WHERE contract = ?"#,
+        )
+        .bind(contract)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| DbError::Query(e.to_string()))?;
+        Ok(row.count)
+    }
+
     /// Return the on-disk size of the database in bytes.
     ///
     /// Uses SQLite `PRAGMA page_count` and `PRAGMA page_size` to compute the

@@ -145,22 +145,38 @@ impl<N: EthNetwork + 'static> Pipeline<N> {
             .await?;
 
         if dry_run {
-            // In dry-run mode, just print the bloom estimate and exit without fetching.
             let total_blocks = to.saturating_sub(from) + 1;
+            // When resuming, `candidates` only contains newly-scanned blocks.
+            // Load the total candidate count from the DB so the report reflects
+            // the full picture, not just the delta since the last run.
+            let addr_str = contract.address.to_checksum(None);
+            let total_candidates = self
+                .db
+                .count_bloom_candidates(&addr_str)
+                .await
+                .unwrap_or(candidates.len() as i64) as usize;
             let hit_rate = if total_blocks > 0 {
-                candidates.len() as f64 / total_blocks as f64 * 100.0
+                total_candidates as f64 / total_blocks as f64 * 100.0
             } else {
                 0.0
             };
+            let headers_synced = headers_start > to;
+            let bloom_synced = bloom_start > to;
             println!();
             println!("Dry run complete for {} ({})", label, contract.address);
             println!(
                 "  Block range:     {} → {} ({} blocks)",
                 from, to, total_blocks
             );
+            if headers_synced {
+                println!("  Headers:         already synced ✓");
+            }
+            if bloom_synced {
+                println!("  Bloom scan:      already done ✓");
+            }
             println!(
                 "  Bloom matches:   {} blocks ({:.1}% hit rate)",
-                candidates.len(),
+                total_candidates,
                 hit_rate
             );
             println!("  Estimated time:  < 1 minute");
