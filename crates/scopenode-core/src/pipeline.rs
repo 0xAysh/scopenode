@@ -239,7 +239,7 @@ impl<N: EthNetwork + 'static> Pipeline<N> {
                     parent_hash: header.parent_hash.to_string(),
                     timestamp: header.timestamp as i64,
                     receipts_root: header.receipts_root.to_string(),
-                    logs_bloom: header.logs_bloom.as_slice().to_vec(),
+                    logs_bloom: alloy_primitives::hex::encode(header.logs_bloom.as_slice()),
                     gas_used: header.gas_used as i64,
                     base_fee: header.base_fee_per_gas.map(|f| f as i64),
                 };

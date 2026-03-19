@@ -7,8 +7,8 @@
 //!
 //! Hashes and addresses are stored as hex strings (with `0x` prefix) rather than
 //! raw blobs for readability when inspecting the database with external tools.
-//! The `logs_bloom` field is the exception — stored as a raw 256-byte BLOB for
-//! efficiency (the bloom is never read as text).
+//! All fields including `logs_bloom` are stored as text for readability in
+//! external DB browsers. Bloom is stored as a lowercase 512-char hex string.
 
 /// A block header row as stored in SQLite.
 ///
@@ -32,11 +32,11 @@ pub struct StoredHeader {
     /// Merkle root of receipts — used for Merkle verification in the pipeline.
     pub receipts_root: String,
 
-    /// Raw 256-byte bloom filter blob.
+    /// Bloom filter as a lowercase 512-char hex string (256 bytes × 2 hex chars).
     ///
-    /// Stored as a BLOB (not hex) for efficiency — the bloom is loaded back into
-    /// an `alloy_primitives::Bloom` by `bloom_from_bytes` in `db.rs`.
-    pub logs_bloom: Vec<u8>,
+    /// Stored as TEXT so it is human-readable in external DB browsers.
+    /// Parsed back into `alloy_primitives::Bloom` by `bloom_from_hex` in `db.rs`.
+    pub logs_bloom: String,
 
     /// Total gas used by all transactions in this block.
     pub gas_used: i64,

@@ -107,9 +107,9 @@ impl Db {
 
     /// Fetch all headers in `[from, to]` in ascending order.
     ///
-    /// Returns [`HeaderRow`] which has `logs_bloom` already parsed from the raw BLOB
-    /// into an `alloy_primitives::Bloom` — the bloom scanner can use it directly
-    /// without re-parsing.
+    /// Returns [`HeaderRow`] which has `logs_bloom` already parsed from the hex
+    /// string into an `alloy_primitives::Bloom` — the bloom scanner can use it
+    /// directly without re-parsing.
     pub async fn get_headers(&self, from: u64, to: u64) -> Result<Vec<HeaderRow>, DbError> {
         let from_i = from as i64;
         let to_i = to as i64;
@@ -121,7 +121,7 @@ impl Db {
             parent_hash: String,
             timestamp: i64,
             receipts_root: String,
-            logs_bloom: Vec<u8>,
+            logs_bloom: String,
             gas_used: i64,
             base_fee: Option<i64>,
         }
@@ -144,9 +144,7 @@ impl Db {
                 parent_hash: r.parent_hash,
                 timestamp: r.timestamp,
                 receipts_root: r.receipts_root,
-                // Parse the 256-byte BLOB into an alloy Bloom once here, rather
-                // than on every bloom check in the scanner.
-                logs_bloom: bloom_from_bytes(&r.logs_bloom),
+                logs_bloom: bloom_from_hex(&r.logs_bloom),
                 gas_used: r.gas_used,
                 base_fee: r.base_fee,
             })
@@ -677,18 +675,29 @@ impl Db {
     }
 }
 
-/// Parse a 256-byte BLOB from SQLite back into an alloy `Bloom` type.
+/// Parse a lowercase hex string from SQLite back into an alloy `Bloom` type.
 ///
 /// Returns the zero bloom (all bits unset) on invalid input — this means any
 /// bloom check on a corrupt header will return false (no false matches), which
-/// is the safe fallback.
-fn bloom_from_bytes(bytes: &[u8]) -> Bloom {
-    if bytes.len() == 256 {
-        let mut arr = [0u8; 256];
-        arr.copy_from_slice(bytes);
-        Bloom::new(arr)
-    } else {
-        Bloom::default()
+/// is the safe fallback. Logs a warning so corrupt rows are visible.
+fn bloom_from_hex(hex_str: &str) -> Bloom {
+    match alloy_primitives::hex::decode(hex_str) {
+        Ok(bytes) if bytes.len() == 256 => {
+            let mut arr = [0u8; 256];
+            arr.copy_from_slice(&bytes);
+            Bloom::new(arr)
+        }
+        Ok(bytes) => {
+            tracing::warn!(
+                len = bytes.len(),
+                "logs_bloom hex has wrong byte length (expected 256), using zero bloom"
+            );
+            Bloom::default()
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "corrupt logs_bloom hex in DB, using zero bloom");
+            Bloom::default()
+        }
     }
 }
 
