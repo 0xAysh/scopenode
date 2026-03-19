@@ -270,7 +270,7 @@ Database: `~/.scopenode/scopenode.db` (SQLite, WAL mode).
 - [x] Sourcify ABI fetch + `alloy-dyn-abi` decoding
 - [x] SQLite storage, WAL mode, resumable sync
 - [x] JSON-RPC server (`eth_getLogs`, `eth_blockNumber`, `eth_chainId`)
-- [ ] `status` and `query` commands
+- [x] `status` and `query` commands
 
 > **Known limitation:** Most modern Ethereum mainnet nodes use snap sync and do not
 > maintain a receipts database accessible via the `GetReceipts` devp2p wire message.
