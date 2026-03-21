@@ -35,7 +35,7 @@
 //! These synthetic values enable correct `(tx_hash, log_index)` deduplication in SQLite
 //! and survive re-runs (same inputs → same hash → `INSERT OR IGNORE` skips duplicates).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -48,6 +48,7 @@ use tokio_stream::StreamExt as _;
 use tracing::{debug, info, warn};
 
 use crate::error::NetworkError;
+use crate::receipts::verify_receipts;
 use crate::types::ScopeHeader;
 
 // ── reth devp2p stack ────────────────────────────────────────────────────────
@@ -168,6 +169,12 @@ pub struct DevP2PNetwork {
     /// Active peer sessions keyed by PeerId.
     /// Updated by background task via `handle.event_listener()`.
     peers: Arc<RwLock<HashMap<reth_network_peers::PeerId, PeerSession>>>,
+    /// Peers that returned data failing MPT verification — skipped for the session.
+    ///
+    /// A peer is blacklisted immediately when any receipt batch it returns does not
+    /// reproduce the expected `receipts_root`. It stays blacklisted until the
+    /// process restarts (ephemeral — blacklist is in-memory only).
+    blacklisted: Arc<RwLock<HashSet<reth_network_peers::PeerId>>>,
 }
 
 impl DevP2PNetwork {
@@ -291,7 +298,11 @@ impl DevP2PNetwork {
         // come in so we have stable connections for the first header request.
         tokio::time::sleep(Duration::from_secs(5)).await;
 
-        Ok(Self { handle, peers })
+        Ok(Self {
+            handle,
+            peers,
+            blacklisted: Arc::new(RwLock::new(HashSet::new())),
+        })
     }
 
     /// Poll until `min_peers` have completed the ETH handshake, or `timeout` elapses.
@@ -331,15 +342,28 @@ impl DevP2PNetwork {
         }
     }
 
-    /// Return clones of all connected peer senders.
+    /// Return `(PeerId, sender)` pairs for all connected peers that are not blacklisted.
     ///
-    /// Cloned out of the map so we don't hold the lock while making requests.
-    /// The returned vec may be empty if no peers are connected yet.
-    async fn all_peer_senders(
+    /// Cloned out of the maps so we don't hold the locks while making requests.
+    /// The returned vec may be empty if no usable peers are connected.
+    async fn usable_peer_senders(
         &self,
-    ) -> Vec<PeerRequestSender<PeerRequest<EthNetworkPrimitives>>> {
-        let guard = self.peers.read().await;
-        guard.values().map(|s| s.sender.clone()).collect()
+    ) -> Vec<(reth_network_peers::PeerId, PeerRequestSender<PeerRequest<EthNetworkPrimitives>>)> {
+        let peers = self.peers.read().await;
+        let blacklisted = self.blacklisted.read().await;
+        peers
+            .iter()
+            .filter(|(id, _)| !blacklisted.contains(*id))
+            .map(|(id, s)| (*id, s.sender.clone()))
+            .collect()
+    }
+
+    /// Blacklist a peer for this session.
+    ///
+    /// Called when a peer returns receipt data that fails MPT verification.
+    /// The peer will be skipped for all future requests until the process restarts.
+    async fn blacklist_peer(&self, peer_id: reth_network_peers::PeerId) {
+        self.blacklisted.write().await.insert(peer_id);
     }
 }
 
@@ -356,11 +380,11 @@ impl EthNetwork for DevP2PNetwork {
     async fn get_headers(&self, from: u64, to: u64) -> Result<Vec<ScopeHeader>, NetworkError> {
         let count = (to - from + 1).min(64);
 
-        // Wait up to 30s for at least one peer.
+        // Wait up to 30s for at least one usable (non-blacklisted) peer.
         let senders = {
             let mut attempts = 0u32;
             loop {
-                let s = self.all_peer_senders().await;
+                let s = self.usable_peer_senders().await;
                 if !s.is_empty() || attempts >= 30 {
                     break s;
                 }
@@ -374,7 +398,7 @@ impl EthNetwork for DevP2PNetwork {
         }
 
         // Try each peer until one returns headers.
-        for (idx, sender) in senders.iter().enumerate() {
+        for (peer_id, sender) in &senders {
             let (tx, rx) = oneshot::channel();
             let req = PeerRequest::GetBlockHeaders {
                 request: GetBlockHeaders {
@@ -387,14 +411,14 @@ impl EthNetwork for DevP2PNetwork {
             };
 
             if sender.to_session_tx.send(req).await.is_err() {
-                debug!(peer_idx = idx, "GetBlockHeaders send failed, trying next peer");
+                debug!(%peer_id, "GetBlockHeaders send failed, trying next peer");
                 continue;
             }
 
             match rx.await {
                 Ok(Ok(BlockHeaders(headers))) => {
                     if headers.is_empty() {
-                        debug!(peer_idx = idx, from, to, "GetBlockHeaders returned empty, trying next peer");
+                        debug!(%peer_id, from, to, "GetBlockHeaders returned empty, trying next peer");
                         continue;
                     }
 
@@ -415,11 +439,11 @@ impl EthNetwork for DevP2PNetwork {
                         .collect());
                 }
                 Ok(Err(e)) => {
-                    debug!(peer_idx = idx, err = ?e, "GetBlockHeaders peer error, trying next");
+                    debug!(%peer_id, err = ?e, "GetBlockHeaders peer error, trying next");
                     continue;
                 }
                 Err(_) => {
-                    debug!(peer_idx = idx, "GetBlockHeaders channel closed, trying next");
+                    debug!(%peer_id, "GetBlockHeaders channel closed, trying next");
                     continue;
                 }
             }
@@ -446,12 +470,12 @@ impl EthNetwork for DevP2PNetwork {
     ) -> Vec<ReceiptFetchResult> {
         let hashes: Vec<B256> = blocks.iter().map(|(_, h, _)| *h).collect();
 
-        // Wait up to 60s for at least 3 peers — improves odds of hitting a node
-        // that serves receipts (snap-synced nodes often return empty responses).
+        // Wait up to 60s for at least 3 usable (non-blacklisted) peers.
+        // Archive nodes and full-sync nodes serve receipts; snap-sync nodes often don't.
         let senders = {
             let mut attempts = 0u32;
             loop {
-                let s = self.all_peer_senders().await;
+                let s = self.usable_peer_senders().await;
                 let want = if attempts < 60 { 3 } else { 1 };
                 if s.len() >= want || attempts >= 90 {
                     break s;
@@ -465,7 +489,7 @@ impl EthNetwork for DevP2PNetwork {
         };
 
         if senders.is_empty() {
-            warn!("no connected peers for GetReceipts");
+            warn!("no usable peers for GetReceipts");
             return blocks
                 .iter()
                 .map(|(n, _, _)| ReceiptFetchResult::Failed { block_num: *n })
@@ -474,10 +498,10 @@ impl EthNetwork for DevP2PNetwork {
 
         debug!(peers_available = senders.len(), blocks = blocks.len(), "trying GetReceipts");
 
-        // Try each peer until one returns valid receipts.
-        // Snap-synced nodes often respond with empty batches (no receipt DB).
-        // Archive nodes and full-sync nodes serve receipts for all blocks.
-        for (idx, sender) in senders.iter().enumerate() {
+        // Try each peer in turn. On receipt, convert to alloy types and run MPT
+        // verification immediately. A peer whose data fails verification is
+        // blacklisted for the session and the next peer is tried for the whole batch.
+        for (peer_id, sender) in &senders {
             let (tx, rx) = oneshot::channel();
             let req = PeerRequest::GetReceipts {
                 request: GetReceipts(hashes.clone()),
@@ -485,7 +509,7 @@ impl EthNetwork for DevP2PNetwork {
             };
 
             if sender.to_session_tx.send(req).await.is_err() {
-                debug!(peer_idx = idx, "GetReceipts send failed — peer disconnected, trying next");
+                debug!(%peer_id, "GetReceipts send failed — peer disconnected, trying next");
                 continue;
             }
 
@@ -493,38 +517,50 @@ impl EthNetwork for DevP2PNetwork {
                 Ok(Ok(Receipts(receipt_batches))) => {
                     let outer_len = receipt_batches.len();
                     let inner_total: usize = receipt_batches.iter().map(|v| v.len()).sum();
-                    debug!(
-                        peer_idx = idx,
-                        outer_len,
-                        inner_total,
-                        "GetReceipts response"
-                    );
+                    debug!(%peer_id, outer_len, inner_total, "GetReceipts response");
 
-                    // Peer returned data. Verify it has actual receipts.
-                    // Empty outer vec or all-empty inner vecs = peer has no receipts.
+                    // Snap-synced nodes return empty responses (no receipt DB).
                     let has_data = receipt_batches.iter().any(|v| !v.is_empty());
                     if !has_data {
-                        debug!(peer_idx = idx, outer_len, "GetReceipts empty — peer lacks receipt data, trying next");
+                        debug!(%peer_id, outer_len, "GetReceipts empty — peer lacks receipt data, trying next");
                         continue;
                     }
 
-                    // receipt_batches: Vec<Vec<ReceiptWithBloom>> — one inner Vec per block.
-                    return blocks
-                        .iter()
-                        .zip(receipt_batches.into_iter())
-                        .map(|(&(block_num, block_hash, _receipts_root), wire_receipts)| {
-                            let receipts =
-                                build_alloy_receipts(wire_receipts, block_num, block_hash);
-                            ReceiptFetchResult::Ok { block_num, block_hash, receipts }
-                        })
-                        .collect();
+                    // Convert wire receipts → alloy types and verify MPT for every block.
+                    // If any block's root mismatches, this peer is sending bad data —
+                    // blacklist it immediately and try the next peer for the whole batch.
+                    let mut converted: Vec<ReceiptFetchResult> = Vec::with_capacity(blocks.len());
+                    let mut peer_bad = false;
+
+                    for (&(block_num, block_hash, receipts_root), wire_receipts) in
+                        blocks.iter().zip(receipt_batches.into_iter())
+                    {
+                        let receipts = build_alloy_receipts(wire_receipts, block_num, block_hash);
+
+                        if let Err(e) = verify_receipts(&receipts, receipts_root, block_num) {
+                            warn!(
+                                %peer_id, block = block_num, err = %e,
+                                "MPT verification failed — blacklisting peer"
+                            );
+                            self.blacklist_peer(*peer_id).await;
+                            peer_bad = true;
+                            break;
+                        }
+
+                        converted.push(ReceiptFetchResult::Ok { block_num, block_hash, receipts });
+                    }
+
+                    if !peer_bad {
+                        return converted;
+                    }
+                    // Peer blacklisted; fall through to the next peer.
                 }
                 Ok(Err(e)) => {
-                    debug!(peer_idx = idx, err = ?e, "GetReceipts peer error, trying next");
+                    debug!(%peer_id, err = ?e, "GetReceipts peer error, trying next");
                     continue;
                 }
                 Err(_) => {
-                    debug!(peer_idx = idx, "GetReceipts channel closed, trying next");
+                    debug!(%peer_id, "GetReceipts channel closed, trying next");
                     continue;
                 }
             }
@@ -532,7 +568,7 @@ impl EthNetwork for DevP2PNetwork {
 
         warn!(
             peers_tried = senders.len(),
-            "GetReceipts: all peers failed (likely snap-synced nodes without receipt DB)"
+            "GetReceipts: all peers failed or were blacklisted"
         );
         blocks
             .iter()
