@@ -16,7 +16,6 @@ toml              = { workspace = true }
 tracing           = { workspace = true }
 reqwest           = { workspace = true }
 async-trait       = { workspace = true }
-url               = { workspace = true }
 indicatif         = { workspace = true }
 scopenode-storage = { workspace = true }
 # devp2p

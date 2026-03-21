@@ -19,7 +19,6 @@ use crate::error::ConfigError;
 use alloy_primitives::Address;
 use serde::Deserialize;
 use std::path::PathBuf;
-use url::Url;
 
 /// Root configuration loaded from `config.toml`.
 #[derive(Debug, Deserialize)]
@@ -43,25 +42,12 @@ pub struct NodeConfig {
     #[serde(default = "default_port")]
     pub port: u16,
 
-    /// REST API port (Phase 3b). Default: 8546.
-    ///
-    /// The REST API is not yet implemented; this field is reserved for Phase 3b.
-    #[serde(default = "default_rest_port")]
-    pub rest_port: u16,
-
     /// Directory for the SQLite database and other persistent state.
     ///
     /// Defaults to `~/.scopenode`. Can be overridden by `--data-dir` on the
     /// CLI or the `SCOPENODE_DATA_DIR` environment variable. Tilde expansion
     /// is performed so `~/my-data` works as expected.
     pub data_dir: Option<PathBuf>,
-
-    /// Optional last-resort RPC endpoint (Phase 2).
-    ///
-    /// Used for proxy detection (`eth_getStorageAt`) and receipt fallback when
-    /// devp2p fails. Receipts from this source are still Merkle-verified against
-    /// the header's `receipts_root` before being stored.
-    pub fallback_rpc: Option<Url>,
 }
 
 /// Configuration for a single contract to sync.
@@ -91,14 +77,9 @@ pub struct ContractConfig {
 
     /// Last block to sync (inclusive).
     ///
-    /// Omit for live sync (Phase 3a). When present, the pipeline stops after
+    /// Omit for live sync (Phase 3). When present, the pipeline stops after
     /// processing this block and does not poll for new blocks.
     pub to_block: Option<u64>,
-
-    /// Optional HTTP endpoint to POST new events to during live sync (Phase 3b).
-    ///
-    /// Not yet implemented. Reserved for the webhook notification feature in Phase 3b.
-    pub webhook: Option<Url>,
 
     /// Path to a local ABI JSON file. Use when the contract is not verified on Sourcify.
     ///
@@ -106,6 +87,15 @@ pub struct ContractConfig {
     /// (same as what `solc --abi` or Hardhat/Foundry produce). Only event entries
     /// are used; function and error entries are ignored.
     pub abi_override: Option<PathBuf>,
+
+    /// Implementation address for proxy contracts (EIP-1967 or any proxy pattern).
+    ///
+    /// When set, the ABI is fetched from this address on Sourcify instead of `address`.
+    /// The proxy contract itself emits the events, so `address` is still used for
+    /// bloom scanning and log matching. Only the ABI lookup is redirected.
+    ///
+    /// Use `scopenode validate <config>` to confirm the ABI resolves correctly.
+    pub impl_address: Option<Address>,
 }
 
 impl Config {
@@ -148,7 +138,4 @@ impl Config {
 
 fn default_port() -> u16 {
     8545
-}
-fn default_rest_port() -> u16 {
-    8546
 }

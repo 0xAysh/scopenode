@@ -6159,7 +6159,6 @@ dependencies = [
  "tokio-stream",
  "toml",
  "tracing",
- "url",
 ]
 
 [[package]]
