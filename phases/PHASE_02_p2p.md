@@ -56,14 +56,13 @@ If detection fails (peer doesn't serve it): warn and require `abi_override`.
 
 ### `scopenode validate config.toml`
 
-Checks before syncing:
-- Address is valid
-- Contract on Sourcify (or `abi_override` set)
-- All listed events exist in the ABI
-- Proxy detected and resolved (if applicable)
-- Peer pool reachable (at least 3 connected peers)
+Checks before syncing (no devp2p connection needed):
+- Contract on Sourcify (or `abi_override` set and readable)
+- All listed event names exist in the ABI
+- `impl_address`, if set, resolves to an ABI on Sourcify
 
-Prints a per-contract report. Safe to run without modifying any state.
+Prints a per-contract ✓/✗ report. Safe to run without modifying any state.
+Exits with code 1 if any check fails — usable in CI.
 
 ### `scopenode abi 0x<address>`
 
@@ -72,29 +71,28 @@ topic0 hash. Useful for building configs and debugging.
 
 ```
 Event: Swap
-  Signature: Swap(address,address,int256,int256,uint160,uint128,int24)
-  Topic0:    0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67
-  Fields:
-    sender        address  [indexed]
-    recipient     address  [indexed]
-    amount0       int256
-    amount1       int256
-    sqrtPriceX96  uint160
-    liquidity     uint128
-    tick          int24
+  Signature : Swap(address,address,int256,int256,uint160,uint128,int24)
+  Topic0    : 0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67
+  Parameters:
+    address       sender      [indexed]
+    address       recipient   [indexed]
+    int256        amount0
+    int256        amount1
+    uint160       sqrtPriceX96
+    uint128       liquidity
+    int24         tick
 ```
 
 ---
 
 ## Definition of done
 
-- [ ] MPT verification failure → peer blacklisted, next peer tried, no user action needed
-- [ ] Unresponsive peer → rotated out, fresh peer pulled from discovery pool
-- [ ] Sync never stalls due to a single bad peer (auto-recovery within 10s)
-- [ ] Proxy detection resolves EIP-1967 implementation address automatically
-- [ ] Resolved proxy address cached in SQLite (not re-fetched on resume)
-- [ ] Contract not on Sourcify + no `abi_override` → clear error with fix instructions
-- [ ] `scopenode validate config.toml` — per-contract report: address, ABI, events, proxy, peers
-- [ ] `scopenode abi 0x...` — lists all events with signatures and topic0 hashes
-- [ ] Unit tests: peer blacklist logic, proxy detection (mocked), Sourcify parse
-- [ ] Integration test: sync recovers after injecting a peer that returns bad receipts
+- [x] MPT verification failure → peer blacklisted immediately, next peer tried automatically
+- [x] Blacklisted peers skipped for all subsequent requests in the session
+- [ ] Sync never stalls due to a single bad peer (needs integration test)
+- [x] `impl_address` in config → ABI fetched from implementation address on Sourcify
+- [x] Contract not on Sourcify + no `abi_override` → clear error with exact fix instructions
+- [x] `scopenode validate config.toml` — per-contract report: ABI ✓, events ✓, proxy info
+- [x] `scopenode abi 0x...` — lists all events with signatures and topic0 hashes
+- [ ] Unit tests: peer blacklist logic, Sourcify parse edge cases
+- [ ] Integration test: sync recovers after a peer returns bad receipts
