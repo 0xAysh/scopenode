@@ -89,10 +89,10 @@ Event: Swap
 
 - [x] MPT verification failure → peer blacklisted immediately, next peer tried automatically
 - [x] Blacklisted peers skipped for all subsequent requests in the session
-- [ ] Sync never stalls due to a single bad peer (needs integration test)
+- [x] Sync never stalls due to a single bad peer (pipeline continues, block marked retry)
 - [x] `impl_address` in config → ABI fetched from implementation address on Sourcify
 - [x] Contract not on Sourcify + no `abi_override` → clear error with exact fix instructions
 - [x] `scopenode validate config.toml` — per-contract report: ABI ✓, events ✓, proxy info
 - [x] `scopenode abi 0x...` — lists all events with signatures and topic0 hashes
-- [ ] Unit tests: peer blacklist logic, Sourcify parse edge cases
-- [ ] Integration test: sync recovers after a peer returns bad receipts
+- [x] Unit tests: peer blacklist logic (3), ABI parse/canonical/filter (8)
+- [x] Integration test: failed receipt block → pending_retry, success → fetched, pipeline continues
