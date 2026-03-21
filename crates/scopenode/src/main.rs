@@ -96,6 +96,14 @@ async fn main() -> Result<()> {
             commands::query::run(db, contract.clone(), event.clone(), *limit, output.clone())
                 .await?;
         }
+
+        Command::Abi { address } => {
+            commands::abi::run(address).await?;
+        }
+
+        Command::Validate { config } => {
+            commands::validate::run(config.clone()).await?;
+        }
     }
 
     Ok(())

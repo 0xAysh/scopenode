@@ -47,4 +47,14 @@ pub enum Command {
         #[arg(long, default_value = "table")]
         output: String,
     },
+    /// Fetch and display a contract's ABI from Sourcify
+    Abi {
+        /// Contract address (0x...)
+        address: String,
+    },
+    /// Check a config file before syncing — validates addresses, ABIs, and event names
+    Validate {
+        /// Path to config file
+        config: PathBuf,
+    },
 }
