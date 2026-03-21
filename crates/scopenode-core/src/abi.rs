@@ -291,6 +291,10 @@ impl AbiCache {
     /// the `abi_override` file, stores the result in SQLite, and returns only
     /// the events listed in `contract.events` (not the full ABI).
     ///
+    /// If `contract.impl_address` is set, the ABI is fetched from that address
+    /// on Sourcify instead of `contract.address`. The proxy emits the events
+    /// so `address` is still used for bloom scanning and log matching.
+    ///
     /// Returns [`AbiError::EventNotFound`] if an event name from the config is
     /// not present in the ABI.
     pub async fn get_or_fetch(
@@ -305,11 +309,22 @@ impl AbiCache {
             return filter_events(all_events, &contract.events, contract.address);
         }
 
+        // Resolve which address to use for ABI lookup.
+        // For proxy contracts, the implementation holds the real ABI.
+        let abi_address = contract.impl_address.unwrap_or(contract.address);
+        if let Some(impl_addr) = contract.impl_address {
+            debug!(
+                proxy = %contract.address,
+                implementation = %impl_addr,
+                "Using impl_address for ABI lookup"
+            );
+        }
+
         // Slow path: fetch from Sourcify or abi_override file.
         let all_events = if let Some(override_path) = &contract.abi_override {
             load_abi_override(override_path, contract.address)?
         } else {
-            self.sourcify.fetch_events(contract.address).await?
+            self.sourcify.fetch_events(abi_address).await?
         };
 
         // Serialize the full ABI to JSON for storage. We store ALL events from
