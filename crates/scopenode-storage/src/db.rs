@@ -235,6 +235,29 @@ impl Db {
         Ok(())
     }
 
+    /// Check if a bloom candidate is marked for retry (`pending_retry = 1`).
+    ///
+    /// Returns `false` if the row doesn't exist. Used in tests to assert that a
+    /// failed-receipt block was properly flagged for retry.
+    pub async fn is_pending_retry(&self, block_num: u64, contract: &str) -> Result<bool, DbError> {
+        let n = block_num as i64;
+
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            pending_retry: i64,
+        }
+
+        let row = sqlx::query_as::<_, Row>(
+            r#"SELECT pending_retry FROM bloom_candidates WHERE block_number = ? AND contract = ?"#,
+        )
+        .bind(n)
+        .bind(contract)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DbError::Query(e.to_string()))?;
+        Ok(row.map(|r| r.pending_retry != 0).unwrap_or(false))
+    }
+
     /// Mark a bloom candidate as failed — will be retried by `scopenode retry` (Phase 3a).
     ///
     /// Sets `pending_retry = 1`. Called when receipt fetch fails or Merkle verification

@@ -759,3 +759,79 @@ impl WireReceipt for ReceiptWithBloom<reth_ethereum_primitives::EthereumReceipt>
         &self.receipt.logs
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The blacklist is an Arc<RwLock<HashSet<PeerId>>> inside DevP2PNetwork.
+    // We can't boot a real devp2p stack in unit tests, so we exercise the
+    // filtering algorithm directly using the same primitives.
+
+    fn peer(byte: u8) -> reth_network_peers::PeerId {
+        reth_network_peers::PeerId::from_slice(&[byte; 64])
+    }
+
+    #[tokio::test]
+    async fn blacklist_excludes_blacklisted_peer() {
+        let all: HashMap<reth_network_peers::PeerId, ()> = [
+            (peer(1), ()),
+            (peer(2), ()),
+            (peer(3), ()),
+        ]
+        .into_iter()
+        .collect();
+
+        let mut blacklist = HashSet::new();
+        blacklist.insert(peer(2));
+
+        let usable: Vec<_> = all
+            .keys()
+            .filter(|id| !blacklist.contains(*id))
+            .copied()
+            .collect();
+
+        assert_eq!(usable.len(), 2);
+        assert!(!usable.contains(&peer(2)));
+        assert!(usable.contains(&peer(1)));
+        assert!(usable.contains(&peer(3)));
+    }
+
+    #[tokio::test]
+    async fn blacklist_all_peers_leaves_empty_pool() {
+        let all: HashMap<reth_network_peers::PeerId, ()> = [
+            (peer(1), ()),
+            (peer(2), ()),
+        ]
+        .into_iter()
+        .collect();
+
+        let blacklist: HashSet<reth_network_peers::PeerId> = all.keys().copied().collect();
+
+        let usable: Vec<_> = all
+            .keys()
+            .filter(|id| !blacklist.contains(*id))
+            .collect();
+
+        assert!(usable.is_empty());
+    }
+
+    #[tokio::test]
+    async fn blacklist_empty_passes_all_peers() {
+        let all: HashMap<reth_network_peers::PeerId, ()> = [
+            (peer(10), ()),
+            (peer(20), ()),
+        ]
+        .into_iter()
+        .collect();
+
+        let blacklist: HashSet<reth_network_peers::PeerId> = HashSet::new();
+
+        let usable: Vec<_> = all
+            .keys()
+            .filter(|id| !blacklist.contains(*id))
+            .collect();
+
+        assert_eq!(usable.len(), 2);
+    }
+}

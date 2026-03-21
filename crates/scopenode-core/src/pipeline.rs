@@ -465,6 +465,181 @@ impl<N: EthNetwork + 'static> Pipeline<N> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Config, ContractConfig, NodeConfig};
+    use crate::error::NetworkError;
+    use crate::types::ScopeHeader;
+    use alloy_primitives::{keccak256, Address, Bloom, BloomInput, B256};
+    use alloy_trie::EMPTY_ROOT_HASH;
+    use async_trait::async_trait;
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    // ── MockNetwork ───────────────────────────────────────────────────────────
+
+    /// Deterministic mock implementing EthNetwork.
+    ///
+    /// Returns pre-configured headers. For receipt fetches, returns `Failed`
+    /// for any block number in `fail_blocks` and `Ok { receipts: vec![] }`
+    /// (empty block, passes MPT against EMPTY_ROOT_HASH) for all others.
+    struct MockNetwork {
+        headers: Vec<ScopeHeader>,
+        fail_blocks: HashSet<u64>,
+    }
+
+    #[async_trait]
+    impl EthNetwork for MockNetwork {
+        async fn get_headers(&self, from: u64, to: u64) -> Result<Vec<ScopeHeader>, NetworkError> {
+            Ok(self
+                .headers
+                .iter()
+                .filter(|h| h.number >= from && h.number <= to)
+                .cloned()
+                .collect())
+        }
+
+        async fn get_receipts_for_blocks(
+            &self,
+            blocks: &[(u64, B256, B256)],
+        ) -> Vec<ReceiptFetchResult> {
+            blocks
+                .iter()
+                .map(|&(block_num, block_hash, _)| {
+                    if self.fail_blocks.contains(&block_num) {
+                        ReceiptFetchResult::Failed { block_num }
+                    } else {
+                        ReceiptFetchResult::Ok { block_num, block_hash, receipts: vec![] }
+                    }
+                })
+                .collect()
+        }
+
+        async fn best_block_number(&self) -> Result<u64, NetworkError> {
+            Ok(self.headers.iter().map(|h| h.number).max().unwrap_or(0))
+        }
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    fn unique_db_path() -> std::path::PathBuf {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        std::env::temp_dir()
+            .join(format!("scopenode_test_{}_{}.db", std::process::id(), n))
+    }
+
+    /// Build a bloom that will match for the given address + topic0.
+    fn bloom_for(address: Address, topic0: B256) -> Bloom {
+        let mut bloom = Bloom::default();
+        bloom.accrue(BloomInput::Raw(address.as_slice()));
+        bloom.accrue(BloomInput::Raw(topic0.as_slice()));
+        bloom
+    }
+
+    fn transfer_topic0() -> B256 {
+        keccak256(b"Transfer(address,address,uint256)")
+    }
+
+    fn abi_json_for(event_name: &str, topic0_sig: &str) -> String {
+        // Use the canonical sig to build inputs from the signature string.
+        // For Transfer: (address,address,uint256) = 3 params.
+        let inputs = match topic0_sig {
+            "Transfer(address,address,uint256)" => serde_json::json!([
+                { "name": "from",  "type": "address", "indexed": true,  "components": [] },
+                { "name": "to",    "type": "address", "indexed": true,  "components": [] },
+                { "name": "value", "type": "uint256", "indexed": false, "components": [] }
+            ]),
+            _ => serde_json::json!([]),
+        };
+        serde_json::json!([{ "name": event_name, "inputs": inputs }]).to_string()
+    }
+
+    fn scope_header(number: u64, bloom: Bloom) -> ScopeHeader {
+        ScopeHeader {
+            number,
+            hash: keccak256(number.to_be_bytes()),
+            parent_hash: keccak256((number - 1).to_be_bytes()),
+            timestamp: number * 12,
+            receipts_root: EMPTY_ROOT_HASH,
+            logs_bloom: bloom,
+            gas_used: 0,
+            base_fee_per_gas: None,
+        }
+    }
+
+    fn test_config(address: Address, event: &str, from: u64, to: u64) -> Config {
+        Config {
+            node: NodeConfig { port: 18545, data_dir: None },
+            contracts: vec![ContractConfig {
+                name: Some("test".into()),
+                address,
+                events: vec![event.to_string()],
+                from_block: from,
+                to_block: Some(to),
+                abi_override: None,
+                impl_address: None,
+            }],
+        }
+    }
+
+    // ── Tests ─────────────────────────────────────────────────────────────────
+
+    /// Failed receipt blocks are marked `pending_retry = 1` and the pipeline
+    /// continues without aborting. Successful empty blocks are marked `fetched = 1`.
+    #[tokio::test]
+    async fn failed_blocks_marked_pending_retry_pipeline_continues() {
+        let addr: Address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".parse().unwrap();
+        let topic0 = transfer_topic0();
+        let addr_str = addr.to_checksum(None);
+        let bloom = bloom_for(addr, topic0);
+
+        let db_path = unique_db_path();
+        let db = scopenode_storage::Db::open(db_path.clone()).await.unwrap();
+
+        // Pre-cache the ABI so the pipeline skips Sourcify.
+        db.upsert_contract(
+            &addr_str,
+            Some("test"),
+            &abi_json_for("Transfer", "Transfer(address,address,uint256)"),
+        )
+        .await
+        .unwrap();
+
+        // Build headers: blocks 100 and 101, both with a matching bloom and EMPTY_ROOT.
+        let h100 = scope_header(100, bloom);
+        let h101 = scope_header(101, bloom);
+
+        // Block 101 fails; block 100 succeeds with empty receipts.
+        let network = Arc::new(MockNetwork {
+            headers: vec![h100.clone(), h101.clone()],
+            fail_blocks: [101u64].into_iter().collect(),
+        });
+
+        let config = test_config(addr, "Transfer", 100, 101);
+        let mut pipeline = Pipeline::new(config, network, db.clone());
+        pipeline.run(false, &indicatif::MultiProgress::new()).await.unwrap();
+
+        // Block 100: should be fetched.
+        let fetched_100 = db.is_fetched(100, &addr_str).await.unwrap();
+        assert!(fetched_100, "block 100 should be fetched");
+
+        // Block 101: should be pending_retry.
+        let retry_101 = db.is_pending_retry(101, &addr_str).await.unwrap();
+        assert!(retry_101, "block 101 should be marked pending_retry");
+
+        // No events stored (both blocks are empty).
+        let event_count = db.count_events_for_contract(&addr_str).await.unwrap();
+        assert_eq!(event_count, 0);
+
+        let _ = std::fs::remove_file(&db_path);
+        // WAL mode creates two extra files — clean those up too.
+        let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+    }
+}
+
 /// Convert a core [`StoredEvent`] (alloy types, u64) to a storage [`StoredEvent`] (strings, i64).
 ///
 /// SQLite stores hashes as `0x`-prefixed hex strings and block numbers as i64.

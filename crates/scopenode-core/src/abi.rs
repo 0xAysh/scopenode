@@ -661,6 +661,107 @@ fn dyn_sol_value_to_json(value: &DynSolValue) -> Value {
 mod tests {
     use super::*;
 
+    // ── canonical_type ─────────────────────────────────────────────────────
+
+    #[test]
+    fn canonical_type_primitive() {
+        assert_eq!(canonical_type("address", &[]), "address");
+        assert_eq!(canonical_type("uint256", &[]), "uint256");
+        assert_eq!(canonical_type("bytes32", &[]), "bytes32");
+    }
+
+    #[test]
+    fn canonical_type_tuple_expands_components() {
+        let components = vec![
+            EventInput { name: "a".into(), ty: "address".into(), indexed: false, components: vec![] },
+            EventInput { name: "b".into(), ty: "uint256".into(), indexed: false, components: vec![] },
+        ];
+        assert_eq!(canonical_type("tuple", &components), "(address,uint256)");
+    }
+
+    #[test]
+    fn canonical_type_tuple_array_keeps_suffix() {
+        let components = vec![
+            EventInput { name: "x".into(), ty: "uint128".into(), indexed: false, components: vec![] },
+        ];
+        assert_eq!(canonical_type("tuple[]", &components), "(uint128)[]");
+        assert_eq!(canonical_type("tuple[3]", &components), "(uint128)[3]");
+    }
+
+    #[test]
+    fn canonical_type_nested_tuple() {
+        let inner = vec![
+            EventInput { name: "y".into(), ty: "bool".into(), indexed: false, components: vec![] },
+        ];
+        let outer = vec![
+            EventInput { name: "inner".into(), ty: "tuple".into(), indexed: false, components: inner },
+            EventInput { name: "z".into(), ty: "address".into(), indexed: false, components: vec![] },
+        ];
+        assert_eq!(canonical_type("tuple", &outer), "((bool),address)");
+    }
+
+    // ── parse_events_from_abi ──────────────────────────────────────────────
+
+    #[test]
+    fn parse_events_ignores_functions_and_errors() {
+        let addr = Address::ZERO;
+        let abi = serde_json::json!([
+            { "type": "constructor", "inputs": [] },
+            { "type": "function",    "name": "transfer", "inputs": [] },
+            { "type": "error",       "name": "NotOwner", "inputs": [] },
+            { "type": "event",       "name": "Transfer", "inputs": [
+                { "name": "from",  "type": "address", "indexed": true,  "components": [] },
+                { "name": "to",    "type": "address", "indexed": true,  "components": [] },
+                { "name": "value", "type": "uint256", "indexed": false, "components": [] }
+            ]}
+        ]);
+        let events = parse_events_from_abi(addr, abi.as_array().unwrap()).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].name, "Transfer");
+    }
+
+    #[test]
+    fn parse_events_empty_abi_returns_error() {
+        let addr = Address::ZERO;
+        let result = parse_events_from_abi(addr, &[]);
+        assert!(matches!(result, Err(AbiError::ParseFailed(_, _))));
+    }
+
+    #[test]
+    fn parse_events_no_event_entries_returns_error() {
+        let addr = Address::ZERO;
+        let abi = serde_json::json!([
+            { "type": "function", "name": "foo", "inputs": [] }
+        ]);
+        let result = parse_events_from_abi(addr, abi.as_array().unwrap());
+        assert!(matches!(result, Err(AbiError::ParseFailed(_, _))));
+    }
+
+    // ── filter_events ──────────────────────────────────────────────────────
+
+    #[test]
+    fn filter_events_unknown_name_returns_error() {
+        let addr = Address::ZERO;
+        let all = vec![EventAbi { name: "Transfer".into(), inputs: vec![] }];
+        let result = filter_events(all, &["Transfer".to_string(), "Mint".to_string()], addr);
+        assert!(matches!(result, Err(AbiError::EventNotFound(ref n, _)) if n == "Mint"));
+    }
+
+    #[test]
+    fn filter_events_returns_only_requested() {
+        let addr = Address::ZERO;
+        let all = vec![
+            EventAbi { name: "Transfer".into(), inputs: vec![] },
+            EventAbi { name: "Approval".into(), inputs: vec![] },
+            EventAbi { name: "Mint".into(), inputs: vec![] },
+        ];
+        let result = filter_events(all, &["Transfer".to_string()], addr).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "Transfer");
+    }
+
+    // ── topic0 ─────────────────────────────────────────────────────────────
+
     #[test]
     fn event_signature_and_topic0() {
         let event = EventAbi {
