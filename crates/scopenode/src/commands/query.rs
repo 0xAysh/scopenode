@@ -25,11 +25,19 @@ pub async fn run(
     db: Db,
     contract: Option<String>,
     event: Option<String>,
+    from_block: Option<u64>,
+    to_block: Option<u64>,
     limit: usize,
     output: String,
 ) -> Result<()> {
     let events = db
-        .query_events(contract.as_deref(), event.as_deref(), limit)
+        .query_events(
+            contract.as_deref(),
+            event.as_deref(),
+            from_block,
+            to_block,
+            limit,
+        )
         .await?;
 
     if events.is_empty() {

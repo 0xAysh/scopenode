@@ -82,6 +82,8 @@ async fn main() -> Result<()> {
         Command::Query {
             contract,
             event,
+            from_block,
+            to_block,
             limit,
             output,
         } => {
@@ -93,8 +95,16 @@ async fn main() -> Result<()> {
                 .await
                 .context("Failed to open database")?;
 
-            commands::query::run(db, contract.clone(), event.clone(), *limit, output.clone())
-                .await?;
+            commands::query::run(
+                db,
+                contract.clone(),
+                event.clone(),
+                *from_block,
+                *to_block,
+                *limit,
+                output.clone(),
+            )
+            .await?;
         }
 
         Command::Abi { address } => {

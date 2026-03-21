@@ -33,6 +33,14 @@ pub async fn run(address: &str) -> Result<()> {
         return Ok(());
     }
 
+    // EIP-1967 proxy contracts expose only AdminChanged / Upgraded / BeaconUpgraded.
+    // Detect this and warn the user — the real events are on the implementation.
+    const PROXY_EVENTS: &[&str] = &["AdminChanged", "Upgraded", "BeaconUpgraded"];
+    let is_proxy = !events.is_empty()
+        && events
+            .iter()
+            .all(|e| PROXY_EVENTS.contains(&e.name.as_str()));
+
     for event in &events {
         println!("Event: {}", event.name);
         println!("  Signature : {}", event.signature());
@@ -48,6 +56,18 @@ pub async fn run(address: &str) -> Result<()> {
             }
         }
         println!();
+    }
+
+    if is_proxy {
+        println!("⚠  This looks like an EIP-1967 proxy — only proxy admin events are shown.");
+        println!("   Find the implementation address and add it to your config:");
+        println!();
+        println!("     impl_address = \"0x<implementation>\"");
+        println!();
+        println!("   Then re-run: scopenode abi 0x<implementation>");
+        println!();
+        println!("   Implementation slot (EIP-1967):");
+        println!("     0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc");
     }
 
     Ok(())

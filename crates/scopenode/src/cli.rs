@@ -40,6 +40,12 @@ pub enum Command {
         /// Filter by event name
         #[arg(long)]
         event: Option<String>,
+        /// Only return events at or after this block number
+        #[arg(long)]
+        from_block: Option<u64>,
+        /// Only return events at or before this block number
+        #[arg(long)]
+        to_block: Option<u64>,
         /// Maximum number of events to return
         #[arg(long, default_value = "20")]
         limit: usize,

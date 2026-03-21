@@ -359,19 +359,21 @@ impl Db {
 
     /// Query events from SQLite for the `scopenode query` command.
     ///
-    /// Optional filters for `contract` address and `event` name. The SQL is built
-    /// dynamically at runtime since we can't use compile-time macros without
-    /// `DATABASE_URL`. The query is fully parameterized so injection is not possible.
+    /// Optional filters for `contract`, `event` name, and block range.
+    /// `from_block`/`to_block` default to 0/u64::MAX when `None`.
+    /// The SQL is fully parameterized — no injection possible.
     pub async fn query_events(
         &self,
         contract: Option<&str>,
         event: Option<&str>,
+        from_block: Option<u64>,
+        to_block: Option<u64>,
         limit: usize,
     ) -> Result<Vec<StoredEvent>, DbError> {
         let limit_i = limit as i64;
+        let from_i = from_block.unwrap_or(0) as i64;
+        let to_i = to_block.map(|b| b as i64).unwrap_or(i64::MAX);
 
-        // Build SQL dynamically at runtime since we can't use compile-time macros
-        // without DATABASE_URL. The query is parameterized, so injection is not possible.
         let (sql, bindings) = build_query_events_sql(contract, event, limit_i);
         let mut q = sqlx::query_as::<_, StoredEvent>(&sql);
         if let Some(c) = bindings.contract {
@@ -380,7 +382,7 @@ impl Db {
         if let Some(e) = bindings.event {
             q = q.bind(e.to_string());
         }
-        q = q.bind(limit_i);
+        q = q.bind(from_i).bind(to_i).bind(limit_i);
         q.fetch_all(&self.pool)
             .await
             .map_err(|e| DbError::Query(e.to_string()))
@@ -759,7 +761,7 @@ struct QueryBindings<'a> {
 /// Build the SQL string and binding values for [`Db::query_events`].
 ///
 /// Returns a `(sql, bindings)` pair. The bindings must be applied in the order:
-/// contract (if Some) → event (if Some) → limit.
+/// contract (if Some) → event (if Some) → from_block → to_block → limit.
 fn build_query_events_sql<'a>(
     contract: Option<&'a str>,
     event: Option<&'a str>,
@@ -769,25 +771,27 @@ fn build_query_events_sql<'a>(
                          tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source
                   FROM events
                   WHERE reorged = 0"#;
+    // block_number range is always bound (caller passes 0 / i64::MAX as defaults).
+    let tail = "AND block_number >= ? AND block_number <= ? ORDER BY block_number ASC, log_index ASC LIMIT ?";
 
     let (sql, bind_contract, bind_event) = match (contract, event) {
         (Some(_), Some(_)) => (
-            format!("{base} AND contract = ? AND event_name = ? ORDER BY block_number ASC, log_index ASC LIMIT ?"),
+            format!("{base} AND contract = ? AND event_name = ? {tail}"),
             true,
             true,
         ),
         (Some(_), None) => (
-            format!("{base} AND contract = ? ORDER BY block_number ASC, log_index ASC LIMIT ?"),
+            format!("{base} AND contract = ? {tail}"),
             true,
             false,
         ),
         (None, Some(_)) => (
-            format!("{base} AND event_name = ? ORDER BY block_number ASC, log_index ASC LIMIT ?"),
+            format!("{base} AND event_name = ? {tail}"),
             false,
             true,
         ),
         (None, None) => (
-            format!("{base} ORDER BY block_number ASC, log_index ASC LIMIT ?"),
+            format!("{base} {tail}"),
             false,
             false,
         ),
