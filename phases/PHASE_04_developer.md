@@ -18,6 +18,7 @@ systems. `scopenode init` gets a new user running in under a minute.
 GET  /events
        ?contract=0x...
        &event=Swap
+       &topic0=0xddf252ad...   ← raw topic0 filter (event signature hash)
        &fromBlock=N  &toBlock=N
        &limit=100    &offset=0
 
@@ -29,6 +30,10 @@ GET  /stream/events?contract=0x...&event=Swap     ← SSE
 
 CORS open by default. All query params optional and combinable.
 SSE subscribes to the Phase 3 broadcast channel — zero extra overhead.
+
+`topic0` accepts a raw 32-byte hex topic — useful for callers that have the
+event signature hash but not the human-readable name. Matches cryo's
+`--topic0` filter semantics.
 
 ### Webhooks
 
@@ -59,6 +64,35 @@ Interactive wizard:
 Validates the resulting config with the same logic as `scopenode validate`
 before writing.
 
+### `--topic0` filter on `scopenode query`
+
+```bash
+scopenode query --contract 0xC02... --topic0 0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef
+```
+
+Mirrors the REST `?topic0=` param. Useful for scripts that already hold the
+keccak hash of an event signature and want to avoid passing the ABI.
+
+### Python bindings
+
+A `crates/scopenode-py` crate wraps the SQLite query layer via PyO3 and
+exposes a pandas-friendly API:
+
+```python
+import scopenode
+
+df = scopenode.query(
+    "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+    event="Transfer",
+    from_block=16_000_000,
+    to_block=17_000_000,
+)
+print(df.head())
+```
+
+Returns a `pandas.DataFrame` with one row per event. Column names match the
+ABI parameter names. Installable via `pip install scopenode` (maturin build).
+
 ### `scopenode export`
 
 ```bash
@@ -81,7 +115,11 @@ load into memory.
 - [ ] `scopenode init` produces a `config.toml` that passes `scopenode validate`
 - [ ] `scopenode export --format csv/json/parquet` all produce valid output
 - [ ] Parquet readable by DuckDB: `SELECT * FROM 'events.parquet' LIMIT 5`
-- [ ] Unit tests: webhook retry/backoff, SSE fan-out, export format correctness
+- [ ] `scopenode query --topic0 0x...` returns the same rows as `?event=<name>` for the matching signature
+- [ ] `GET /events?topic0=0x...` returns correct results; unknown topic0 returns empty list (not error)
+- [ ] `pip install scopenode` succeeds; `scopenode.query(...)` returns a `pandas.DataFrame`
+- [ ] DataFrame column names match ABI parameter names; U256 columns are `object` dtype (string)
+- [ ] Unit tests: webhook retry/backoff, SSE fan-out, export format correctness, topic0 filter
 
 ## New dependencies
 
@@ -91,4 +129,5 @@ tower-http   = { version = "0.5", features = ["cors"] }
 async-stream = "0.3"
 dialoguer    = "0.11"
 parquet      = "51"
+pyo3         = { version = "0.21", features = ["extension-module"] }
 ```

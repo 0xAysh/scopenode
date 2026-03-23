@@ -51,9 +51,42 @@ bloom → receipt fetch → MPT verify → decode → store pipeline as historic
 A `broadcast` channel fans live events to all consumers (REST SSE, webhooks
 in Phase 4).
 
+### Block range shorthand
+
+`from_block` and `to_block` in config (and `--blocks` on the CLI) accept
+human-readable shorthand inspired by cryo:
+
+```toml
+[node]
+from_block = "16M"       # 16_000_000
+to_block   = "16.5M"     # 16_500_000
+```
+
+CLI usage:
+
+```bash
+scopenode sync --blocks 16M:17M
+scopenode sync --blocks 16M:+1000   # from_block=16M, to_block=16M+1000
+```
+
+Supported suffixes: `K` (×1 000), `M` (×1 000 000). Relative offset `+N`
+is resolved against the left bound. Plain integers still accepted everywhere.
+
+### Configurable reorg buffer
+
+The depth of the rolling reorg-detection buffer is now a config option:
+
+```toml
+[node]
+reorg_buffer = 64   # default; post-Merge safe minimum
+```
+
+Operators running archive nodes or doing historical analysis may lower this.
+Defaults to 64 when absent — matching the post-Merge finality window.
+
 ### Reorg handling
 
-Rolling buffer of last 64 block hashes. On each new block:
+Rolling buffer of last `reorg_buffer` block hashes. On each new block:
 1. Check `new_block.parent_hash == our_tip_hash`
 2. Mismatch → walk back via `parent_hash` to common ancestor
 3. Mark orphaned events `reorged = 1` — never hard-delete
@@ -106,6 +139,9 @@ Key bindings: `q` quit · `p` peer list · `r` recent events · `l` logs
 - [ ] `scopenode snapshot` / `scopenode restore` work; restore auto-snaps before overwriting
 - [ ] `scopenode doctor` reports: peer count, beacon head, DB counts, pending_retry count
 - [ ] `scopenode retry` clears all `pending_retry` blocks on success
+- [ ] `from_block = "16M"` in config parses to `16_000_000`; `"16.5M"` → `16_500_000`
+- [ ] `scopenode sync --blocks 16M:+500` resolves to `from_block=16000000, to_block=16000500`
+- [ ] `reorg_buffer` config key respected; defaults to 64 when absent
 - [ ] Unit tests: reorg detection at depth 1/5/64, live syncer broadcast fan-out
 - [ ] Integration test: live sync processes 10 real blocks after historical completes
 
