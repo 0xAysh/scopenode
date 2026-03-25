@@ -571,7 +571,7 @@ mod tests {
 
     fn test_config(address: Address, event: &str, from: u64, to: u64) -> Config {
         Config {
-            node: NodeConfig { port: 18545, data_dir: None },
+            node: NodeConfig { port: 18545, data_dir: None, consensus_rpc: vec![], reorg_buffer: 64 },
             contracts: vec![ContractConfig {
                 name: Some("test".into()),
                 address,
