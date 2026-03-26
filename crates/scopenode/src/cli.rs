@@ -29,6 +29,15 @@ pub enum Command {
         /// Show bloom estimate only — do not fetch receipts
         #[arg(long)]
         dry_run: bool,
+        /// Override block range for all contracts in the config.
+        ///
+        /// Formats:
+        ///   `16M:17M`    — from 16,000,000 to 17,000,000 (inclusive)
+        ///   `16M:+1000`  — from 16,000,000 to 16,001,000 (relative offset)
+        ///
+        /// Shorthand suffixes: `M` = 1,000,000 · `K` = 1,000
+        #[arg(long, value_name = "RANGE")]
+        blocks: Option<String>,
     },
     /// Show indexed contracts and sync state
     Status,
@@ -63,4 +72,23 @@ pub enum Command {
         /// Path to config file
         config: PathBuf,
     },
+    /// Re-fetch all blocks that failed receipt verification
+    Retry {
+        /// Path to config file
+        config: PathBuf,
+    },
+    /// Save a snapshot of the database
+    Snapshot {
+        /// Optional label for this snapshot (default: timestamp)
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Restore the database from a snapshot
+    Restore {
+        /// Label of the snapshot to restore (default: most recent)
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Check node health: peers, beacon head, DB integrity, retry queue
+    Doctor,
 }

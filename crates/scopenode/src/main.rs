@@ -46,7 +46,7 @@ async fn main() -> Result<()> {
     fmt().with_env_filter(filter).with_target(false).init();
 
     match &cli.command {
-        Command::Sync { config, dry_run } => {
+        Command::Sync { config, dry_run, blocks } => {
             let mut cfg =
                 Config::from_file(config).context("Failed to load config")?;
 
@@ -64,7 +64,7 @@ async fn main() -> Result<()> {
                 .await
                 .context("Failed to open database")?;
 
-            commands::sync::run(cfg, db, *dry_run, cli.quiet).await?;
+            commands::sync::run(cfg, db, *dry_run, cli.quiet, blocks.clone()).await?;
         }
 
         Command::Status => {
@@ -113,6 +113,33 @@ async fn main() -> Result<()> {
 
         Command::Validate { config } => {
             commands::validate::run(config.clone()).await?;
+        }
+
+        Command::Retry { config } => {
+            let cfg = Config::from_file(config).context("Failed to load config")?;
+            let data_dir = resolve_data_dir(&cfg);
+            let db = Db::open(data_dir.join("scopenode.db"))
+                .await
+                .context("Failed to open database")?;
+            commands::retry::run(cfg, db).await?;
+        }
+
+        Command::Snapshot { label } => {
+            let data_dir = resolve_data_dir_no_config(&cli.data_dir);
+            commands::snapshot::run(&data_dir, label.clone()).await?;
+        }
+
+        Command::Restore { label } => {
+            let data_dir = resolve_data_dir_no_config(&cli.data_dir);
+            commands::restore::run(&data_dir, label.clone()).await?;
+        }
+
+        Command::Doctor => {
+            let data_dir = resolve_data_dir_no_config(&cli.data_dir);
+            let db = Db::open(data_dir.join("scopenode.db"))
+                .await
+                .context("Failed to open database")?;
+            commands::doctor::run(db).await?;
         }
     }
 

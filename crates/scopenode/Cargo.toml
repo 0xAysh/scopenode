@@ -20,3 +20,4 @@ serde_json        = { workspace = true }
 dirs              = { workspace = true }
 indicatif         = { workspace = true }
 alloy-primitives  = { workspace = true }
+sqlx              = { workspace = true }

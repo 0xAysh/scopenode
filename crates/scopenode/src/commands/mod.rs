@@ -1,5 +1,9 @@
 pub mod abi;
+pub mod doctor;
 pub mod query;
+pub mod restore;
+pub mod retry;
+pub mod snapshot;
 pub mod status;
 pub mod sync;
 pub mod validate;

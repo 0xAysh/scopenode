@@ -2,9 +2,10 @@
 //!
 //! Steps:
 //! 1. Boot [`DevP2PNetwork`] — connects to Ethereum mainnet peers via devp2p
-//! 2. Build [`Pipeline`] and run it — headers → bloom → receipts → decode → store
-//! 3. Start the JSON-RPC server on the configured port
-//! 4. Wait for Ctrl+C, then shut down gracefully
+//! 2. Apply any `--blocks` range override to all contracts in the config
+//! 3. Build [`Pipeline`] and run it — headers → bloom → receipts → decode → store
+//! 4. Start the JSON-RPC server on the configured port
+//! 5. Wait for Ctrl+C, then shut down gracefully
 //!
 //! No RPC provider is used. All data comes from devp2p peers and is verified
 //! cryptographically via Merkle Patricia Trie before being stored.
@@ -22,12 +23,26 @@ use std::sync::Arc;
 use tracing::info;
 
 /// Run the `sync` command.
+///
+/// `blocks_override` is an optional `--blocks` flag value like `"16M:17M"` or `"16M:+1000"`.
+/// When set, it overrides `from_block` / `to_block` for every contract in the config.
 pub async fn run(
-    config: Config,
+    mut config: Config,
     db: Db,
     dry_run: bool,
     quiet: bool,
+    blocks_override: Option<String>,
 ) -> Result<()> {
+    if let Some(ref range_str) = blocks_override {
+        let (from, to) = parse_blocks_flag(range_str)
+            .map_err(|e| anyhow::anyhow!("Invalid --blocks argument \"{range_str}\": {e}"))?;
+        for contract in &mut config.contracts {
+            contract.from_block = from;
+            contract.to_block = to;
+        }
+        info!(?from, ?to, "--blocks override applied to all contracts");
+    }
+
     let progress = MultiProgress::new();
     if quiet {
         progress.set_draw_target(indicatif::ProgressDrawTarget::hidden());
@@ -74,4 +89,85 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+/// Parse a `--blocks` range string into `(from_block, to_block)`.
+///
+/// Formats:
+/// - `"16M:17M"` → (16_000_000, Some(17_000_000))
+/// - `"16M:+1000"` → (16_000_000, Some(16_001_000))
+/// - `"16M:+0"` → (16_000_000, Some(16_000_000))
+///
+/// Shorthand suffixes `M` and `K` are supported on both sides.
+/// Relative offset (`+N`) is resolved against the left bound.
+pub fn parse_blocks_flag(s: &str) -> Result<(u64, Option<u64>), String> {
+    use scopenode_core::config::parse_block_shorthand;
+
+    let (left, right) = s.split_once(':')
+        .ok_or_else(|| format!("expected colon separator in \"{}\" — use e.g. \"16M:17M\" or \"16M:+1000\"", s))?;
+
+    let from = parse_block_shorthand(left.trim())?;
+
+    let right = right.trim();
+    let to = if let Some(offset_str) = right.strip_prefix('+') {
+        let offset: u64 = offset_str.parse().map_err(|_| {
+            format!("invalid relative offset \"+{}\" — expected a non-negative integer", offset_str)
+        })?;
+        from.checked_add(offset)
+            .ok_or_else(|| format!("block range overflow: {} + {}", from, offset))?
+    } else {
+        parse_block_shorthand(right)?
+    };
+
+    if to < from {
+        return Err(format!(
+            "to_block ({}) must be >= from_block ({})",
+            to, from
+        ));
+    }
+
+    Ok((from, Some(to)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_absolute_range() {
+        let (from, to) = parse_blocks_flag("16M:17M").unwrap();
+        assert_eq!(from, 16_000_000);
+        assert_eq!(to, Some(17_000_000));
+    }
+
+    #[test]
+    fn parse_relative_offset() {
+        let (from, to) = parse_blocks_flag("16M:+500").unwrap();
+        assert_eq!(from, 16_000_000);
+        assert_eq!(to, Some(16_000_500));
+    }
+
+    #[test]
+    fn parse_zero_offset() {
+        let (from, to) = parse_blocks_flag("16M:+0").unwrap();
+        assert_eq!(from, 16_000_000);
+        assert_eq!(to, Some(16_000_000));
+    }
+
+    #[test]
+    fn parse_integer_range() {
+        let (from, to) = parse_blocks_flag("12376729:12500000").unwrap();
+        assert_eq!(from, 12376729);
+        assert_eq!(to, Some(12500000));
+    }
+
+    #[test]
+    fn parse_inverted_errors() {
+        assert!(parse_blocks_flag("17M:16M").is_err());
+    }
+
+    #[test]
+    fn parse_missing_colon_errors() {
+        assert!(parse_blocks_flag("16M").is_err());
+    }
 }

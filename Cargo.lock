@@ -6127,6 +6127,7 @@ dependencies = [
  "scopenode-rpc",
  "scopenode-storage",
  "serde_json",
+ "sqlx",
  "tokio",
  "tracing",
  "tracing-subscriber 0.3.22",

@@ -643,6 +643,44 @@ impl Db {
         Ok(row.size as u64)
     }
 
+    /// Return all `(block_number, block_hash, receipts_root, contract)` tuples that
+    /// have `pending_retry = 1` in `bloom_candidates`, joined with `headers` to get
+    /// the `receipts_root` needed for Merkle verification.
+    pub async fn get_pending_retry_candidates(
+        &self,
+    ) -> Result<Vec<(u64, alloy_primitives::B256, alloy_primitives::B256, String)>, DbError> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            block_number: i64,
+            block_hash: String,
+            receipts_root: String,
+            contract: String,
+        }
+        let rows = sqlx::query_as::<_, Row>(
+            r#"SELECT bc.block_number, bc.block_hash, h.receipts_root, bc.contract
+               FROM bloom_candidates bc
+               JOIN headers h ON h.number = bc.block_number
+               WHERE bc.pending_retry = 1"#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DbError::Query(e.to_string()))?;
+
+        rows.into_iter()
+            .map(|r| {
+                let block_hash: alloy_primitives::B256 = r
+                    .block_hash
+                    .parse()
+                    .map_err(|_| DbError::Query(format!("invalid block_hash: {}", r.block_hash)))?;
+                let receipts_root: alloy_primitives::B256 = r
+                    .receipts_root
+                    .parse()
+                    .map_err(|_| DbError::Query(format!("invalid receipts_root: {}", r.receipts_root)))?;
+                Ok((r.block_number as u64, block_hash, receipts_root, r.contract))
+            })
+            .collect()
+    }
+
     /// Query events for a JSON-RPC `eth_getLogs` filter.
     ///
     /// Filters by `contract` address and optionally by `topic0` (the event selector

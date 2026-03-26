@@ -73,6 +73,33 @@ impl<N: EthNetwork + 'static> Pipeline<N> {
         Ok(())
     }
 
+    /// Re-run the receipt-fetch stage for all blocks marked `pending_retry = 1`.
+    ///
+    /// Skips header and bloom stages — only retries the fetch+verify+decode+store
+    /// step for blocks that previously failed Merkle verification or network fetch.
+    pub async fn run_retry(&mut self, progress: &MultiProgress) -> Result<(), CoreError> {
+        let candidates = self.db.get_pending_retry_candidates().await?;
+        if candidates.is_empty() {
+            return Ok(());
+        }
+
+        for contract in self.config.contracts.clone() {
+            let addr_str = contract.address.to_checksum(None);
+            let blocks: Vec<(u64, B256, B256)> = candidates
+                .iter()
+                .filter(|(_, _, _, c)| *c == addr_str)
+                .map(|&(n, h, r, _)| (n, h, r))
+                .collect();
+            if blocks.is_empty() {
+                continue;
+            }
+            let events = self.abi_cache.get_or_fetch(&contract).await?;
+            self.fetch_and_store(&contract, &blocks, &events, progress).await?;
+        }
+
+        Ok(())
+    }
+
     /// Run all pipeline stages for a single contract.
     ///
     /// Stages in order:
