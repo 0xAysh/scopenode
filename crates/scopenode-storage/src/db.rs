@@ -643,6 +643,33 @@ impl Db {
         Ok(row.size as u64)
     }
 
+    /// Mark all events from the given block hashes as reorged (`reorged = 1`).
+    ///
+    /// Called by the live-sync pipeline when [`ReorgDetector`] returns a
+    /// [`ReorgEvent`]. Events are soft-deleted — never hard-deleted — so they
+    /// can be inspected post-hoc and are excluded from all normal queries via
+    /// the `WHERE reorged = 0` filter.
+    ///
+    /// Returns the total number of event rows that were updated.
+    ///
+    /// [`ReorgDetector`]: scopenode_core::reorg::ReorgDetector
+    /// [`ReorgEvent`]: scopenode_core::reorg::ReorgEvent
+    pub async fn mark_reorged_by_hash(&self, block_hashes: &[B256]) -> Result<u64, DbError> {
+        let mut total = 0u64;
+        for hash in block_hashes {
+            let hash_str = hash.to_string();
+            let result = sqlx::query(
+                "UPDATE events SET reorged = 1 WHERE block_hash = ? AND reorged = 0",
+            )
+            .bind(&hash_str)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| DbError::Query(e.to_string()))?;
+            total += result.rows_affected();
+        }
+        Ok(total)
+    }
+
     /// Return all `(block_number, block_hash, receipts_root, contract)` tuples that
     /// have `pending_retry = 1` in `bloom_candidates`, joined with `headers` to get
     /// the `receipts_root` needed for Merkle verification.
