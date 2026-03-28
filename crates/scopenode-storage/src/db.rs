@@ -655,19 +655,22 @@ impl Db {
     /// [`ReorgDetector`]: scopenode_core::reorg::ReorgDetector
     /// [`ReorgEvent`]: scopenode_core::reorg::ReorgEvent
     pub async fn mark_reorged_by_hash(&self, block_hashes: &[B256]) -> Result<u64, DbError> {
-        let mut total = 0u64;
+        if block_hashes.is_empty() {
+            return Ok(0);
+        }
+        let placeholders = block_hashes.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "UPDATE events SET reorged = 1 WHERE block_hash IN ({placeholders}) AND reorged = 0"
+        );
+        let mut q = sqlx::query(&sql);
         for hash in block_hashes {
-            let hash_str = hash.to_string();
-            let result = sqlx::query(
-                "UPDATE events SET reorged = 1 WHERE block_hash = ? AND reorged = 0",
-            )
-            .bind(&hash_str)
+            q = q.bind(hash.to_string());
+        }
+        let result = q
             .execute(&self.pool)
             .await
             .map_err(|e| DbError::Query(e.to_string()))?;
-            total += result.rows_affected();
-        }
-        Ok(total)
+        Ok(result.rows_affected())
     }
 
     /// Return all `(block_number, block_hash, receipts_root, contract)` tuples that

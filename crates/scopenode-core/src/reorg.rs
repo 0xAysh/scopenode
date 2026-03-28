@@ -57,16 +57,21 @@ impl ReorgDetector {
         }
     }
 
+    /// Push a block into the window, evicting the oldest entry when at capacity.
+    fn push_capped(&mut self, num: u64, hash: B256) {
+        if self.buffer.len() == self.capacity {
+            self.buffer.pop_front();
+        }
+        self.buffer.push_back((num, hash));
+    }
+
     /// Seed the window from already-stored headers.
     ///
     /// Call this on startup after loading the last `reorg_buffer` headers from
     /// SQLite. Headers must be in ascending block-number order.
     pub fn seed(&mut self, headers: impl IntoIterator<Item = (u64, B256)>) {
         for (num, hash) in headers {
-            if self.buffer.len() == self.capacity {
-                self.buffer.pop_front();
-            }
-            self.buffer.push_back((num, hash));
+            self.push_capped(num, hash);
         }
     }
 
@@ -88,22 +93,18 @@ impl ReorgDetector {
     /// buffer is cleared, and the new block becomes the sole entry.
     pub fn advance(&mut self, block_num: u64, block_hash: B256, parent_hash: B256) -> Option<ReorgEvent> {
         if self.buffer.is_empty() {
-            self.buffer.push_back((block_num, block_hash));
+            self.push_capped(block_num, block_hash);
             return None;
         }
 
-        let &(tip_num, tip_hash) = self.buffer.back().unwrap();
+        let &(tip_num, tip_hash) = self.buffer.back().expect("buffer not empty");
 
-        // Happy path: the new block extends our current tip.
         if block_num == tip_num + 1 && parent_hash == tip_hash {
-            if self.buffer.len() == self.capacity {
-                self.buffer.pop_front();
-            }
-            self.buffer.push_back((block_num, block_hash));
+            self.push_capped(block_num, block_hash);
             return None;
         }
 
-        // Reorg: find the common ancestor by locating parent_hash in the window.
+        // Find common ancestor: the buffer entry whose hash equals parent_hash.
         if let Some(pos) = self.buffer.iter().position(|&(_, h)| h == parent_hash) {
             let common_ancestor = self.buffer[pos].0;
             let orphaned_hashes: Vec<B256> = self.buffer
@@ -112,12 +113,8 @@ impl ReorgDetector {
                 .map(|&(_, h)| h)
                 .collect();
 
-            // Discard orphaned entries and add the new block.
             self.buffer.truncate(pos + 1);
-            if self.buffer.len() == self.capacity {
-                self.buffer.pop_front();
-            }
-            self.buffer.push_back((block_num, block_hash));
+            self.push_capped(block_num, block_hash);
 
             return Some(ReorgEvent { common_ancestor, orphaned_hashes });
         }
@@ -129,7 +126,7 @@ impl ReorgDetector {
             .unwrap_or(0);
         let orphaned_hashes: Vec<B256> = self.buffer.iter().map(|&(_, h)| h).collect();
         self.buffer.clear();
-        self.buffer.push_back((block_num, block_hash));
+        self.push_capped(block_num, block_hash);
 
         Some(ReorgEvent { common_ancestor, orphaned_hashes })
     }
