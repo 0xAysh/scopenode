@@ -14,10 +14,11 @@ use anyhow::{Context, Result};
 use indicatif::MultiProgress;
 use scopenode_core::{
     config::Config,
-    live::{self, LiveSyncer},
+    live::LiveSyncer,
     network::DevP2PNetwork,
     pipeline::Pipeline,
 };
+use tokio::sync::broadcast;
 use scopenode_rpc::start_server;
 use scopenode_storage::Db;
 use std::sync::Arc;
@@ -80,7 +81,7 @@ pub async fn run(
     if !dry_run {
         // Broadcast channel for live events — receivers can be added via subscribe().
         // Currently consumed by the live syncer; will fan out to SSE/webhooks in Phase 4.
-        let (tx, _) = live::channel(1024);
+        let (tx, _) = broadcast::channel(1024);
 
         println!("\nSync complete. Starting JSON-RPC server on port {port}...");
         let handle = start_server(port, db.clone())
