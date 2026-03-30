@@ -256,21 +256,7 @@ impl<N: EthNetwork + 'static> Pipeline<N> {
             let headers = self.network.get_headers(chunk_start, chunk_end).await?;
 
             for header in &headers {
-                // Convert from the core ScopeHeader (u64 fields, Bloom type) to the
-                // storage StoredHeader (i64 fields, raw bytes). SQLite uses signed
-                // integers, so block numbers > 2^63 would overflow — not a concern
-                // for Ethereum which is at ~20M blocks as of 2024.
-                let scope_header = scopenode_storage::models::StoredHeader {
-                    number: header.number as i64,
-                    hash: header.hash.to_string(),
-                    parent_hash: header.parent_hash.to_string(),
-                    timestamp: header.timestamp as i64,
-                    receipts_root: header.receipts_root.to_string(),
-                    logs_bloom: alloy_primitives::hex::encode(header.logs_bloom.as_slice()),
-                    gas_used: header.gas_used as i64,
-                    base_fee: header.base_fee_per_gas.map(|f| f as i64),
-                };
-                self.db.insert_header(&scope_header).await?;
+                self.db.insert_header(&scope_header_to_stored(header)).await?;
                 pb.inc(1);
             }
 
@@ -667,12 +653,29 @@ mod tests {
     }
 }
 
+/// Convert a [`ScopeHeader`] to the storage [`StoredHeader`] row type.
+///
+/// SQLite uses signed integers; block numbers and timestamps are cast to i64.
+/// The bloom filter is encoded as a lowercase hex string for human readability.
+pub(crate) fn scope_header_to_stored(h: &crate::types::ScopeHeader) -> scopenode_storage::models::StoredHeader {
+    scopenode_storage::models::StoredHeader {
+        number: h.number as i64,
+        hash: h.hash.to_string(),
+        parent_hash: h.parent_hash.to_string(),
+        timestamp: h.timestamp as i64,
+        receipts_root: h.receipts_root.to_string(),
+        logs_bloom: alloy_primitives::hex::encode(h.logs_bloom.as_slice()),
+        gas_used: h.gas_used as i64,
+        base_fee: h.base_fee_per_gas.map(|f| f as i64),
+    }
+}
+
 /// Convert a core [`StoredEvent`] (alloy types, u64) to a storage [`StoredEvent`] (strings, i64).
 ///
 /// SQLite stores hashes as `0x`-prefixed hex strings and block numbers as i64.
 /// Topics are stored as a JSON array of hex strings. Raw data is stored as a hex string.
 /// U256 values in `decoded` are already stringified by the ABI decoder (JS precision safe).
-fn core_to_storage_event(e: &CoreEvent) -> scopenode_storage::models::StoredEvent {
+pub(crate) fn core_to_storage_event(e: &CoreEvent) -> scopenode_storage::models::StoredEvent {
     scopenode_storage::models::StoredEvent {
         contract: e.contract.to_checksum(None),
         event_name: e.event_name.clone(),

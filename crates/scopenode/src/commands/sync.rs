@@ -5,7 +5,7 @@
 //! 2. Apply any `--blocks` range override to all contracts in the config
 //! 3. Build [`Pipeline`] and run it — headers → bloom → receipts → decode → store
 //! 4. Start the JSON-RPC server on the configured port
-//! 5. Wait for Ctrl+C, then shut down gracefully
+//! 5. If any contract has no `to_block`, enter live sync mode; otherwise wait for Ctrl+C
 //!
 //! No RPC provider is used. All data comes from devp2p peers and is verified
 //! cryptographically via Merkle Patricia Trie before being stored.
@@ -14,6 +14,7 @@ use anyhow::{Context, Result};
 use indicatif::MultiProgress;
 use scopenode_core::{
     config::Config,
+    live::{self, LiveSyncer},
     network::DevP2PNetwork,
     pipeline::Pipeline,
 };
@@ -66,7 +67,9 @@ pub async fn run(
     spinner.finish_with_message("Connected to Ethereum mainnet peers ✓");
 
     let port = config.node.port;
-    let mut pipeline = Pipeline::new(config, network, db.clone());
+    let has_live = config.contracts.iter().any(|c| c.to_block.is_none());
+
+    let mut pipeline = Pipeline::new(config.clone(), Arc::clone(&network), db.clone());
 
     println!("Starting sync via devp2p...");
     pipeline
@@ -75,15 +78,33 @@ pub async fn run(
         .context("Pipeline failed")?;
 
     if !dry_run {
+        // Broadcast channel for live events — receivers can be added via subscribe().
+        // Currently consumed by the live syncer; will fan out to SSE/webhooks in Phase 4.
+        let (tx, _) = live::channel(1024);
+
         println!("\nSync complete. Starting JSON-RPC server on port {port}...");
-        let handle = start_server(port, db)
+        let handle = start_server(port, db.clone())
             .await
             .context("Failed to start JSON-RPC server")?;
-        info!(port, "Server running. Press Ctrl+C to stop.");
 
-        tokio::signal::ctrl_c()
-            .await
-            .context("Failed to listen for Ctrl+C")?;
+        if has_live {
+            println!("Entering live sync (Ctrl+C to stop)...");
+            let syncer = LiveSyncer::new(config, network, db, tx);
+            tokio::select! {
+                res = syncer.run() => {
+                    if let Err(e) = res {
+                        eprintln!("Live sync error: {e:#}");
+                    }
+                }
+                _ = tokio::signal::ctrl_c() => {}
+            }
+        } else {
+            info!(port, "Historical sync done. Press Ctrl+C to stop.");
+            tokio::signal::ctrl_c()
+                .await
+                .context("Failed to listen for Ctrl+C")?;
+        }
+
         println!("\nShutting down...");
         handle.stop()?;
     }

@@ -75,6 +75,11 @@ impl ReorgDetector {
         }
     }
 
+    /// Window capacity (equals `node.reorg_buffer` from the config).
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
     /// Current chain tip (the most recent block added to the window).
     pub fn tip(&self) -> Option<(u64, B256)> {
         self.buffer.back().copied()

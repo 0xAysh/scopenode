@@ -28,7 +28,7 @@ use std::path::PathBuf;
 use url::Url;
 
 /// Root configuration loaded from `config.toml`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// Node-level settings (port, data directory, consensus RPCs, reorg buffer).
@@ -39,7 +39,7 @@ pub struct Config {
 }
 
 /// Settings that apply to the whole node instance.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeConfig {
     /// JSON-RPC server port. Default: 8545 (the standard Ethereum RPC port).
