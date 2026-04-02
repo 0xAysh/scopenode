@@ -873,3 +873,74 @@ fn build_query_events_sql<'a>(
         },
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Open a temporary on-disk SQLite database for testing.
+    ///
+    /// Uses a temp file so migrations (which require WAL mode) work correctly.
+    /// The file is cleaned up when `_guard` is dropped.
+    async fn open_test_db() -> (Db, tempfile::TempPath) {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let (file, path) = tmp.into_parts();
+        drop(file);
+        let db = Db::open(path.to_path_buf()).await.unwrap();
+        (db, path)
+    }
+
+    fn make_event(contract: &str, block_number: i64, block_hash: &str, tx_hash: &str, log_index: i64) -> StoredEvent {
+        StoredEvent {
+            contract: contract.to_string(),
+            event_name: "Transfer".to_string(),
+            topic0: "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef".to_string(),
+            block_number,
+            block_hash: block_hash.to_string(),
+            tx_hash: tx_hash.to_string(),
+            tx_index: 0,
+            log_index,
+            raw_topics: "[\"0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef\"]".to_string(),
+            raw_data: "00".to_string(),
+            decoded: "{}".to_string(),
+            source: "devp2p".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_logs_excludes_reorged_events() {
+        let (db, _guard) = open_test_db().await;
+
+        let contract = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
+        let canonical_hash = "0x1111111111111111111111111111111111111111111111111111111111111111";
+        let orphan_hash   = "0x2222222222222222222222222222222222222222222222222222222222222222";
+
+        // Insert one canonical event and one orphaned (reorged) event.
+        let canonical = make_event(contract, 100, canonical_hash, "0xaaaa", 0);
+        let orphaned  = make_event(contract, 101, orphan_hash,   "0xbbbb", 0);
+
+        db.insert_events(&[canonical, orphaned]).await.unwrap();
+
+        // Mark the orphan block as reorged.
+        let hash: B256 = orphan_hash.parse().unwrap();
+        let marked = db.mark_reorged_by_hash(&[hash]).await.unwrap();
+        assert_eq!(marked, 1, "one event should be marked reorged");
+
+        // Register the contract so is_contract_indexed passes (not needed for
+        // query_events_for_filter, but validates the full stack).
+        sqlx::query("INSERT OR IGNORE INTO contracts (address) VALUES (?)")
+            .bind(contract)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // query_events_for_filter must return only the canonical event.
+        let rows = db
+            .query_events_for_filter(Some(contract), None, None, None, 100)
+            .await
+            .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].block_hash, canonical_hash);
+    }
+}
