@@ -885,6 +885,9 @@ mod tests {
     async fn open_test_db() -> (Db, tempfile::TempPath) {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let (file, path) = tmp.into_parts();
+        // Drop the file handle so Db::open can open the same path without a lock conflict
+        // on Windows; on Unix this is harmless. The TempPath returned to the caller keeps
+        // the file alive and deletes it on drop.
         drop(file);
         let db = Db::open(path.to_path_buf()).await.unwrap();
         (db, path)
@@ -921,20 +924,10 @@ mod tests {
 
         db.insert_events(&[canonical, orphaned]).await.unwrap();
 
-        // Mark the orphan block as reorged.
         let hash: B256 = orphan_hash.parse().unwrap();
         let marked = db.mark_reorged_by_hash(&[hash]).await.unwrap();
         assert_eq!(marked, 1, "one event should be marked reorged");
 
-        // Register the contract so is_contract_indexed passes (not needed for
-        // query_events_for_filter, but validates the full stack).
-        sqlx::query("INSERT OR IGNORE INTO contracts (address) VALUES (?)")
-            .bind(contract)
-            .execute(&db.pool)
-            .await
-            .unwrap();
-
-        // query_events_for_filter must return only the canonical event.
         let rows = db
             .query_events_for_filter(Some(contract), None, None, None, 100)
             .await

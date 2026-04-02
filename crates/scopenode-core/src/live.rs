@@ -14,7 +14,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use alloy_primitives::B256;
+use alloy_primitives::{Bloom, B256};
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
@@ -146,7 +146,6 @@ impl<N: EthNetwork + 'static> LiveSyncer<N> {
             );
         }
 
-        // Check if any contract bloom-matches before fetching receipts.
         let any_match = contracts
             .iter()
             .any(|(_, _, targets)| BloomScanner::matches(&header.logs_bloom, targets));
@@ -154,7 +153,6 @@ impl<N: EthNetwork + 'static> LiveSyncer<N> {
             return Ok(());
         }
 
-        // Fetch and verify receipts once for this block.
         let batch = [(header.number, header.hash, header.receipts_root)];
         let results: Vec<_> = self.network.get_receipts_for_blocks(&batch).await;
 
@@ -163,11 +161,7 @@ impl<N: EthNetwork + 'static> LiveSyncer<N> {
                 ReceiptFetchResult::Ok { block_num, block_hash, receipts } => {
                     if let Err(e) = verify_receipts(&receipts, header.receipts_root, block_num) {
                         warn!(block = block_num, err = %e, "Live receipt verification failed");
-                        for (contract, _, targets) in contracts {
-                            if BloomScanner::matches(&header.logs_bloom, targets) {
-                                let _ = self.db.mark_retry(block_num, &contract.address.to_checksum(None)).await;
-                            }
-                        }
+                        mark_retry_matching(&self.db, block_num, &header.logs_bloom, contracts).await;
                         return Ok(());
                     }
 
@@ -197,15 +191,25 @@ impl<N: EthNetwork + 'static> LiveSyncer<N> {
                 }
                 ReceiptFetchResult::Failed { block_num } => {
                     warn!(block = block_num, "Live receipt fetch failed");
-                    for (contract, _, targets) in contracts {
-                        if BloomScanner::matches(&header.logs_bloom, targets) {
-                            let _ = self.db.mark_retry(block_num, &contract.address.to_checksum(None)).await;
-                        }
-                    }
+                    mark_retry_matching(&self.db, block_num, &header.logs_bloom, contracts).await;
                 }
             }
         }
 
         Ok(())
+    }
+}
+
+/// Call `mark_retry` for every contract whose bloom targets match `bloom`.
+async fn mark_retry_matching(
+    db: &scopenode_storage::Db,
+    block_num: u64,
+    bloom: &Bloom,
+    contracts: &[(ContractConfig, Vec<EventAbi>, Vec<BloomTarget>)],
+) {
+    for (contract, _, targets) in contracts {
+        if BloomScanner::matches(bloom, targets) {
+            let _ = db.mark_retry(block_num, &contract.address.to_checksum(None)).await;
+        }
     }
 }
