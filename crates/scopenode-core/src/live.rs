@@ -200,6 +200,177 @@ impl<N: EthNetwork + 'static> LiveSyncer<N> {
     }
 }
 
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Config, ContractConfig, NodeConfig};
+    use crate::error::NetworkError;
+    use crate::types::ScopeHeader;
+    use alloy_primitives::{keccak256, Address, Bloom, Bytes, B256};
+    use alloy_trie::EMPTY_ROOT_HASH;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Duration;
+
+    // ── MockNetwork ───────────────────────────────────────────────────────────
+
+    struct MockNetwork {
+        headers: Vec<ScopeHeader>,
+    }
+
+    #[async_trait]
+    impl EthNetwork for MockNetwork {
+        async fn get_headers(&self, from: u64, to: u64) -> Result<Vec<ScopeHeader>, NetworkError> {
+            Ok(self
+                .headers
+                .iter()
+                .filter(|h| h.number >= from && h.number <= to)
+                .cloned()
+                .collect())
+        }
+
+        async fn get_receipts_for_blocks(
+            &self,
+            blocks: &[(u64, B256, B256)],
+        ) -> Vec<ReceiptFetchResult> {
+            blocks
+                .iter()
+                .map(|&(block_num, block_hash, _)| ReceiptFetchResult::Ok {
+                    block_num,
+                    block_hash,
+                    receipts: vec![],
+                })
+                .collect()
+        }
+
+        async fn best_block_number(&self) -> Result<u64, NetworkError> {
+            Ok(self.headers.iter().map(|h| h.number).max().unwrap_or(0))
+        }
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    fn unique_db_path() -> std::path::PathBuf {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        std::env::temp_dir()
+            .join(format!("scopenode_live_test_{}_{}.db", std::process::id(), n))
+    }
+
+    fn scope_header(number: u64) -> ScopeHeader {
+        ScopeHeader {
+            number,
+            hash: keccak256(number.to_be_bytes()),
+            parent_hash: keccak256((number.saturating_sub(1)).to_be_bytes()),
+            timestamp: number * 12,
+            receipts_root: EMPTY_ROOT_HASH,
+            logs_bloom: Bloom::default(), // empty — no receipt fetch triggered
+            gas_used: 0,
+            base_fee_per_gas: None,
+        }
+    }
+
+    fn live_config(address: Address) -> Config {
+        Config {
+            node: NodeConfig {
+                port: 18545,
+                data_dir: None,
+                consensus_rpc: vec![],
+                reorg_buffer: 64,
+            },
+            contracts: vec![ContractConfig {
+                name: Some("test".into()),
+                address,
+                events: vec!["Transfer".to_string()],
+                from_block: 1,
+                to_block: None,
+                abi_override: None,
+                impl_address: None,
+            }],
+        }
+    }
+
+    fn transfer_abi_json() -> String {
+        serde_json::json!([{
+            "name": "Transfer",
+            "inputs": [
+                { "name": "from",  "type": "address", "indexed": true  },
+                { "name": "to",    "type": "address", "indexed": true  },
+                { "name": "value", "type": "uint256", "indexed": false }
+            ]
+        }])
+        .to_string()
+    }
+
+    // ── Tests ─────────────────────────────────────────────────────────────────
+
+    /// The broadcast channel fans a single event out to all active subscribers.
+    #[tokio::test]
+    async fn broadcast_fan_out_multiple_receivers() {
+        let (tx, mut rx1) = broadcast::channel::<StoredEvent>(32);
+        let mut rx2 = tx.subscribe();
+        let mut rx3 = tx.subscribe();
+
+        let event = StoredEvent {
+            contract: Address::ZERO,
+            event_name: "Transfer".to_string(),
+            topic0: B256::ZERO,
+            block_number: 42,
+            block_hash: B256::ZERO,
+            tx_hash: B256::ZERO,
+            tx_index: 0,
+            log_index: 0,
+            raw_topics: vec![],
+            raw_data: Bytes::default(),
+            decoded: serde_json::json!({}),
+            source: "devp2p".to_string(),
+        };
+
+        tx.send(event).unwrap();
+
+        let e1 = rx1.recv().await.unwrap();
+        let e2 = rx2.recv().await.unwrap();
+        let e3 = rx3.recv().await.unwrap();
+
+        assert_eq!(e1.block_number, 42);
+        assert_eq!(e2.block_number, 42);
+        assert_eq!(e3.block_number, 42);
+        assert_eq!(e1.event_name, "Transfer");
+    }
+
+    /// LiveSyncer stores a header row for every block it processes.
+    #[tokio::test]
+    async fn live_syncer_stores_headers_for_processed_blocks() {
+        let addr: Address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".parse().unwrap();
+        let addr_str = addr.to_checksum(None);
+
+        let db_path = unique_db_path();
+        let db = scopenode_storage::Db::open(db_path.clone()).await.unwrap();
+        db.upsert_contract(&addr_str, Some("test"), &transfer_abi_json())
+            .await
+            .unwrap();
+
+        let headers: Vec<ScopeHeader> = (1u64..=5).map(scope_header).collect();
+        let network = Arc::new(MockNetwork { headers });
+        let (tx, _rx) = broadcast::channel(32);
+
+        let syncer = LiveSyncer::new(live_config(addr), network, db.clone(), tx);
+
+        // run() loops forever — interrupt after the first batch completes.
+        let _ = tokio::time::timeout(Duration::from_secs(1), syncer.run()).await;
+
+        let stored = db.get_headers(1, 5).await.unwrap();
+        assert_eq!(stored.len(), 5);
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+    }
+}
+
 /// Call `mark_retry` for every contract whose bloom targets match `bloom`.
 async fn mark_retry_matching(
     db: &scopenode_storage::Db,
