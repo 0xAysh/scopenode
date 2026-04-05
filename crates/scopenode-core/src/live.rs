@@ -255,7 +255,7 @@ mod tests {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
 
     fn unique_db_path() -> std::path::PathBuf {
-        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir()
             .join(format!("scopenode_live_test_{}_{}.db", std::process::id(), n))
     }
@@ -336,9 +336,9 @@ mod tests {
         let e3 = rx3.recv().await.unwrap();
 
         assert_eq!(e1.block_number, 42);
-        assert_eq!(e2.block_number, 42);
-        assert_eq!(e3.block_number, 42);
         assert_eq!(e1.event_name, "Transfer");
+        assert_eq!(e2.block_number, e1.block_number);
+        assert_eq!(e3.block_number, e1.block_number);
     }
 
     /// LiveSyncer stores a header row for every block it processes.
