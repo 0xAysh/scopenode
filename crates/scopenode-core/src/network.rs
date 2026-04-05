@@ -127,6 +127,14 @@ pub trait EthNetwork: Send + Sync {
     /// Derived from `UnifiedStatus::latest_block` — populated for eth/69+ peers.
     /// Used as `to_block` when the config omits it (live-tip sync).
     async fn best_block_number(&self) -> Result<u64, NetworkError>;
+
+    /// Return the number of currently active devp2p peer sessions.
+    ///
+    /// Used by the TUI to display network connectivity. Default implementation
+    /// returns 0, suitable for test doubles and mocks.
+    async fn peer_count(&self) -> usize {
+        0
+    }
 }
 
 // ── Internal peer session state ───────────────────────────────────────────────
@@ -587,6 +595,10 @@ impl EthNetwork for DevP2PNetwork {
             .filter_map(|s| s.best_block)
             .max()
             .ok_or(NetworkError::NoPeers { wanted: 1, found: 0 })
+    }
+
+    async fn peer_count(&self) -> usize {
+        self.peers.read().await.len()
     }
 }
 
