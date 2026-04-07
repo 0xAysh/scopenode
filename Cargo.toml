@@ -39,6 +39,8 @@ reth-storage-api         = { git = "https://github.com/paradigmxyz/reth", tag = 
 reth-ethereum-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3", default-features = false }
 reth-ethereum-forks      = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3", default-features = false }
 tokio-stream             = "0.1"
+axum                     = { version = "0.7", features = ["tokio"] }
+tower-http               = { version = "0.5", features = ["cors"] }
 ratatui                  = "0.28"
 crossterm                = { version = "0.28", features = ["event-stream"] }
 scopenode-core    = { path = "crates/scopenode-core" }

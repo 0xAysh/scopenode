@@ -1,20 +1,22 @@
-//! Ethereum JSON-RPC server for scopenode.
+//! Servers for scopenode: Ethereum JSON-RPC at `:8545` and REST API at `:8546`.
 //!
-//! Serves a standard `eth_*` JSON-RPC interface on `localhost:<port>` so any
-//! Ethereum library (viem, ethers.js, web3.py, alloy, cast) can query indexed
-//! events without code changes.
+//! **JSON-RPC** (`:8545`): serves `eth_getLogs`, `eth_blockNumber`, `eth_chainId`
+//! so any Ethereum library (viem, ethers.js, web3.py, alloy, cast) can query
+//! indexed events without code changes.
+//!
+//! **REST** (`:8546`): JSON HTTP API + SSE stream for apps that don't speak
+//! Ethereum JSON-RPC. Supports filtering by contract, event name, topic0, and
+//! block range. The `/stream/events` endpoint pushes live events via SSE.
 //!
 //! Only queries for **indexed contracts** are answered. Out-of-scope calls
 //! return a clear error telling the user to run `scopenode status`.
-//!
-//! Implemented methods:
-//! - `eth_getLogs` — filtered event log query from SQLite
-//! - `eth_blockNumber` — highest indexed block number
-//! - `eth_chainId` — always returns `0x1` (Ethereum mainnet)
 
 #![deny(warnings)]
 
+pub mod rest;
 pub mod server;
+
+pub use rest::start_rest_server;
 
 use jsonrpsee::server::{Server, ServerHandle};
 use scopenode_storage::Db;

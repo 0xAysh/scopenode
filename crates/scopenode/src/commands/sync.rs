@@ -28,7 +28,7 @@ use scopenode_core::{
     pipeline::Pipeline,
     types::StoredEvent,
 };
-use scopenode_rpc::start_server;
+use scopenode_rpc::{start_rest_server, start_server};
 use scopenode_storage::Db;
 use tokio::sync::broadcast;
 use tokio_stream::StreamExt as _;
@@ -93,10 +93,13 @@ pub async fn run(
 
         if !dry_run {
             let (tx, _) = broadcast::channel::<StoredEvent>(1024);
-            println!("\nSync complete. Starting JSON-RPC server on port {port}...");
+            println!("\nSync complete. Starting servers on ports {port} (JSON-RPC) and {} (REST)...", port + 1);
             let handle = start_server(port, db.clone())
                 .await
                 .context("Failed to start JSON-RPC server")?;
+            start_rest_server(port + 1, db.clone(), tx.clone())
+                .await
+                .context("Failed to start REST server")?;
 
             if has_live {
                 println!("Entering live sync (Ctrl+C to stop)...");
@@ -198,6 +201,9 @@ async fn run_with_tui<N: EthNetwork + 'static>(
                     let handle = start_server(port, db.clone())
                         .await
                         .context("Failed to start JSON-RPC server")?;
+                    start_rest_server(port + 1, db.clone(), broadcast_tx.clone())
+                        .await
+                        .context("Failed to start REST server")?;
                     // Store the stop function for cleanup after the loop.
                     rpc_handle = Some(Box::new(move || handle.stop().map_err(anyhow::Error::from)));
 

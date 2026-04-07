@@ -719,52 +719,68 @@ impl Db {
     ///
     /// Only returns non-reorged events (`reorged = 0`). The `limit` guards against
     /// extremely large result sets; 10,000 is the default cap in the RPC server.
+    /// Query events with optional filters.
+    ///
+    /// All filters are combined with AND. Only non-reorged events are returned.
+    /// `limit` caps the result set; `offset` supports pagination.
+    ///
+    /// Filters:
+    /// - `contract` — EIP-55 checksummed address
+    /// - `event_name` — human-readable event name (e.g. `"Swap"`)
+    /// - `topic0` — raw keccak256 event selector hash (0x-prefixed hex)
+    /// - `from_block` / `to_block` — inclusive block range (defaults to full range)
     pub async fn query_events_for_filter(
         &self,
         contract: Option<&str>,
+        event_name: Option<&str>,
         topic0: Option<&str>,
         from_block: Option<u64>,
         to_block: Option<u64>,
         limit: usize,
+        offset: u64,
     ) -> Result<Vec<StoredEvent>, DbError> {
         let from = from_block.unwrap_or(0) as i64;
         let to = to_block.map(|b| b as i64).unwrap_or(i64::MAX);
-        let limit_i = limit as i64;
 
-        // Build query dynamically based on which filters are present.
-        // topic0 maps to the indexed `topic0` column, which is the event selector hash.
-        let base = r#"SELECT contract, event_name, topic0, block_number, block_hash,
-                             tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source
-                      FROM events
-                      WHERE reorged = 0"#;
+        // Build WHERE clauses dynamically — only include filters that are Some.
+        let mut conditions = vec!["reorged = 0"];
+        if contract.is_some()   { conditions.push("contract = ?"); }
+        if event_name.is_some() { conditions.push("event_name = ?"); }
+        if topic0.is_some()     { conditions.push("topic0 = ?"); }
+        conditions.extend(["block_number >= ?", "block_number <= ?"]);
 
-        let (sql, has_contract, has_topic0) = match (contract, topic0) {
-            (Some(_), Some(_)) => (
-                format!("{base} AND contract = ? AND topic0 = ? AND block_number >= ? AND block_number <= ? ORDER BY block_number ASC, log_index ASC LIMIT ?"),
-                true, true,
-            ),
-            (Some(_), None) => (
-                format!("{base} AND contract = ? AND block_number >= ? AND block_number <= ? ORDER BY block_number ASC, log_index ASC LIMIT ?"),
-                true, false,
-            ),
-            _ => (
-                format!("{base} AND block_number >= ? AND block_number <= ? ORDER BY block_number ASC, log_index ASC LIMIT ?"),
-                false, false,
-            ),
-        };
+        let sql = format!(
+            "SELECT contract, event_name, topic0, block_number, block_hash, \
+             tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source \
+             FROM events WHERE {} \
+             ORDER BY block_number ASC, log_index ASC LIMIT ? OFFSET ?",
+            conditions.join(" AND ")
+        );
 
         let mut q = sqlx::query_as::<_, StoredEvent>(&sql);
-        if has_contract {
-            q = q.bind(contract.unwrap());
-        }
-        if has_topic0 {
-            q = q.bind(topic0.unwrap());
-        }
-        q = q.bind(from).bind(to).bind(limit_i);
+        if let Some(c) = contract   { q = q.bind(c); }
+        if let Some(e) = event_name { q = q.bind(e); }
+        if let Some(t) = topic0     { q = q.bind(t); }
+        q = q.bind(from).bind(to).bind(limit as i64).bind(offset as i64);
 
         q.fetch_all(&self.pool)
             .await
             .map_err(|e| DbError::Query(e.to_string()))
+    }
+
+    /// Count all non-reorged events across all contracts.
+    ///
+    /// Used by the REST `/status` endpoint.
+    pub async fn count_all_events(&self) -> Result<i64, DbError> {
+        #[derive(sqlx::FromRow)]
+        struct Row { count: i64 }
+        let row = sqlx::query_as::<_, Row>(
+            "SELECT COUNT(*) as count FROM events WHERE reorged = 0",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| DbError::Query(e.to_string()))?;
+        Ok(row.count)
     }
 }
 
@@ -929,7 +945,7 @@ mod tests {
         assert_eq!(marked, 1, "one event should be marked reorged");
 
         let rows = db
-            .query_events_for_filter(Some(contract), None, None, None, 100)
+            .query_events_for_filter(Some(contract), None, None, None, None, 100, 0)
             .await
             .unwrap();
 

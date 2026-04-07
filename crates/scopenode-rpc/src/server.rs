@@ -101,10 +101,12 @@ impl EthApiServer for EthApiImpl {
             .db
             .query_events_for_filter(
                 contract_str.as_deref(),
+                None,           // event_name: JSON-RPC uses topic0, not name
                 topic0_str.as_deref(),
                 from_block,
                 to_block,
                 10_000, // Safety cap: prevent response size explosions.
+                0,      // offset: not used from JSON-RPC path
             )
             .await
             .map_err(|e| internal_error(&e.to_string()))?;
