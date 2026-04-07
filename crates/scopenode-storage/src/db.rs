@@ -587,6 +587,55 @@ impl Db {
         .map_err(|e| DbError::Query(e.to_string()))
     }
 
+    /// Return all indexed contracts with their non-reorged event count in one query.
+    ///
+    /// Equivalent to `get_all_contracts()` + `count_events_for_contract()` per row,
+    /// but resolved with a single LEFT JOIN rather than N+1 queries.
+    pub async fn contracts_with_event_counts(&self) -> Result<Vec<(ContractRow, i64)>, DbError> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            address: String,
+            name: Option<String>,
+            abi_json: Option<String>,
+            event_count: i64,
+        }
+        let rows = sqlx::query_as::<_, Row>(
+            r#"SELECT c.address, c.name, c.abi_json,
+                      COUNT(e.rowid) as event_count
+               FROM contracts c
+               LEFT JOIN events e ON e.contract = c.address AND e.reorged = 0
+               GROUP BY c.address
+               ORDER BY c.address ASC"#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DbError::Query(e.to_string()))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                (
+                    ContractRow { address: r.address, name: r.name, abi_json: r.abi_json },
+                    r.event_count,
+                )
+            })
+            .collect())
+    }
+
+    /// Count the number of indexed contracts.
+    ///
+    /// Lighter than `get_all_contracts()` when only the count is needed
+    /// (avoids fetching `abi_json` blobs).
+    pub async fn count_contracts(&self) -> Result<i64, DbError> {
+        #[derive(sqlx::FromRow)]
+        struct Row { count: i64 }
+        let row = sqlx::query_as::<_, Row>("SELECT COUNT(*) as count FROM contracts")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| DbError::Query(e.to_string()))?;
+        Ok(row.count)
+    }
+
     /// Count bloom candidates marked for retry (`pending_retry = 1`).
     ///
     /// Shown in `scopenode status` output. A non-zero count indicates blocks where
@@ -711,20 +760,11 @@ impl Db {
             .collect()
     }
 
-    /// Query events for a JSON-RPC `eth_getLogs` filter.
-    ///
-    /// Filters by `contract` address and optionally by `topic0` (the event selector
-    /// hash, i.e. keccak256 of the event signature). This correctly implements the
-    /// Ethereum JSON-RPC `topics[0]` filter semantics.
-    ///
-    /// Only returns non-reorged events (`reorged = 0`). The `limit` guards against
-    /// extremely large result sets; 10,000 is the default cap in the RPC server.
     /// Query events with optional filters.
     ///
     /// All filters are combined with AND. Only non-reorged events are returned.
     /// `limit` caps the result set; `offset` supports pagination.
     ///
-    /// Filters:
     /// - `contract` — EIP-55 checksummed address
     /// - `event_name` — human-readable event name (e.g. `"Swap"`)
     /// - `topic0` — raw keccak256 event selector hash (0x-prefixed hex)

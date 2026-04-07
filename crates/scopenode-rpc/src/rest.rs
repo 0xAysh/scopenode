@@ -165,34 +165,18 @@ async fn get_events(
 async fn get_status(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<StatusResponse>, (axum::http::StatusCode, String)> {
-    let (block_number, contracts, event_count) = tokio::try_join!(
-        async {
-            state
-                .db
-                .latest_block_number()
-                .await
-                .map(|n| n.unwrap_or(0))
-                .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
-        },
-        async {
-            state
-                .db
-                .get_all_contracts()
-                .await
-                .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
-        },
-        async {
-            state
-                .db
-                .count_all_events()
-                .await
-                .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
-        },
+    let err = |e: scopenode_storage::error::DbError| {
+        (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    };
+    let (block_number, contract_count, event_count) = tokio::try_join!(
+        async { state.db.latest_block_number().await.map(|n| n.unwrap_or(0)).map_err(err) },
+        async { state.db.count_contracts().await.map_err(err) },
+        async { state.db.count_all_events().await.map_err(err) },
     )?;
 
     Ok(Json(StatusResponse {
         block_number,
-        contract_count: contracts.len(),
+        contract_count: contract_count as usize,
         event_count,
     }))
 }
@@ -202,23 +186,18 @@ async fn get_contracts(
 ) -> Result<Json<ContractsResponse>, (axum::http::StatusCode, String)> {
     let rows = state
         .db
-        .get_all_contracts()
+        .contracts_with_event_counts()
         .await
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let mut contracts = Vec::with_capacity(rows.len());
-    for row in &rows {
-        let event_count = state
-            .db
-            .count_events_for_contract(&row.address)
-            .await
-            .unwrap_or(0);
-        contracts.push(ContractResponse {
-            address: row.address.clone(),
-            name: row.name.clone(),
+    let contracts = rows
+        .into_iter()
+        .map(|(row, event_count)| ContractResponse {
+            address: row.address,
+            name: row.name,
             event_count,
-        });
-    }
+        })
+        .collect();
 
     Ok(Json(ContractsResponse { contracts }))
 }
@@ -251,21 +230,20 @@ async fn stream_events(
     Query(q): Query<StreamQuery>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let rx = state.broadcast.subscribe();
-    let contract_filter = q.contract.map(|s| s.to_lowercase());
-    let event_filter = q.event.map(|s| s.to_lowercase());
+    let contract_filter = q.contract;
+    let event_filter = q.event;
 
     let stream = BroadcastStream::new(rx).filter_map(move |result| {
-        // Swallow lagged errors — slow clients just miss some events.
-        let ev = result.ok()?;
+        let ev = result.ok()?; // swallow lagged errors — slow clients miss some events
 
         let addr = ev.contract.to_checksum(None);
         if let Some(ref c) = contract_filter {
-            if addr.to_lowercase() != *c {
+            if !addr.eq_ignore_ascii_case(c) {
                 return None;
             }
         }
         if let Some(ref e) = event_filter {
-            if ev.event_name.to_lowercase() != *e {
+            if !ev.event_name.eq_ignore_ascii_case(e) {
                 return None;
             }
         }
