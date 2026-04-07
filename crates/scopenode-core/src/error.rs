@@ -39,6 +39,9 @@ pub enum CoreError {
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("Internal error: {0}")]
+    Internal(String),
 }
 
 /// Errors from the devp2p network transport layer.

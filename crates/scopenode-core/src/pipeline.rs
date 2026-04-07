@@ -318,8 +318,18 @@ impl<N: EthNetwork + 'static> Pipeline<N> {
             if BloomScanner::matches(&bloom, targets) {
                 // This block's bloom says it might contain our events.
                 // Record it as a bloom candidate for the receipt fetch stage.
-                let hash: B256 = h.hash.parse().unwrap_or_default();
-                let receipts_root: B256 = h.receipts_root.parse().unwrap_or_default();
+                let hash: B256 = h.hash.parse().map_err(|_| {
+                    CoreError::Internal(format!(
+                        "block {}: malformed hash in DB: {:?}",
+                        h.number, h.hash
+                    ))
+                })?;
+                let receipts_root: B256 = h.receipts_root.parse().map_err(|_| {
+                    CoreError::Internal(format!(
+                        "block {}: malformed receipts_root in DB: {:?}",
+                        h.number, h.receipts_root
+                    ))
+                })?;
                 candidates.push((h.number as u64, hash, receipts_root));
                 let _ = self
                     .db
