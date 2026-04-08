@@ -464,7 +464,9 @@ impl<N: EthNetwork + 'static> Pipeline<N> {
         // Update cursor to mark receipt stage complete.
         // Skip when remaining is empty — all blocks were already fetched on resume,
         // and upserting with from_block would roll receipts_done_to backward.
-        if let Some(&(last_block, _, _)) = remaining.last() {
+        // Use max() rather than last() — remaining may not be sorted by block number
+        // (e.g. when called from run_retry with an unordered retry candidate set).
+        if let Some(last_block) = remaining.iter().map(|&(n, _, _)| n).max() {
             let to = contract.to_block.unwrap_or(last_block);
             let cursor = SyncCursor {
                 contract: addr_str.clone(),
