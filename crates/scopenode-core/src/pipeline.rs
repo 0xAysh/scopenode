@@ -318,8 +318,18 @@ impl<N: EthNetwork + 'static> Pipeline<N> {
             if BloomScanner::matches(&bloom, targets) {
                 // This block's bloom says it might contain our events.
                 // Record it as a bloom candidate for the receipt fetch stage.
-                let hash: B256 = h.hash.parse().unwrap_or_default();
-                let receipts_root: B256 = h.receipts_root.parse().unwrap_or_default();
+                let hash: B256 = h.hash.parse().map_err(|_| {
+                    CoreError::Internal(format!(
+                        "block {}: malformed hash in DB: {}",
+                        h.number, h.hash
+                    ))
+                })?;
+                let receipts_root: B256 = h.receipts_root.parse().map_err(|_| {
+                    CoreError::Internal(format!(
+                        "block {}: malformed receipts_root in DB: {}",
+                        h.number, h.receipts_root
+                    ))
+                })?;
                 candidates.push((h.number as u64, hash, receipts_root));
                 let _ = self
                     .db
@@ -369,12 +379,12 @@ impl<N: EthNetwork + 'static> Pipeline<N> {
 
         // Filter already-fetched blocks for resumability: if we crashed mid-batch,
         // the next run picks up from blocks where fetched=0, skipping completed ones.
-        let mut remaining = Vec::new();
-        for &(block_num, block_hash, receipts_root) in candidates {
-            if !self.db.is_fetched(block_num, &addr_str).await? {
-                remaining.push((block_num, block_hash, receipts_root));
-            }
-        }
+        let fetched_set = self.db.get_fetched_set(&addr_str).await?;
+        let remaining: Vec<(u64, B256, B256)> = candidates
+            .iter()
+            .copied()
+            .filter(|(n, _, _)| !fetched_set.contains(n))
+            .collect();
 
         let total = remaining.len() as u64;
         let pb = progress.add(ProgressBar::new(total));
@@ -452,21 +462,22 @@ impl<N: EthNetwork + 'static> Pipeline<N> {
         pb.finish_with_message(format!("done ({total_events} events found)"));
 
         // Update cursor to mark receipt stage complete.
-        let to = contract.to_block.unwrap_or(
-            remaining
-                .last()
-                .map(|&(n, _, _)| n)
-                .unwrap_or(contract.from_block),
-        );
-        let cursor = SyncCursor {
-            contract: addr_str.clone(),
-            from_block: contract.from_block,
-            to_block: contract.to_block,
-            headers_done_to: Some(to),
-            bloom_done_to: Some(to),
-            receipts_done_to: Some(to),
-        };
-        let _ = self.db.upsert_sync_cursor(&cursor).await;
+        // Skip when remaining is empty — all blocks were already fetched on resume,
+        // and upserting with from_block would roll receipts_done_to backward.
+        // Use max() rather than last() — remaining may not be sorted by block number
+        // (e.g. when called from run_retry with an unordered retry candidate set).
+        if let Some(last_block) = remaining.iter().map(|&(n, _, _)| n).max() {
+            let to = contract.to_block.unwrap_or(last_block);
+            let cursor = SyncCursor {
+                contract: addr_str.clone(),
+                from_block: contract.from_block,
+                to_block: contract.to_block,
+                headers_done_to: Some(to),
+                bloom_done_to: Some(to),
+                receipts_done_to: Some(to),
+            };
+            let _ = self.db.upsert_sync_cursor(&cursor).await;
+        }
 
         info!(
             contract = %contract.address,

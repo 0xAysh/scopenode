@@ -135,7 +135,10 @@ impl SourcifyClient {
     /// Create a new Sourcify client with a default `reqwest` HTTP client.
     pub fn new() -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("reqwest client"),
         }
     }
 

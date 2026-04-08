@@ -86,10 +86,21 @@ impl<N: EthNetwork + 'static> LiveSyncer<N> {
         if tip > 0 {
             let seed_from = tip.saturating_sub(self.reorg_detector.capacity() as u64 - 1);
             let headers = self.db.get_headers(seed_from, tip).await?;
-            self.reorg_detector.seed(headers.iter().map(|h| {
-                let hash: B256 = h.hash.parse().unwrap_or_default();
-                (h.number as u64, hash)
-            }));
+            self.reorg_detector.seed(
+                headers.iter().filter_map(|h| {
+                    match h.hash.parse::<B256>() {
+                        Ok(hash) => Some((h.number as u64, hash)),
+                        Err(e) => {
+                            warn!(
+                                block = h.number,
+                                err = %e,
+                                "Malformed header hash in DB — skipping for reorg seed"
+                            );
+                            None
+                        }
+                    }
+                }),
+            );
         }
 
         info!(tip, contracts = contract_data.len(), "Live sync started");
