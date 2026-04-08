@@ -320,13 +320,13 @@ impl<N: EthNetwork + 'static> Pipeline<N> {
                 // Record it as a bloom candidate for the receipt fetch stage.
                 let hash: B256 = h.hash.parse().map_err(|_| {
                     CoreError::Internal(format!(
-                        "block {}: malformed hash in DB: {:?}",
+                        "block {}: malformed hash in DB: {}",
                         h.number, h.hash
                     ))
                 })?;
                 let receipts_root: B256 = h.receipts_root.parse().map_err(|_| {
                     CoreError::Internal(format!(
-                        "block {}: malformed receipts_root in DB: {:?}",
+                        "block {}: malformed receipts_root in DB: {}",
                         h.number, h.receipts_root
                     ))
                 })?;
