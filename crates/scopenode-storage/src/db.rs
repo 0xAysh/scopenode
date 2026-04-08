@@ -15,6 +15,7 @@ use crate::error::DbError;
 use crate::models::{ContractRow, StoredEvent, StoredHeader};
 use alloy_primitives::{Bloom, B256};
 use sqlx::SqlitePool;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use tracing::info;
 
@@ -216,6 +217,27 @@ impl Db {
         .await
         .map_err(|e| DbError::Query(e.to_string()))?;
         Ok(row.map(|r| r.fetched != 0).unwrap_or(false))
+    }
+
+    /// Return the set of block numbers already fetched for a contract.
+    ///
+    /// Used by `fetch_and_store` to filter candidates in one query instead of
+    /// N individual `is_fetched` calls. Returns block numbers where `fetched = 1`.
+    pub async fn get_fetched_set(&self, contract: &str) -> Result<HashSet<u64>, DbError> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            block_number: i64,
+        }
+
+        let rows = sqlx::query_as::<_, Row>(
+            r#"SELECT block_number FROM bloom_candidates WHERE contract = ? AND fetched = 1"#,
+        )
+        .bind(contract)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DbError::Query(e.to_string()))?;
+
+        Ok(rows.into_iter().map(|r| r.block_number as u64).collect())
     }
 
     /// Mark a bloom candidate as successfully fetched.
