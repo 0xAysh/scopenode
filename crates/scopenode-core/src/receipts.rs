@@ -138,3 +138,79 @@ fn encode_receipt_for_trie(receipt: &TransactionReceipt) -> Vec<u8> {
     consensus_receipt.inner.encode_2718(&mut buf);
     buf
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::VerifyError;
+    use alloy::consensus::{Eip658Value, Receipt, ReceiptEnvelope};
+    use alloy::rpc::types::{Log as RpcLog, TransactionReceipt};
+    use alloy_primitives::{Address, B256};
+    use alloy_trie::EMPTY_ROOT_HASH;
+
+    /// Build a minimal legacy receipt with no logs.
+    /// Only `cumulative_gas_used` varies between calls — enough to change the trie root.
+    fn make_receipt(cumulative_gas_used: u64) -> TransactionReceipt {
+        let receipt: Receipt<RpcLog> = Receipt {
+            status: Eip658Value::Eip658(true),
+            cumulative_gas_used,
+            logs: vec![],
+        };
+        let inner: ReceiptEnvelope<RpcLog> = ReceiptEnvelope::Legacy(receipt.into());
+        TransactionReceipt {
+            inner,
+            transaction_hash: B256::ZERO,
+            transaction_index: Some(0),
+            block_hash: Some(B256::ZERO),
+            block_number: Some(1),
+            gas_used: cumulative_gas_used,
+            effective_gas_price: 0,
+            blob_gas_used: None,
+            blob_gas_price: None,
+            from: Address::ZERO,
+            to: None,
+            contract_address: None,
+        }
+    }
+
+    #[test]
+    fn empty_receipts_match_empty_root() {
+        assert!(verify_receipts(&[], EMPTY_ROOT_HASH, 0).is_ok());
+    }
+
+    #[test]
+    fn empty_receipts_wrong_root_fails() {
+        let wrong_root = B256::from([1u8; 32]);
+        let result = verify_receipts(&[], wrong_root, 0);
+        assert!(
+            matches!(result, Err(VerifyError::RootMismatch { expected, computed, .. })
+                if expected == wrong_root && computed == EMPTY_ROOT_HASH),
+            "expected RootMismatch with computed=EMPTY_ROOT_HASH, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn tampered_receipt_fails() {
+        let receipt_a = make_receipt(21_000);
+
+        // Derive root_a: we don't know it in advance, so we use the error.
+        let root_a = match verify_receipts(&[receipt_a.clone()], B256::ZERO, 1) {
+            Err(VerifyError::RootMismatch { computed, .. }) => computed,
+            other => panic!("expected RootMismatch when probing root, got {:?}", other),
+        };
+
+        // Sanity: receipt_a passes against its own root.
+        assert!(
+            verify_receipts(&[receipt_a], root_a, 1).is_ok(),
+            "receipt_a should pass against root_a"
+        );
+
+        // Tampered: different cumulative_gas_used → different trie encoding → different root.
+        let receipt_b = make_receipt(42_000);
+        assert!(
+            verify_receipts(&[receipt_b], root_a, 1).is_err(),
+            "tampered receipt should fail against root_a"
+        );
+    }
+}
