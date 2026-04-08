@@ -462,21 +462,20 @@ impl<N: EthNetwork + 'static> Pipeline<N> {
         pb.finish_with_message(format!("done ({total_events} events found)"));
 
         // Update cursor to mark receipt stage complete.
-        let to = contract.to_block.unwrap_or(
-            remaining
-                .last()
-                .map(|&(n, _, _)| n)
-                .unwrap_or(contract.from_block),
-        );
-        let cursor = SyncCursor {
-            contract: addr_str.clone(),
-            from_block: contract.from_block,
-            to_block: contract.to_block,
-            headers_done_to: Some(to),
-            bloom_done_to: Some(to),
-            receipts_done_to: Some(to),
-        };
-        let _ = self.db.upsert_sync_cursor(&cursor).await;
+        // Skip when remaining is empty — all blocks were already fetched on resume,
+        // and upserting with from_block would roll receipts_done_to backward.
+        if let Some(&(last_block, _, _)) = remaining.last() {
+            let to = contract.to_block.unwrap_or(last_block);
+            let cursor = SyncCursor {
+                contract: addr_str.clone(),
+                from_block: contract.from_block,
+                to_block: contract.to_block,
+                headers_done_to: Some(to),
+                bloom_done_to: Some(to),
+                receipts_done_to: Some(to),
+            };
+            let _ = self.db.upsert_sync_cursor(&cursor).await;
+        }
 
         info!(
             contract = %contract.address,
