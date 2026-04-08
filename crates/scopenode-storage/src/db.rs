@@ -336,8 +336,8 @@ impl Db {
     ///
     /// Wrapping N inserts in one transaction is dramatically faster than N
     /// individual transactions (SQLite flushes to disk per-commit by default).
-    /// Uses `INSERT OR IGNORE` on `(tx_hash, log_index)` so re-running the
-    /// pipeline for an already-processed block never creates duplicates.
+    /// Uses `INSERT OR IGNORE` on `(block_number, tx_index, log_index)` so
+    /// re-running the pipeline for an already-processed block never creates duplicates.
     /// The transaction is all-or-nothing: if any insert fails, none are committed.
     pub async fn insert_events(&self, events: &[StoredEvent]) -> Result<(), DbError> {
         if events.is_empty() {
