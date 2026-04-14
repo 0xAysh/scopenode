@@ -141,9 +141,9 @@ impl<N: EthNetwork + 'static> LiveSyncer<N> {
         contracts: &[(ContractConfig, Vec<EventAbi>, Vec<BloomTarget>)],
     ) -> Result<(), CoreError> {
         let headers = self.network.get_headers(block_num, block_num).await?;
-        let header = headers.into_iter().next().ok_or_else(|| {
+        let header = headers.into_iter().next().ok_or(
             CoreError::Network(crate::error::NetworkError::HeadersFailed(block_num, block_num))
-        })?;
+        )?;
 
         self.db.insert_header(&scope_header_to_stored(&header)).await?;
 

@@ -791,6 +791,7 @@ impl Db {
     /// - `event_name` — human-readable event name (e.g. `"Swap"`)
     /// - `topic0` — raw keccak256 event selector hash (0x-prefixed hex)
     /// - `from_block` / `to_block` — inclusive block range (defaults to full range)
+    #[allow(clippy::too_many_arguments)]
     pub async fn query_events_for_filter(
         &self,
         contract: Option<&str>,

@@ -32,6 +32,7 @@
 //! without transaction metadata (tx_hash, from, block context). We synthesise:
 //!   - `tx_hash` = `keccak256(block_hash ++ tx_index_be)` — deterministic, unique per (block, tx)
 //!   - `log_index` = cumulative across all logs in the block (0-indexed globally)
+//!
 //! These synthetic values enable correct `(tx_hash, log_index)` deduplication in SQLite
 //! and survive re-runs (same inputs → same hash → `INSERT OR IGNORE` skips duplicates).
 
@@ -488,7 +489,7 @@ impl EthNetwork for DevP2PNetwork {
                 if s.len() >= want || attempts >= 90 {
                     break s;
                 }
-                if attempts % 10 == 0 {
+                if attempts.is_multiple_of(10) {
                     debug!(peers = s.len(), elapsed_s = attempts, "waiting for more peers before receipt fetch...");
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -541,7 +542,7 @@ impl EthNetwork for DevP2PNetwork {
                     let mut peer_bad = false;
 
                     for (&(block_num, block_hash, receipts_root), wire_receipts) in
-                        blocks.iter().zip(receipt_batches.into_iter())
+                        blocks.iter().zip(receipt_batches)
                     {
                         let receipts = build_alloy_receipts(wire_receipts, block_num, block_hash);
 
@@ -647,7 +648,7 @@ where
             let mut hash_input = [0u8; 40]; // 32 bytes block_hash + 8 bytes tx_index
             hash_input[..32].copy_from_slice(block_hash.as_slice());
             hash_input[32..].copy_from_slice(&tx_index.to_be_bytes());
-            let tx_hash: B256 = keccak256(&hash_input);
+            let tx_hash: B256 = keccak256(hash_input);
 
             // Build alloy::rpc::types::Log for each primitive log.
             // log_index is globally unique within the block (cumulative across all txs).
