@@ -25,3 +25,4 @@ pub mod pipeline;
 pub mod receipts;
 pub mod reorg;
 pub mod types;
+pub mod webhook;
