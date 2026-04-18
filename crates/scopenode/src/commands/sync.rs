@@ -27,6 +27,7 @@ use scopenode_core::{
     network::{DevP2PNetwork, EthNetwork},
     pipeline::Pipeline,
     types::StoredEvent,
+    webhook::WebhookDispatcher,
 };
 use scopenode_rpc::{start_rest_server, start_server};
 use scopenode_storage::Db;
@@ -93,6 +94,7 @@ pub async fn run(
 
         if !dry_run {
             let (tx, _) = broadcast::channel::<StoredEvent>(1024);
+            tokio::spawn(WebhookDispatcher::new(config.clone(), tx.subscribe()).run());
             println!("\nSync complete. Starting servers on ports {port} (JSON-RPC) and {} (REST)...", port + 1);
             let handle = start_server(port, db.clone())
                 .await
@@ -145,6 +147,7 @@ async fn run_with_tui<N: EthNetwork + 'static>(
 ) -> Result<()> {
     let mut state = AppState::new(&config);
     let (broadcast_tx, mut broadcast_rx) = broadcast::channel::<StoredEvent>(1024);
+    tokio::spawn(WebhookDispatcher::new(config.clone(), broadcast_tx.subscribe()).run());
 
     // Set up the terminal before spawning anything so any early errors go to
     // the alternate screen rather than clobbering the spinner output.
