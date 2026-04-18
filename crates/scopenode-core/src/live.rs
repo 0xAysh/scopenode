@@ -300,6 +300,9 @@ mod tests {
                 to_block: None,
                 abi_override: None,
                 impl_address: None,
+                webhook: None,
+                webhook_secret: None,
+                webhook_events: std::collections::HashMap::new(),
             }],
         }
     }

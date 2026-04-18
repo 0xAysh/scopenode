@@ -609,6 +609,9 @@ mod tests {
                 to_block: Some(to),
                 abi_override: None,
                 impl_address: None,
+                webhook: None,
+                webhook_secret: None,
+                webhook_events: std::collections::HashMap::new(),
             }],
         }
     }
