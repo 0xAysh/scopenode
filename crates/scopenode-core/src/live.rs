@@ -182,7 +182,7 @@ impl<N: EthNetwork + 'static> LiveSyncer<N> {
                         }
 
                         let decoder = EventDecoder::new(events, contract.address)?;
-                        let decoded = decoder.extract_and_decode(&receipts, block_num, block_hash);
+                        let decoded = decoder.extract_and_decode(&receipts, block_num, block_hash, header.timestamp);
                         let storage: Vec<_> = decoded.iter().map(core_to_storage_event).collect();
 
                         if !storage.is_empty() {
@@ -338,6 +338,7 @@ mod tests {
             raw_data: Bytes::default(),
             decoded: serde_json::json!({}),
             source: "devp2p".to_string(),
+            timestamp: 0,
         };
 
         tx.send(event).unwrap();

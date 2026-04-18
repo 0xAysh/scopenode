@@ -85,10 +85,12 @@ impl<N: EthNetwork + 'static> Pipeline<N> {
 
         for contract in self.config.contracts.clone() {
             let addr_str = contract.address.to_checksum(None);
-            let blocks: Vec<(u64, B256, B256)> = candidates
+            // run_retry doesn't have timestamps (not stored in pending_retry table);
+            // use 0 as a sentinel — retry blocks are re-fetched for correctness, not webhooks.
+            let blocks: Vec<(u64, B256, B256, u64)> = candidates
                 .iter()
                 .filter(|(_, _, _, c)| *c == addr_str)
-                .map(|&(n, h, r, _)| (n, h, r))
+                .map(|&(n, h, r, _)| (n, h, r, 0u64))
                 .collect();
             if blocks.is_empty() {
                 continue;
@@ -290,7 +292,7 @@ impl<N: EthNetwork + 'static> Pipeline<N> {
         from: u64,
         to: u64,
         progress: &MultiProgress,
-    ) -> Result<Vec<(u64, B256, B256)>, CoreError> {
+    ) -> Result<Vec<(u64, B256, B256, u64)>, CoreError> {
         let headers = self.db.get_headers(from, to).await?;
 
         // Nothing new to scan — bloom was already done for this range on a prior run.
@@ -330,7 +332,7 @@ impl<N: EthNetwork + 'static> Pipeline<N> {
                         h.number, h.receipts_root
                     ))
                 })?;
-                candidates.push((h.number as u64, hash, receipts_root));
+                candidates.push((h.number as u64, hash, receipts_root, h.timestamp as u64));
                 let _ = self
                     .db
                     .insert_bloom_candidate(h.number as u64, hash, &addr_str)
@@ -370,7 +372,7 @@ impl<N: EthNetwork + 'static> Pipeline<N> {
     async fn fetch_and_store(
         &mut self,
         contract: &ContractConfig,
-        candidates: &[(u64, B256, B256)],
+        candidates: &[(u64, B256, B256, u64)],
         events: &[crate::abi::EventAbi],
         progress: &MultiProgress,
     ) -> Result<(), CoreError> {
@@ -380,10 +382,10 @@ impl<N: EthNetwork + 'static> Pipeline<N> {
         // Filter already-fetched blocks for resumability: if we crashed mid-batch,
         // the next run picks up from blocks where fetched=0, skipping completed ones.
         let fetched_set = self.db.get_fetched_set(&addr_str).await?;
-        let remaining: Vec<(u64, B256, B256)> = candidates
+        let remaining: Vec<(u64, B256, B256, u64)> = candidates
             .iter()
             .copied()
-            .filter(|(n, _, _)| !fetched_set.contains(n))
+            .filter(|(n, _, _, _)| !fetched_set.contains(n))
             .collect();
 
         let total = remaining.len() as u64;
@@ -403,7 +405,10 @@ impl<N: EthNetwork + 'static> Pipeline<N> {
         // Batch up to 16 blocks per network request. This matches the ETH wire
         // protocol's GetReceipts message batch limit, keeping Phase 2 compatibility.
         for chunk in remaining.chunks(16) {
-            let results = self.network.get_receipts_for_blocks(chunk).await;
+            // The network trait takes 3-tuples (num, hash, receipts_root); strip the timestamp.
+            let net_chunk: Vec<(u64, B256, B256)> =
+                chunk.iter().map(|&(n, h, r, _)| (n, h, r)).collect();
+            let results = self.network.get_receipts_for_blocks(&net_chunk).await;
 
             for result in results {
                 match result {
@@ -412,11 +417,11 @@ impl<N: EthNetwork + 'static> Pipeline<N> {
                         block_hash,
                         receipts,
                     } => {
-                        // Find the expected receipts_root for this block from our chunk.
-                        let receipts_root = chunk
+                        // Find the expected receipts_root and timestamp for this block from our chunk.
+                        let (receipts_root, timestamp) = chunk
                             .iter()
-                            .find(|&&(n, _, _)| n == block_num)
-                            .map(|&(_, _, r)| r)
+                            .find(|&&(n, _, _, _)| n == block_num)
+                            .map(|&(_, _, r, t)| (r, t))
                             .unwrap_or_default();
 
                         // Merkle verify: rebuild the receipt trie and check the root.
@@ -437,7 +442,7 @@ impl<N: EthNetwork + 'static> Pipeline<N> {
 
                         // ABI decode: scan all receipt logs for our contract + events.
                         let stored_events =
-                            decoder.extract_and_decode(&receipts, block_num, block_hash);
+                            decoder.extract_and_decode(&receipts, block_num, block_hash, timestamp);
 
                         let storage_events: Vec<scopenode_storage::models::StoredEvent> =
                             stored_events.iter().map(core_to_storage_event).collect();
@@ -466,7 +471,7 @@ impl<N: EthNetwork + 'static> Pipeline<N> {
         // and upserting with from_block would roll receipts_done_to backward.
         // Use max() rather than last() — remaining may not be sorted by block number
         // (e.g. when called from run_retry with an unordered retry candidate set).
-        if let Some(last_block) = remaining.iter().map(|&(n, _, _)| n).max() {
+        if let Some(last_block) = remaining.iter().map(|&(n, _, _, _)| n).max() {
             let to = contract.to_block.unwrap_or(last_block);
             let cursor = SyncCursor {
                 contract: addr_str.clone(),

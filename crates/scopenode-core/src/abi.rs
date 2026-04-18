@@ -458,6 +458,7 @@ impl EventDecoder {
         receipts: &[TransactionReceipt],
         block_num: u64,
         block_hash: B256,
+        timestamp: u64,
     ) -> Vec<StoredEvent> {
         let mut results = Vec::new();
 
@@ -499,6 +500,7 @@ impl EventDecoder {
                     raw_data: Bytes::from(raw_data.0.to_vec()),
                     decoded,
                     source: "devp2p".to_string(),
+                    timestamp,
                 });
             }
         }

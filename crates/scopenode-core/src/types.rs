@@ -117,6 +117,9 @@ pub struct StoredEvent {
     /// - `"era1"` — ERA1 archive fallback (Phase 2)
     /// - `"rpc"` — last-resort fallback RPC (receipts still Merkle-verified)
     pub source: String,
+
+    /// Unix timestamp of the block this event was emitted in (seconds since epoch).
+    pub timestamp: u64,
 }
 
 /// Bloom filter inputs for a single (contract, event) pair.
