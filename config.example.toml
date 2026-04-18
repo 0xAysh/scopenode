@@ -1,6 +1,5 @@
 [node]
 port = 8545
-rest_port = 8546
 data_dir = "~/.scopenode"
 
 [[contracts]]
