@@ -10,3 +10,18 @@ events = ["Swap", "Mint", "Burn"]
 from_block = 17000000
 to_block = 17000100
 # abi_override = "./abis/MyContract.json"
+#
+# Webhook — receive live events via HTTP POST (fires after historical sync completes).
+# Optional: remove these lines if you don't need push delivery.
+#
+# All events on this contract go to this URL unless overridden by webhook_events.
+# webhook = "https://myapp.com/hooks/uniswap"
+#
+# HMAC-SHA256 secret. Adds X-Scopenode-Signature: sha256=<hex> to every POST.
+# Verify on your server: HMAC-SHA256(key=secret, msg=request_body_bytes).
+# webhook_secret = "change-me-to-a-random-secret"
+#
+# Per-event overrides — Swap events go to a different URL than the catch-all above.
+# [contracts.webhook_events]
+# Swap = "https://myapp.com/hooks/swaps"
+# Mint = "https://myapp.com/hooks/mints"
