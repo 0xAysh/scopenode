@@ -65,6 +65,51 @@ pub fn resolve_url<'a>(contract: &'a ContractConfig, event_name: &str) -> Option
         .or(contract.webhook.as_ref())
 }
 
+use std::time::Duration;
+use tracing::warn;
+
+/// POST `body` to `url` with `headers`, retrying up to 3 times on failure.
+///
+/// Delays: 1s after attempt 1, 2s after attempt 2. Attempt 3 is the last.
+/// Non-2xx responses count as failures. Failures after 3 attempts are logged
+/// and dropped — live sync is never blocked.
+pub async fn deliver_with_retry(
+    client: &reqwest::Client,
+    url: &Url,
+    body: Vec<u8>,
+    headers: reqwest::header::HeaderMap,
+) {
+    let delays = [Duration::from_secs(1), Duration::from_secs(2), Duration::from_secs(4)];
+
+    for (attempt, delay) in delays.iter().enumerate() {
+        match client
+            .post(url.as_str())
+            .headers(headers.clone())
+            .body(body.clone())
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => return,
+            Ok(r) => warn!(
+                status = %r.status(),
+                attempt,
+                url = %url,
+                "Webhook non-2xx response"
+            ),
+            Err(e) => warn!(
+                err = %e,
+                attempt,
+                url = %url,
+                "Webhook request failed"
+            ),
+        }
+        if attempt < 2 {
+            tokio::time::sleep(*delay).await;
+        }
+    }
+    warn!(url = %url, "Webhook giving up after 3 attempts");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,6 +212,88 @@ mod tests {
             let c = make_contract(None, &[("Swap", "https://example.com/swaps")]);
             assert!(resolve_url(&c, "Swap").is_some());
             assert!(resolve_url(&c, "Mint").is_none());
+        }
+    }
+
+    mod delivery {
+        use super::super::*;
+        use wiremock::{
+            matchers::{header, method, path},
+            Mock, MockServer, ResponseTemplate,
+        };
+
+        async fn make_server_and_url(response: u16, expected_calls: u64)
+            -> (MockServer, url::Url)
+        {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/hook"))
+                .respond_with(ResponseTemplate::new(response))
+                .expect(expected_calls)
+                .mount(&server)
+                .await;
+            let url = format!("{}/hook", server.uri()).parse().unwrap();
+            (server, url)
+        }
+
+        fn client() -> reqwest::Client {
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(2))
+                .build()
+                .unwrap()
+        }
+
+        #[tokio::test]
+        async fn success_on_first_attempt_sends_one_request() {
+            let (_server, url) = make_server_and_url(200, 1).await;
+            deliver_with_retry(&client(), &url, b"payload".to_vec(), Default::default()).await;
+            // wiremock asserts exact call count on drop
+        }
+
+        #[tokio::test]
+        async fn non_2xx_retries_three_times() {
+            // Note: this test takes ~3s due to 1s + 2s backoff delays.
+            let (_server, url) = make_server_and_url(500, 3).await;
+            deliver_with_retry(&client(), &url, b"payload".to_vec(), Default::default()).await;
+        }
+
+        #[tokio::test]
+        async fn success_on_second_attempt_sends_two_requests() {
+            let server = MockServer::start().await;
+            // First call → 500, second call → 200
+            Mock::given(method("POST"))
+                .and(path("/hook"))
+                .respond_with(ResponseTemplate::new(500))
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/hook"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let url: url::Url = format!("{}/hook", server.uri()).parse().unwrap();
+            deliver_with_retry(&client(), &url, b"payload".to_vec(), Default::default()).await;
+        }
+
+        #[tokio::test]
+        async fn content_type_header_is_sent() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/hook"))
+                .and(header("content-type", "application/json"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let url: url::Url = format!("{}/hook", server.uri()).parse().unwrap();
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                reqwest::header::CONTENT_TYPE,
+                "application/json".parse().unwrap(),
+            );
+            deliver_with_retry(&client(), &url, b"{}".to_vec(), headers).await;
         }
     }
 
