@@ -110,6 +110,87 @@ pub async fn deliver_with_retry(
     warn!(url = %url, "Webhook giving up after 3 attempts");
 }
 
+use crate::config::Config;
+use tokio::sync::broadcast;
+
+/// Subscribes to the live-event broadcast channel and delivers events to
+/// configured webhook URLs. Runs as a long-lived tokio task.
+///
+/// - Builds one shared `reqwest::Client` (connection pool reuse).
+/// - Each delivery is spawned in its own task (never blocks the loop).
+/// - Exits cleanly when the broadcast channel closes.
+pub struct WebhookDispatcher {
+    config: Config,
+    rx:     broadcast::Receiver<StoredEvent>,
+    client: reqwest::Client,
+}
+
+impl WebhookDispatcher {
+    pub fn new(config: Config, rx: broadcast::Receiver<StoredEvent>) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("reqwest client creation should not fail");
+        Self { config, rx, client }
+    }
+
+    /// Consume events from the broadcast channel until it closes.
+    pub async fn run(mut self) {
+        loop {
+            match self.rx.recv().await {
+                Ok(event) => self.dispatch(event).await,
+                Err(broadcast::error::RecvError::Closed) => break,
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    warn!(skipped = n, "Webhook dispatcher lagged — events dropped");
+                }
+            }
+        }
+    }
+
+    async fn dispatch(&self, event: StoredEvent) {
+        let event_addr = event.contract.to_checksum(None);
+
+        for contract in &self.config.contracts {
+            if contract.address.to_checksum(None) != event_addr {
+                continue;
+            }
+            let url = match resolve_url(contract, &event.event_name) {
+                Some(u) => u.clone(),
+                None => continue,
+            };
+
+            let payload = WebhookPayload::from(&event);
+            let body = match serde_json::to_vec(&payload) {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!(err = %e, "Failed to serialize webhook payload");
+                    continue;
+                }
+            };
+
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(reqwest::header::CONTENT_TYPE, "application/json".parse().unwrap());
+            if let Ok(v) = event.event_name.parse() {
+                headers.insert("x-scopenode-event", v);
+            }
+            if let Ok(v) = event_addr.parse() {
+                headers.insert("x-scopenode-contract", v);
+            }
+            if let Some(secret) = &contract.webhook_secret {
+                let sig = sign_body(secret, &body);
+                if let Ok(v) = sig.parse() {
+                    headers.insert("x-scopenode-signature", v);
+                }
+            }
+
+            let client = self.client.clone();
+            tokio::spawn(async move {
+                deliver_with_retry(&client, &url, body, headers).await;
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,6 +375,154 @@ mod tests {
                 "application/json".parse().unwrap(),
             );
             deliver_with_retry(&client(), &url, b"{}".to_vec(), headers).await;
+        }
+    }
+
+    mod dispatcher {
+        use super::super::*;
+        use crate::config::{Config, ContractConfig, NodeConfig};
+        use crate::types::StoredEvent;
+        use alloy_primitives::{Address, Bytes, B256};
+        use serde_json::json;
+        use tokio::sync::broadcast;
+        use wiremock::{matchers::{header_regex, method, path}, Mock, MockServer, ResponseTemplate};
+
+        fn make_event(contract: Address) -> StoredEvent {
+            StoredEvent {
+                contract,
+                event_name:   "Swap".to_string(),
+                topic0:       B256::ZERO,
+                block_number: 100,
+                block_hash:   B256::ZERO,
+                tx_hash:      B256::ZERO,
+                tx_index:     0,
+                log_index:    0,
+                raw_topics:   vec![],
+                raw_data:     Bytes::default(),
+                decoded:      json!({}),
+                source:       "devp2p".to_string(),
+                timestamp:    1_700_000_000,
+            }
+        }
+
+        fn config_with_webhook(address: Address, webhook_url: &str) -> Config {
+            Config {
+                node: NodeConfig {
+                    port: 18545,
+                    data_dir: None,
+                    consensus_rpc: vec![],
+                    reorg_buffer: 64,
+                },
+                contracts: vec![ContractConfig {
+                    name: None,
+                    address,
+                    events: vec!["Swap".into()],
+                    from_block: 0,
+                    to_block: None,
+                    abi_override: None,
+                    impl_address: None,
+                    webhook: Some(webhook_url.parse().unwrap()),
+                    webhook_secret: None,
+                    webhook_events: std::collections::HashMap::new(),
+                }],
+            }
+        }
+
+        #[tokio::test]
+        async fn event_matching_contract_triggers_post() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/hook"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let address: Address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".parse().unwrap();
+            let url = format!("{}/hook", server.uri());
+            let config = config_with_webhook(address, &url);
+
+            let (tx, rx) = broadcast::channel(16);
+            let dispatcher = WebhookDispatcher::new(config, rx);
+            let handle = tokio::spawn(dispatcher.run());
+
+            tx.send(make_event(address)).unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            drop(tx);
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
+            // wiremock asserts call count on drop
+        }
+
+        #[tokio::test]
+        async fn event_for_different_contract_sends_no_post() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+                .mount(&server)
+                .await;
+
+            let configured: Address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".parse().unwrap();
+            let other:      Address = "0xdAC17F958D2ee523a2206206994597C13D831ec7".parse().unwrap();
+            let url = format!("{}/hook", server.uri());
+            let config = config_with_webhook(configured, &url);
+
+            let (tx, rx) = broadcast::channel(16);
+            let dispatcher = WebhookDispatcher::new(config, rx);
+            let handle = tokio::spawn(dispatcher.run());
+
+            tx.send(make_event(other)).unwrap(); // wrong contract
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            drop(tx);
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
+        }
+
+        #[tokio::test]
+        async fn dispatcher_exits_cleanly_when_channel_closes() {
+            let config = Config {
+                node: NodeConfig {
+                    port: 18545,
+                    data_dir: None,
+                    consensus_rpc: vec![],
+                    reorg_buffer: 64,
+                },
+                contracts: vec![],
+            };
+            let (tx, rx) = broadcast::channel::<StoredEvent>(16);
+            let dispatcher = WebhookDispatcher::new(config, rx);
+            drop(tx); // close immediately
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                dispatcher.run(),
+            )
+            .await
+            .expect("dispatcher must exit when channel closes, not hang");
+        }
+
+        #[tokio::test]
+        async fn signature_header_present_when_secret_set() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/hook"))
+                .and(header_regex("x-scopenode-signature", r"^sha256=[0-9a-f]{64}$"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let address: Address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".parse().unwrap();
+            let url = format!("{}/hook", server.uri());
+            let mut config = config_with_webhook(address, &url);
+            config.contracts[0].webhook_secret = Some("secret123".to_string());
+
+            let (tx, rx) = broadcast::channel(16);
+            let dispatcher = WebhookDispatcher::new(config, rx);
+            let handle = tokio::spawn(dispatcher.run());
+
+            tx.send(make_event(address)).unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            drop(tx);
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
         }
     }
 
