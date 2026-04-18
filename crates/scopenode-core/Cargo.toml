@@ -18,6 +18,8 @@ reqwest           = { workspace = true }
 async-trait       = { workspace = true }
 indicatif         = { workspace = true }
 url               = { workspace = true }
+hmac              = { workspace = true }
+sha2              = { workspace = true }
 scopenode-storage = { workspace = true }
 # devp2p
 reth-network             = { workspace = true }
@@ -29,3 +31,7 @@ reth-storage-api         = { workspace = true }
 reth-ethereum-primitives = { workspace = true }
 reth-ethereum-forks      = { workspace = true }
 tokio-stream             = { workspace = true }
+
+[dev-dependencies]
+wiremock = "0.6"
+tokio    = { workspace = true }
