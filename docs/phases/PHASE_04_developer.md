@@ -64,6 +64,62 @@ Interactive wizard:
 Validates the resulting config with the same logic as `scopenode validate`
 before writing.
 
+### `eth_subscribe` over WebSocket
+
+scopenode already has a broadcast channel for live events (Phase 3). Exposing
+it as a standard Ethereum WebSocket subscription makes scopenode a drop-in for
+Viem/ethers.js `watchContractEvent` — no client changes needed.
+
+```bash
+wscat -c ws://localhost:8545
+→ {"jsonrpc":"2.0","id":1,"method":"eth_subscribe","params":["logs",{"address":"0x8ad...","topics":["0xc42...swap topic0"]}]}
+← {"jsonrpc":"2.0","method":"eth_subscription","params":{"subscription":"0x1","result":{...log...}}}
+```
+
+`jsonrpsee` has built-in WebSocket support — this is mostly wiring the
+broadcast receiver into a subscription response stream.
+
+Supported subscription types:
+- `"logs"` with optional `address` + `topics` filter (mirrors `eth_getLogs` params)
+- `"newHeads"` — emit each new block header as scopenode indexes it
+
+`eth_unsubscribe` cancels the subscription. Disconnecting a WebSocket client
+drops the receiver automatically (broadcast channel semantics).
+
+### SQL-derived views
+
+Users define named SQLite views in the config. scopenode materialises them at
+startup and re-runs the view query on every write. Views are exposed
+automatically at `GET /views/<name>`.
+
+```toml
+[[contracts.views]]
+name = "swap_volume_daily"
+sql  = """
+  SELECT date(e.timestamp, 'unixepoch')           AS day,
+         SUM(json_extract(e.decoded, '$.amount0')) AS volume_token0,
+         COUNT(*)                                  AS swap_count
+  FROM events e
+  WHERE e.contract = '0x8ad599c3A0ff1De082011EFDDc58f1908eb6e6D8'
+    AND e.event_name = 'Swap'
+    AND e.reorged = 0
+  GROUP BY day
+"""
+```
+
+```bash
+curl http://localhost:8546/views/swap_volume_daily
+# → [{"day":"2024-01-15","volume_token0":"-12345678","swap_count":42}, ...]
+```
+
+Views are read-only SQLite views — scopenode runs `CREATE VIEW IF NOT EXISTS`
+at startup and queries them on demand. No new tables, no materialization
+overhead, no reorg complexity (views always read live `reorged = 0` rows).
+
+Validation at startup: each view SQL is parsed with `EXPLAIN QUERY PLAN` — a
+syntax error or missing column fails fast with a clear message, not a 500 at
+query time.
+
 ### `--topic0` filter on `scopenode query`
 
 ```bash
@@ -119,7 +175,13 @@ load into memory.
 - [ ] `GET /events?topic0=0x...` returns correct results; unknown topic0 returns empty list (not error)
 - [ ] `pip install scopenode` succeeds; `scopenode.query(...)` returns a `pandas.DataFrame`
 - [ ] DataFrame column names match ABI parameter names; U256 columns are `object` dtype (string)
-- [ ] Unit tests: webhook retry/backoff, SSE fan-out, export format correctness, topic0 filter
+- [ ] `eth_subscribe logs` delivers live events to a WebSocket client within 1s of indexing
+- [ ] `eth_subscribe newHeads` emits each new block header as it's indexed
+- [ ] `eth_unsubscribe` cancels a subscription; client disconnect auto-cleans the receiver
+- [ ] `GET /views/<name>` returns correct JSON for a user-defined SQL view
+- [ ] Invalid view SQL caught at startup with a clear error, not a 500 at query time
+- [ ] View results respect `reorged = 0` (reorged events excluded automatically via SQL)
+- [ ] Unit tests: webhook retry/backoff, SSE fan-out, export format correctness, topic0 filter, WebSocket subscription lifecycle, view validation
 
 ## New dependencies
 
@@ -130,4 +192,7 @@ async-stream = "0.3"
 dialoguer    = "0.11"
 parquet      = "51"
 pyo3         = { version = "0.21", features = ["extension-module"] }
+# eth_subscribe WebSocket — jsonrpsee already in workspace, just enable ws feature
+jsonrpsee    = { version = "0.26", features = ["server", "macros", "ws"] }
+# SQL views — sqlx already in workspace, no new dep needed
 ```
