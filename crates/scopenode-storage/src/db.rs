@@ -831,6 +831,60 @@ impl Db {
             .map_err(|e| DbError::Query(e.to_string()))
     }
 
+    /// Stream events with optional filters, row by row.
+    ///
+    /// Identical filter semantics to [`query_events_for_filter`] but returns a
+    /// lazy [`futures_core::Stream`] instead of a fully-buffered `Vec`. The
+    /// stream yields one [`StoredEvent`] per row without buffering the entire
+    /// result set, making it suitable for large exports.
+    ///
+    /// No `limit` or `offset` — the stream always covers the full matching set.
+    ///
+    /// - `contract` — EIP-55 checksummed address
+    /// - `event_name` — human-readable event name (e.g. `"Swap"`)
+    /// - `topic0` — raw keccak256 event selector hash (0x-prefixed hex)
+    /// - `from_block` / `to_block` — inclusive block range (defaults to full range)
+    pub fn stream_events_for_filter<'a>(
+        &'a self,
+        contract: Option<&'a str>,
+        event_name: Option<&'a str>,
+        topic0: Option<&'a str>,
+        from_block: Option<u64>,
+        to_block: Option<u64>,
+    ) -> impl futures_core::Stream<Item = Result<StoredEvent, DbError>> + 'a {
+        let from = from_block.unwrap_or(0) as i64;
+        let to = to_block.map(|b| b as i64).unwrap_or(i64::MAX);
+
+        // Build WHERE clauses dynamically — only include filters that are Some.
+        let mut conditions = vec!["reorged = 0"];
+        if contract.is_some()   { conditions.push("contract = ?"); }
+        if event_name.is_some() { conditions.push("event_name = ?"); }
+        if topic0.is_some()     { conditions.push("topic0 = ?"); }
+        conditions.extend(["block_number >= ?", "block_number <= ?"]);
+
+        let sql = format!(
+            "SELECT contract, event_name, topic0, block_number, block_hash, \
+             tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source \
+             FROM events WHERE {} \
+             ORDER BY block_number ASC, log_index ASC",
+            conditions.join(" AND ")
+        );
+
+        // Leak the SQL string to produce a `'static` reference so the stream
+        // returned by `fetch` does not borrow a local variable. Each call
+        // leaks only a few hundred bytes — acceptable for a batch API.
+        let sql: &'static str = Box::leak(sql.into_boxed_str());
+        let mut q = sqlx::query_as::<_, StoredEvent>(sql);
+        if let Some(c) = contract   { q = q.bind(c); }
+        if let Some(e) = event_name { q = q.bind(e); }
+        if let Some(t) = topic0     { q = q.bind(t); }
+        q = q.bind(from).bind(to);
+
+        // sqlx::fetch returns a BoxStream (Pin<Box<dyn Stream<Item = sqlx::Result<T>>>>) —
+        // wrap it to convert sqlx::Error -> DbError without buffering.
+        sqlx_stream_to_db_stream(q.fetch(&self.pool))
+    }
+
     /// Count all non-reorged events across all contracts.
     ///
     /// Used by the REST `/status` endpoint.
@@ -895,6 +949,36 @@ pub struct HeaderRow {
     pub gas_used: i64,
     /// EIP-1559 base fee (NULL for pre-London blocks).
     pub base_fee: Option<i64>,
+}
+
+// ─── Stream adapter ──────────────────────────────────────────────────────────
+
+/// Wraps a boxed sqlx stream to convert `sqlx::Error` items into [`DbError`].
+///
+/// `sqlx::fetch()` returns a `Pin<Box<dyn Stream<Item = sqlx::Result<T>>>>`.
+/// Since the box is already heap-allocated, the inner stream never moves, so
+/// we can project through the `Pin` safely to poll it.
+struct DbStream<'a, T> {
+    inner: futures_core::stream::BoxStream<'a, Result<T, sqlx::Error>>,
+}
+
+impl<T> futures_core::Stream for DbStream<'_, T> {
+    type Item = Result<T, DbError>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.inner.as_mut().poll_next(cx).map(|opt| {
+            opt.map(|r| r.map_err(|e| DbError::Query(e.to_string())))
+        })
+    }
+}
+
+fn sqlx_stream_to_db_stream<'a, T>(
+    stream: futures_core::stream::BoxStream<'a, Result<T, sqlx::Error>>,
+) -> DbStream<'a, T> {
+    DbStream { inner: stream }
 }
 
 // ─── Dynamic query builder helpers ─────────────────────────────────────────
@@ -1013,6 +1097,101 @@ mod tests {
             .unwrap();
 
         assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].block_hash, canonical_hash);
+    }
+
+    /// Helper: collect all items from a `Stream<Item = Result<T, E>>` into a `Vec<T>`,
+    /// propagating the first error.
+    async fn collect_stream<T, E>(
+        stream: impl futures_core::Stream<Item = Result<T, E>>,
+    ) -> Result<Vec<T>, E> {
+        use futures_util::StreamExt;
+        stream.collect::<Vec<_>>().await
+            .into_iter()
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn stream_events_for_filter_returns_all_rows_ordered() {
+        let (db, _guard) = open_test_db().await;
+
+        let contract = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
+        let hash_a = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let hash_b = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let hash_c = "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+        // Insert 3 events at different block numbers (out of order to verify ordering).
+        let e3 = make_event(contract, 300, hash_c, "0xcccc", 0);
+        let e1 = make_event(contract, 100, hash_a, "0xaaaa", 0);
+        let e2 = make_event(contract, 200, hash_b, "0xbbbb", 0);
+        db.insert_events(&[e3, e1, e2]).await.unwrap();
+
+        let stream = db.stream_events_for_filter(None, None, None, None, None);
+        let rows = collect_stream(stream).await.unwrap();
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].block_number, 100, "first row should be block 100");
+        assert_eq!(rows[1].block_number, 200, "second row should be block 200");
+        assert_eq!(rows[2].block_number, 300, "third row should be block 300");
+    }
+
+    #[tokio::test]
+    async fn stream_events_for_filter_with_contract_filter() {
+        let (db, _guard) = open_test_db().await;
+
+        let contract_a = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
+        let contract_b = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2";
+        let hash_a = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let hash_b = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        // One event per contract.
+        let ea = make_event(contract_a, 100, hash_a, "0xaaaa", 0);
+        let eb = make_event(contract_b, 101, hash_b, "0xbbbb", 0);
+        db.insert_events(&[ea, eb]).await.unwrap();
+
+        let stream = db.stream_events_for_filter(Some(contract_a), None, None, None, None);
+        let rows = collect_stream(stream).await.unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].contract, contract_a);
+    }
+
+    #[tokio::test]
+    async fn stream_events_for_filter_empty_result() {
+        let (db, _guard) = open_test_db().await;
+
+        // No events inserted — stream should yield zero rows without panicking.
+        let stream = db.stream_events_for_filter(
+            Some("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+            None,
+            None,
+            None,
+            None,
+        );
+        let rows = collect_stream(stream).await.unwrap();
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn stream_events_for_filter_excludes_reorged() {
+        let (db, _guard) = open_test_db().await;
+
+        let contract = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
+        let canonical_hash = "0x1111111111111111111111111111111111111111111111111111111111111111";
+        let orphan_hash    = "0x2222222222222222222222222222222222222222222222222222222222222222";
+
+        let canonical = make_event(contract, 100, canonical_hash, "0xaaaa", 0);
+        let orphaned  = make_event(contract, 101, orphan_hash,   "0xbbbb", 0);
+        db.insert_events(&[canonical, orphaned]).await.unwrap();
+
+        // Mark the second event as reorged.
+        let hash: B256 = orphan_hash.parse().unwrap();
+        db.mark_reorged_by_hash(&[hash]).await.unwrap();
+
+        let stream = db.stream_events_for_filter(None, None, None, None, None);
+        let rows = collect_stream(stream).await.unwrap();
+
+        assert_eq!(rows.len(), 1, "reorged event must be excluded");
         assert_eq!(rows[0].block_hash, canonical_hash);
     }
 }
