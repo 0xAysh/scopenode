@@ -48,8 +48,8 @@ When `to_block` is absent from config: historical sync runs, then live sync
 starts automatically. Each new Helios-verified header goes through the same
 bloom → receipt fetch → MPT verify → decode → store pipeline as historical.
 
-A `broadcast` channel fans live events to all consumers (REST SSE, webhooks
-in Phase 4).
+A `broadcast` channel fans live events to all consumers (REST SSE and
+`eth_subscribe` WebSocket in Phase 4).
 
 ### Block range shorthand
 
