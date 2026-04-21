@@ -81,11 +81,15 @@ None needed — all patterns exist in the codebase.
 
 ## Implementation Units
 
+<<<<<<< HEAD
 <<<<<<< Updated upstream
 - [ ] **Unit 1: Remove webhook system from Rust code and Cargo**
 =======
 - [x] **Unit 1: Remove webhook system from Rust code and Cargo**
 >>>>>>> Stashed changes
+=======
+- [ ] **Unit 1: Remove webhook system from Rust code and Cargo**
+>>>>>>> refactor/scope-refinement
 
   **Goal:** Delete all webhook code and its exclusive dependencies so the project compiles cleanly without webhooks.
 
@@ -124,11 +128,15 @@ None needed — all patterns exist in the codebase.
 
 ---
 
+<<<<<<< HEAD
 <<<<<<< Updated upstream
 - [ ] **Unit 2: Add streaming query method to storage layer**
 =======
 - [x] **Unit 2: Add streaming query method to storage layer**
 >>>>>>> Stashed changes
+=======
+- [ ] **Unit 2: Add streaming query method to storage layer**
+>>>>>>> refactor/scope-refinement
 
   **Goal:** Give the export command a row-by-row DB cursor so it can write events to stdout without loading the entire result set into memory.
 
@@ -164,11 +172,15 @@ None needed — all patterns exist in the codebase.
 
 ---
 
+<<<<<<< HEAD
 <<<<<<< Updated upstream
 - [ ] **Unit 3: Add `scopenode export` CLI command**
 =======
 - [x] **Unit 3: Add `scopenode export` CLI command**
 >>>>>>> Stashed changes
+=======
+- [ ] **Unit 3: Add `scopenode export` CLI command**
+>>>>>>> refactor/scope-refinement
 
   **Goal:** A new `scopenode export` subcommand that streams all matching events to stdout as CSV or JSON, with no row cap.
 
@@ -212,11 +224,15 @@ None needed — all patterns exist in the codebase.
 
 ---
 
+<<<<<<< HEAD
 <<<<<<< Updated upstream
 - [ ] **Unit 4: Prune phase docs, VISION.md, README.md, and config.example.toml**
 =======
 - [x] **Unit 4: Prune phase docs, VISION.md, README.md, and config.example.toml**
 >>>>>>> Stashed changes
+=======
+- [ ] **Unit 4: Prune phase docs, VISION.md, README.md, and config.example.toml**
+>>>>>>> refactor/scope-refinement
 
   **Goal:** Remove all references to cut features from every documentation file so the docs accurately reflect the planned and actual scope.
 

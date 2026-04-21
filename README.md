@@ -290,8 +290,7 @@ Database: `~/.scopenode/scopenode.db` (SQLite, WAL mode).
 - [ ] Reorg detection and handling
 - [ ] REST API at `:8546`
 - [ ] Server-Sent Events (SSE) for live streaming
-- [ ] Webhooks
-- [ ] CSV/JSON/Parquet export
+- [ ] CSV/JSON export
 
 ---
 

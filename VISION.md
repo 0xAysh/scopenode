@@ -77,9 +77,6 @@ from = "17000000"
 to = "17555000"
 ```
 
-Alternatively, use `scopenode init` — an interactive wizard that asks
-questions and generates the config for you.
-
 ### Step 1 — Header Sync
 
 Download block headers for the requested range from the Ethereum P2P network.
@@ -235,32 +232,21 @@ Install is a single command:
 cargo install scopenode
 ```
 
-Then either write a `config.toml` directly, or use the init wizard:
+Write a `config.toml` describing the contracts and events you want, then run:
 ```bash
-# interactive wizard — asks questions, generates config.toml
-scopenode init
+scopenode sync config.toml
 ```
-
-`scopenode init` walks through:
-- Contract address (validates format)
-- Auto-detects if it's a proxy, shows the implementation
-- Fetches ABI from Sourcify, lists available events, lets you pick
-- Block range (with human labels: "last 30 days", "all time", or specific blocks)
-- Writes `config.toml` and asks "start syncing now? [Y/n]"
-
-Zero config writing by hand required for the common case.
 
 ---
 
 ### CLI commands
 
 ```bash
-scopenode init                         # interactive wizard → writes config.toml
 scopenode sync config.toml             # start sync (resumes if interrupted)
 scopenode sync config.toml --dry-run   # bloom scan only, no receipt fetch
 scopenode status                       # what's indexed, sync progress, peer count
 scopenode query [options]              # query local data from terminal
-scopenode export [options]             # export data to csv/json/parquet
+scopenode export [options]             # export data to csv/json
 scopenode validate config.toml        # check config before committing to a sync
 scopenode abi 0x8ad599c3...            # show available events for a contract
 scopenode retry                        # retry blocks that failed receipt fetch
@@ -344,7 +330,6 @@ scopenode query --contract 0x8ad... --event Swap --where "amount0 > 1000000"
 # output formats
 scopenode query --contract 0x8ad... --event Swap --output json
 scopenode query --contract 0x8ad... --event Swap --output csv > swaps.csv
-scopenode query --contract 0x8ad... --event Swap --output parquet > swaps.parquet
 ```
 
 Terminal table output:
@@ -357,8 +342,8 @@ block     tx_hash    sender      amount0      amount1      sqrtPrice...
 Showing 20 of 12,439 results
 ```
 
-CSV and Parquet output makes this immediately useful for data science / analytics
-workflows (pandas, dbt, DuckDB, etc.) without any code.
+CSV and JSON output makes this immediately useful for data science / analytics
+workflows (pandas, dbt, etc.) without any code.
 
 ---
 
@@ -390,34 +375,6 @@ source.onmessage = (e) => console.log(JSON.parse(e.data))
 
 This makes scopenode usable from any language (Python, Go, shell scripts) without
 an Ethereum library.
-
----
-
-### Webhook support for live events
-
-```toml
-[node]
-port = 8545
-rest_port = 8546
-
-[[contracts]]
-address = "0x8ad..."
-events = ["Swap"]
-webhook = "http://localhost:3000/api/events"  # POST for each new event
-```
-
-When a new verified Swap event arrives during live sync, scopenode POSTs:
-```json
-{
-  "contract": "0x8ad599c3...",
-  "event": "Swap",
-  "block": 19000042,
-  "tx_hash": "0xabc...",
-  "data": { "sender": "0x123...", "amount0": -1000000, "amount1": 500000 }
-}
-```
-
-Real-time apps don't need to poll. Backend just receives events.
 
 ---
 
@@ -563,9 +520,8 @@ Phase 3a — Reliability (production-grade core):
 
 Phase 3b — Developer surface area (additive features):
 25. REST API at `:8546` — `GET /events`, `GET /status`, `GET /stream/events` (SSE).
-26. Webhook support — POST new events to a URL during live sync.
-27. `scopenode init` — interactive wizard, generates config.toml.
-28. `scopenode export` — CSV/JSON/Parquet output.
+26. `eth_subscribe` WebSocket — live event subscriptions for Viem/ethers.js.
+27. `scopenode export` — CSV/JSON output.
 
 ---
 

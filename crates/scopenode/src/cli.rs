@@ -91,4 +91,25 @@ pub enum Command {
     },
     /// Check node health: peers, beacon head, DB integrity, retry queue
     Doctor,
+    /// Export all matching events to stdout as CSV or JSON (no row cap)
+    Export {
+        /// Filter by contract address
+        #[arg(long)]
+        contract: Option<String>,
+        /// Filter by event name (e.g. "Swap")
+        #[arg(long)]
+        event: Option<String>,
+        /// Filter by raw keccak256 topic0 hash (0x-prefixed hex)
+        #[arg(long)]
+        topic0: Option<String>,
+        /// Only export events at or after this block number
+        #[arg(long)]
+        from_block: Option<u64>,
+        /// Only export events at or before this block number
+        #[arg(long)]
+        to_block: Option<u64>,
+        /// Output format: csv (default) or json
+        #[arg(long, default_value = "csv")]
+        format: String,
+    },
 }

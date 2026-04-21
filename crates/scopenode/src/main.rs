@@ -142,6 +142,34 @@ async fn main() -> Result<()> {
                 .context("Failed to open database")?;
             commands::doctor::run(db).await?;
         }
+
+        Command::Export {
+            contract,
+            event,
+            topic0,
+            from_block,
+            to_block,
+            format,
+        } => {
+            let data_dir = resolve_data_dir_no_config(&cli.data_dir);
+            std::fs::create_dir_all(&data_dir)
+                .with_context(|| format!("Failed to create data dir: {}", data_dir.display()))?;
+
+            let db = Db::open(data_dir.join("scopenode.db"))
+                .await
+                .context("Failed to open database")?;
+
+            commands::export::run(
+                db,
+                contract.clone(),
+                event.clone(),
+                topic0.clone(),
+                *from_block,
+                *to_block,
+                format.clone(),
+            )
+            .await?;
+        }
     }
 
     Ok(())

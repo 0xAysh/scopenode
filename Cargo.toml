@@ -27,8 +27,6 @@ indicatif         = "0.18"
 async-trait       = "0.1"
 dirs              = "6"
 url               = { version = "2", features = ["serde"] }
-hmac              = "0.12"
-sha2              = "0.10"
 jsonrpsee         = { version = "0.26", features = ["server", "macros"] }
 # devp2p stack — reth provides production-grade Ethereum P2P networking
 # Use git ref because crates.io publishes all reth crates at 0.0.0 (internal workspace versions)
