@@ -1,5 +1,6 @@
 pub mod abi;
 pub mod doctor;
+pub mod export;
 pub mod query;
 pub mod restore;
 pub mod retry;
