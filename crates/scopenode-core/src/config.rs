@@ -23,7 +23,6 @@
 use crate::error::ConfigError;
 use alloy_primitives::Address;
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 use url::Url;
@@ -112,23 +111,6 @@ pub struct ContractConfig {
     /// Implementation address for proxy contracts (EIP-1967 or any proxy pattern).
     pub impl_address: Option<Address>,
 
-    /// HTTP endpoint to POST all live events from this contract.
-    ///
-    /// Receives every event that has no per-event override in `webhook_events`.
-    pub webhook: Option<Url>,
-
-    /// HMAC-SHA256 secret for signing webhook payloads.
-    ///
-    /// When set, every POST includes an `X-Scopenode-Signature: sha256=<hex>` header.
-    /// Compute the expected signature as `HMAC-SHA256(key=secret, msg=request_body_bytes)`.
-    pub webhook_secret: Option<String>,
-
-    /// Per-event webhook URL overrides. Key is the event name (e.g. `"Swap"`).
-    ///
-    /// When a matching entry exists, that URL receives the event instead of `webhook`.
-    /// Falls through to `webhook` for events not in this map.
-    #[serde(default)]
-    pub webhook_events: HashMap<String, Url>,
 }
 
 impl Config {
@@ -154,15 +136,6 @@ impl Config {
             }
             if c.events.is_empty() {
                 return Err(ConfigError::NoEvents(c.address));
-            }
-            for event_name in c.webhook_events.keys() {
-                if !c.events.contains(event_name) {
-                    tracing::warn!(
-                        contract = %c.address,
-                        event = event_name,
-                        "webhook_events entry for unknown event name — possible typo"
-                    );
-                }
             }
         }
         Ok(())
@@ -408,43 +381,4 @@ mod tests {
         assert_eq!(cfg.node.reorg_buffer, 32);
     }
 
-    #[test]
-    fn toml_webhook_fields_parse() {
-        let toml = r#"
-            [node]
-            [[contracts]]
-            address        = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
-            events         = ["Transfer"]
-            from_block     = 1
-            webhook        = "https://example.com/hooks/all"
-            webhook_secret = "my-secret"
-            [contracts.webhook_events]
-            Transfer = "https://example.com/hooks/transfer"
-        "#;
-        let cfg: Config = toml::from_str(toml).unwrap();
-        assert_eq!(
-            cfg.contracts[0].webhook.as_ref().unwrap().as_str(),
-            "https://example.com/hooks/all"
-        );
-        assert_eq!(cfg.contracts[0].webhook_secret.as_deref(), Some("my-secret"));
-        assert_eq!(
-            cfg.contracts[0].webhook_events["Transfer"].as_str(),
-            "https://example.com/hooks/transfer"
-        );
-    }
-
-    #[test]
-    fn toml_webhook_absent_is_none() {
-        let toml = r#"
-            [node]
-            [[contracts]]
-            address    = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
-            events     = ["Transfer"]
-            from_block = 1
-        "#;
-        let cfg: Config = toml::from_str(toml).unwrap();
-        assert!(cfg.contracts[0].webhook.is_none());
-        assert!(cfg.contracts[0].webhook_secret.is_none());
-        assert!(cfg.contracts[0].webhook_events.is_empty());
-    }
 }

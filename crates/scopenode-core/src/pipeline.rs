@@ -86,7 +86,7 @@ impl<N: EthNetwork + 'static> Pipeline<N> {
         for contract in self.config.contracts.clone() {
             let addr_str = contract.address.to_checksum(None);
             // run_retry doesn't have timestamps (not stored in pending_retry table);
-            // use 0 as a sentinel — retry blocks are re-fetched for correctness, not webhooks.
+            // use 0 as a sentinel — timestamps are not needed for retry correctness.
             let blocks: Vec<(u64, B256, B256, u64)> = candidates
                 .iter()
                 .filter(|(_, _, _, c)| *c == addr_str)
@@ -609,9 +609,6 @@ mod tests {
                 to_block: Some(to),
                 abi_override: None,
                 impl_address: None,
-                webhook: None,
-                webhook_secret: None,
-                webhook_events: std::collections::HashMap::new(),
             }],
         }
     }
