@@ -162,11 +162,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_format_is_rejected() {
-        // The error path for unknown format is tested via the match arm;
-        // the actual anyhow::bail! cannot be tested in a unit test without
-        // running the full async fn. Verify the csv/json arms compile correctly
-        // by checking the CSV_HEADER constant is well-formed.
+    fn csv_header_has_all_twelve_fields() {
         assert!(CSV_HEADER.starts_with("contract,"));
         assert!(CSV_HEADER.ends_with(",source"));
         assert_eq!(CSV_HEADER.split(',').count(), 12);
