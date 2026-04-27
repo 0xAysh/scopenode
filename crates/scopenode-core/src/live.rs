@@ -2,15 +2,18 @@
 //!
 //! [`LiveSyncer`] polls for new block headers every 6 seconds (half a slot).
 //! For each new block it:
-//! 1. Stores the header (needed to seed [`ReorgDetector`] across restarts)
-//! 2. Runs the reorg detector — orphaned events are soft-deleted in SQLite
-//! 3. Bloom-scans against every configured live contract
-//! 4. For bloom hits: fetches receipts, Merkle-verifies, ABI-decodes, stores,
+//! 1. Verifies the block header against the Helios beacon light client (when
+//!    `consensus_rpc` is configured), then:
+//! 2. Stores the header (needed to seed [`ReorgDetector`] across restarts)
+//! 3. Runs the reorg detector — orphaned events are soft-deleted in SQLite
+//! 4. Bloom-scans against every configured live contract
+//! 5. For bloom hits: fetches receipts, Merkle-verifies, ABI-decodes, stores,
 //!    and broadcasts each event on the [`tokio::sync::broadcast`] channel
 //!
 //! "Live contracts" are those with `to_block = None` in the config. Fixed-range
 //! contracts are ignored here — they were fully handled by the historical pipeline.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,14 +22,16 @@ use tokio::sync::broadcast;
 use tracing::{info, warn};
 
 use crate::abi::{AbiCache, EventAbi, EventDecoder};
+use crate::beacon::BeaconStatusTx;
 use crate::config::{Config, ContractConfig};
 use crate::error::CoreError;
 use crate::headers::BloomScanner;
+use crate::helios_client::{HeliosGuard, VerifyDecision};
 use crate::network::{EthNetwork, ReceiptFetchResult};
 use crate::pipeline::{core_to_storage_event, scope_header_to_stored};
 use crate::receipts::verify_receipts;
 use crate::reorg::ReorgDetector;
-use crate::types::{BloomTarget, StoredEvent};
+use crate::types::{BloomTarget, ScopeHeader, StoredEvent};
 use scopenode_storage::Db;
 
 /// Continuous live-sync loop for contracts with `to_block = None`.
@@ -40,6 +45,8 @@ pub struct LiveSyncer<N: EthNetwork> {
     abi_cache: AbiCache,
     broadcast: broadcast::Sender<StoredEvent>,
     reorg_detector: ReorgDetector,
+    beacon_status_tx: BeaconStatusTx,
+    data_dir: Option<PathBuf>,
 }
 
 impl<N: EthNetwork + 'static> LiveSyncer<N> {
@@ -48,6 +55,8 @@ impl<N: EthNetwork + 'static> LiveSyncer<N> {
         network: Arc<N>,
         db: Db,
         broadcast: broadcast::Sender<StoredEvent>,
+        beacon_status_tx: BeaconStatusTx,
+        data_dir: Option<PathBuf>,
     ) -> Self {
         let capacity = config.node.reorg_buffer as usize;
         let abi_cache = AbiCache::new(db.clone());
@@ -58,14 +67,17 @@ impl<N: EthNetwork + 'static> LiveSyncer<N> {
             abi_cache,
             broadcast,
             reorg_detector: ReorgDetector::new(capacity),
+            beacon_status_tx,
+            data_dir,
         }
     }
 
     /// Seed the reorg detector from stored headers, then poll for new blocks.
     ///
     /// Processes all live contracts (those with `to_block = None`) for every
-    /// new block. Errors on individual blocks are logged and skipped — the loop
-    /// continues to the next block rather than aborting.
+    /// new block. In verified mode, each block header is checked against
+    /// Helios before processing. Errors on individual blocks are logged and
+    /// skipped — the loop continues to the next block rather than aborting.
     pub async fn run(mut self) -> Result<(), CoreError> {
         // Preload ABIs and build bloom targets once.
         let mut contract_data: Vec<(ContractConfig, Vec<EventAbi>, Vec<BloomTarget>)> = Vec::new();
@@ -105,7 +117,36 @@ impl<N: EthNetwork + 'static> LiveSyncer<N> {
 
         info!(tip, contracts = contract_data.len(), "Live sync started");
 
+        // R4 unverified warning.
+        if self.config.node.consensus_rpc.is_empty() && !self.config.node.beacon_unverified_ack {
+            warn!(
+                "no consensus_rpc configured — live headers will be trusted from peers, \
+                 not beacon-verified.\n\n      \
+                 To enable trustless verification, add to config.toml:\n        \
+                 consensus_rpc = [\"https://www.lightclientdata.org\"]\n        \
+                 execution_rpc = \"https://<your-rpc-provider>\"\n\n      \
+                 To acknowledge unverified mode and suppress this message:\n        \
+                 beacon_unverified_ack = true"
+            );
+        }
+
+        // Bootstrap the Helios beacon client (returns None in unverified mode).
+        let reqwest_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap_or_default();
+
+        let mut helios: Option<HeliosGuard> = HeliosGuard::start(
+            &self.config.node,
+            &self.beacon_status_tx,
+            self.data_dir.as_deref(),
+            &reqwest_client,
+        )
+        .await?;
+
         let mut our_tip = tip;
+        let mut unverified_block_count: u64 = 0;
+
         let mut interval = tokio::time::interval(Duration::from_secs(6));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -125,29 +166,99 @@ impl<N: EthNetwork + 'static> LiveSyncer<N> {
             }
 
             for block_num in (our_tip + 1)..=best {
-                if let Err(e) = self.process_block(block_num, &contract_data).await {
-                    warn!(block = block_num, "Live block error: {e}");
+                if let Some(ref mut guard) = helios {
+                    // Verified mode: pre-fetch header to obtain peer_hash, then
+                    // verify before processing.
+                    let headers = match self.network.get_headers(block_num, block_num).await {
+                        Ok(h) => h,
+                        Err(e) => {
+                            warn!(block = block_num, "Header fetch failed before verification: {e}");
+                            break; // retry this block on the next poll tick
+                        }
+                    };
+                    let header = match headers.into_iter().next() {
+                        Some(h) => h,
+                        None => {
+                            warn!(block = block_num, "No header returned for block");
+                            break;
+                        }
+                    };
+                    let peer_hash = header.hash;
+                    let current_status = self.beacon_status_tx.borrow().clone();
+
+                    match guard
+                        .verify_block(
+                            block_num,
+                            peer_hash,
+                            &current_status,
+                            &self.beacon_status_tx,
+                            self.data_dir.as_deref(),
+                        )
+                        .await?
+                    {
+                        VerifyDecision::Accept => {
+                            if let Err(e) =
+                                self.process_block(block_num, Some(header), &contract_data).await
+                            {
+                                warn!(block = block_num, "Live block error: {e}");
+                            }
+                            our_tip = block_num;
+                        }
+                        VerifyDecision::Discard => break, // retry this block next tick
+                        VerifyDecision::Halt => {
+                            return Err(CoreError::Internal(
+                                "helios verification halted live sync".to_string(),
+                            ));
+                        }
+                    }
+                } else {
+                    // Unverified mode: process without beacon check.
+                    if let Err(e) = self.process_block(block_num, None, &contract_data).await {
+                        warn!(block = block_num, "Live block error: {e}");
+                    }
+                    our_tip = block_num;
+
+                    unverified_block_count += 1;
+                    if unverified_block_count % 100 == 0
+                        && !self.config.node.beacon_unverified_ack
+                    {
+                        warn!(
+                            "no consensus_rpc configured — live headers still trusted from peers \
+                             (block {block_num}, {} blocks since last warning). \
+                             Set beacon_unverified_ack = true to suppress.",
+                            unverified_block_count
+                        );
+                    }
                 }
             }
-
-            our_tip = best;
         }
     }
 
     /// Fetch, verify, decode, store, and broadcast all events for one live block.
+    ///
+    /// `prefetched_header`: when `Some`, the header was already fetched for
+    /// beacon verification — reuse it to avoid a second devp2p round-trip.
     async fn process_block(
         &mut self,
         block_num: u64,
+        prefetched_header: Option<ScopeHeader>,
         contracts: &[(ContractConfig, Vec<EventAbi>, Vec<BloomTarget>)],
     ) -> Result<(), CoreError> {
-        let headers = self.network.get_headers(block_num, block_num).await?;
-        let header = headers.into_iter().next().ok_or(
-            CoreError::Network(crate::error::NetworkError::HeadersFailed(block_num, block_num))
-        )?;
+        let header = if let Some(h) = prefetched_header {
+            h
+        } else {
+            let headers = self.network.get_headers(block_num, block_num).await?;
+            headers.into_iter().next().ok_or(CoreError::Network(
+                crate::error::NetworkError::HeadersFailed(block_num, block_num),
+            ))?
+        };
 
         self.db.insert_header(&scope_header_to_stored(&header)).await?;
 
-        if let Some(reorg) = self.reorg_detector.advance(header.number, header.hash, header.parent_hash) {
+        if let Some(reorg) = self
+            .reorg_detector
+            .advance(header.number, header.hash, header.parent_hash)
+        {
             let count = self.db.mark_reorged_by_hash(&reorg.orphaned_hashes).await?;
             warn!(
                 depth = reorg.orphaned_hashes.len(),
@@ -170,9 +281,17 @@ impl<N: EthNetwork + 'static> LiveSyncer<N> {
         for result in results {
             match result {
                 ReceiptFetchResult::Ok { block_num, block_hash, receipts } => {
-                    if let Err(e) = verify_receipts(&receipts, header.receipts_root, block_num) {
+                    if let Err(e) =
+                        verify_receipts(&receipts, header.receipts_root, block_num)
+                    {
                         warn!(block = block_num, err = %e, "Live receipt verification failed");
-                        mark_retry_matching(&self.db, block_num, &header.logs_bloom, contracts).await;
+                        mark_retry_matching(
+                            &self.db,
+                            block_num,
+                            &header.logs_bloom,
+                            contracts,
+                        )
+                        .await;
                         return Ok(());
                     }
 
@@ -182,8 +301,14 @@ impl<N: EthNetwork + 'static> LiveSyncer<N> {
                         }
 
                         let decoder = EventDecoder::new(events, contract.address)?;
-                        let decoded = decoder.extract_and_decode(&receipts, block_num, block_hash, header.timestamp);
-                        let storage: Vec<_> = decoded.iter().map(core_to_storage_event).collect();
+                        let decoded = decoder.extract_and_decode(
+                            &receipts,
+                            block_num,
+                            block_hash,
+                            header.timestamp,
+                        );
+                        let storage: Vec<_> =
+                            decoded.iter().map(core_to_storage_event).collect();
 
                         if !storage.is_empty() {
                             info!(
@@ -202,7 +327,13 @@ impl<N: EthNetwork + 'static> LiveSyncer<N> {
                 }
                 ReceiptFetchResult::Failed { block_num } => {
                     warn!(block = block_num, "Live receipt fetch failed");
-                    mark_retry_matching(&self.db, block_num, &header.logs_bloom, contracts).await;
+                    mark_retry_matching(
+                        &self.db,
+                        block_num,
+                        &header.logs_bloom,
+                        contracts,
+                    )
+                    .await;
                 }
             }
         }
@@ -216,6 +347,7 @@ impl<N: EthNetwork + 'static> LiveSyncer<N> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::beacon::BeaconStatus;
     use crate::config::{Config, ContractConfig, NodeConfig};
     use crate::error::NetworkError;
     use crate::types::ScopeHeader;
@@ -224,6 +356,7 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
+    use tokio::sync::watch;
 
     // ── MockNetwork ───────────────────────────────────────────────────────────
 
@@ -291,6 +424,12 @@ mod tests {
                 data_dir: None,
                 consensus_rpc: vec![],
                 reorg_buffer: 64,
+                execution_rpc: None,
+                beacon_unverified_ack: false,
+                beacon_fallback_unverified: false,
+                allow_http_consensus_rpc: false,
+                consensus_checkpoint: None,
+                beacon_sync_timeout_secs: 300,
             },
             contracts: vec![ContractConfig {
                 name: Some("test".into()),
@@ -302,6 +441,11 @@ mod tests {
                 impl_address: None,
             }],
         }
+    }
+
+    fn dummy_beacon_tx() -> BeaconStatusTx {
+        let (tx, _rx) = watch::channel(BeaconStatus::NotConfigured);
+        Arc::new(tx)
     }
 
     fn transfer_abi_json() -> String {
@@ -368,8 +512,9 @@ mod tests {
         let headers: Vec<ScopeHeader> = (1u64..=5).map(scope_header).collect();
         let network = Arc::new(MockNetwork { headers });
         let (tx, _rx) = broadcast::channel(32);
+        let beacon_tx = dummy_beacon_tx();
 
-        let syncer = LiveSyncer::new(live_config(addr), network, db.clone(), tx);
+        let syncer = LiveSyncer::new(live_config(addr), network, db.clone(), tx, beacon_tx, None);
 
         // run() loops forever — interrupt after the first batch completes.
         let _ = tokio::time::timeout(Duration::from_secs(1), syncer.run()).await;

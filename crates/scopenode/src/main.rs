@@ -65,7 +65,7 @@ async fn main() -> Result<()> {
                 .await
                 .context("Failed to open database")?;
 
-            commands::sync::run(cfg, db, *dry_run, cli.quiet, blocks.clone()).await?;
+            commands::sync::run(cfg, db, *dry_run, cli.quiet, blocks.clone(), data_dir).await?;
         }
 
         Command::Status => {
@@ -140,7 +140,7 @@ async fn main() -> Result<()> {
             let db = Db::open(data_dir.join("scopenode.db"))
                 .await
                 .context("Failed to open database")?;
-            commands::doctor::run(db).await?;
+            commands::doctor::run(db, &data_dir).await?;
         }
 
         Command::Export {

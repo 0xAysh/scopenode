@@ -2,6 +2,55 @@
 port = 8545
 data_dir = "~/.scopenode"
 
+# ─── Beacon light client (trustless live sync) ────────────────────────────────
+#
+# consensus_rpc: one or more beacon chain consensus API endpoints.
+#   - When set, scopenode starts a Helios beacon light client and verifies each
+#     live block header against the BLS-signed canonical chain before indexing.
+#   - Multiple endpoints are checked for agreement before live sync starts;
+#     disagreement halts live sync (Byzantine fault tolerance).
+#   - Leave empty to run in unverified mode (a startup warning is shown).
+#
+# consensus_rpc = ["https://www.lightclientdata.org"]
+# consensus_rpc = [
+#     "https://www.lightclientdata.org",
+#     "https://sync-mainnet.beaconcha.in",
+# ]
+
+# execution_rpc: required when consensus_rpc is non-empty.
+#   - Used by Helios for bootstrap block lookups only (not for indexing).
+#   - Any public Ethereum execution-layer RPC works.
+#
+# execution_rpc = "https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY"
+
+# consensus_checkpoint: hex-encoded finalized beacon block hash to anchor the
+#   BLS trust chain. Leave unset to use the release default (updated each release).
+#   Must be a 0x-prefixed 32-byte hex string from eth_getBlockByNumber("finalized").
+#
+# consensus_checkpoint = "0xabc123..."
+
+# beacon_sync_timeout_secs: seconds to wait for Helios bootstrap before halting.
+#   Default: 300. Recommended minimum: 120.
+#
+# beacon_sync_timeout_secs = 300
+
+# beacon_fallback_unverified: when true, fall back to unverified mode if Helios
+#   does not sync within beacon_sync_timeout_secs instead of halting.
+#   Not recommended — use only for debugging or unstable consensus endpoints.
+#
+# beacon_fallback_unverified = false
+
+# beacon_unverified_ack: suppress the startup warning shown when consensus_rpc
+#   is empty. Set this only after explicitly accepting unverified live sync.
+#
+# beacon_unverified_ack = false
+
+# allow_http_consensus_rpc: allow http:// URLs for consensus_rpc and execution_rpc.
+#   HTTP exposes sync committee data to MITM. Only for local testing
+#   (e.g. a localhost Lodestar node). Logs a warning when active.
+#
+# allow_http_consensus_rpc = false
+
 [[contracts]]
 name = "Uniswap V3 ETH/USDC"
 address = "0x8ad599c3A0ff1De082011EFDDc58f1908eb6e6D8"

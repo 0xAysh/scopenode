@@ -16,7 +16,9 @@
 #![deny(warnings)]
 
 pub mod abi;
+pub mod beacon;
 pub mod config;
+pub mod helios_client;
 pub mod error;
 pub mod headers;
 pub mod live;

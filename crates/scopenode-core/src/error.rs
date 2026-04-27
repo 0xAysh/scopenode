@@ -14,6 +14,7 @@
 
 use alloy_primitives::Address;
 use thiserror::Error;
+use url::Url;
 
 /// Top-level error for pipeline operations.
 ///
@@ -155,4 +156,18 @@ pub enum ConfigError {
     /// A contract config lists no events to watch — at least one event is required.
     #[error("Contract {0} has no events configured")]
     NoEvents(Address),
+
+    /// `consensus_rpc` is set but `execution_rpc` is absent.
+    ///
+    /// Helios requires an execution-layer RPC for bootstrap block lookups. Any
+    /// public Ethereum RPC works — it is not used for indexing.
+    #[error("consensus_rpc requires execution_rpc — add a public Ethereum RPC URL to config.toml")]
+    MissingExecutionRpc,
+
+    /// A consensus or execution RPC URL uses `http://` without `allow_http_consensus_rpc = true`.
+    ///
+    /// HTTP endpoints allow MITM of sync committee data. Use HTTPS, or set
+    /// `allow_http_consensus_rpc = true` only for local testing.
+    #[error("RPC URL {url} must use HTTPS (set allow_http_consensus_rpc = true to allow HTTP for local testing)")]
+    InsecureRpcUrl { url: Url },
 }

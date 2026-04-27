@@ -39,8 +39,9 @@ use ratatui::{
     widgets::{Block, Borders, Gauge, List, ListItem, Paragraph},
     Frame, Terminal,
 };
-use scopenode_core::{config::Config, types::StoredEvent};
+use scopenode_core::{beacon::BeaconStatus, config::Config, types::StoredEvent};
 use scopenode_storage::Db;
+use tokio::sync::watch;
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
@@ -65,11 +66,14 @@ pub struct AppState {
     pub reorg_count: u64,
     pub contract_stats: Vec<ContractStat>,
     pub recent_events: VecDeque<StoredEvent>,
+    /// Current beacon verification state; updated each refresh tick.
+    pub beacon_status: BeaconStatus,
+    beacon_status_rx: watch::Receiver<BeaconStatus>,
     speed_sample: (Instant, u64),
 }
 
 impl AppState {
-    pub fn new(config: &Config) -> Self {
+    pub fn new(config: &Config, beacon_status_rx: watch::Receiver<BeaconStatus>) -> Self {
         Self {
             mode: SyncMode::Historical,
             current_block: 0,
@@ -87,6 +91,8 @@ impl AppState {
                 })
                 .collect(),
             recent_events: VecDeque::with_capacity(20),
+            beacon_status: BeaconStatus::NotConfigured,
+            beacon_status_rx,
             speed_sample: (Instant::now(), 0),
         }
     }
@@ -95,9 +101,10 @@ impl AppState {
         self.mode = SyncMode::Live;
     }
 
-    /// Poll the DB for current stats and update speed estimate.
+    /// Poll the DB for current stats, update speed estimate, and sync beacon status.
     pub async fn refresh(&mut self, db: &Db, peer_count: usize) {
         self.peer_count = peer_count;
+        self.beacon_status = self.beacon_status_rx.borrow().clone();
 
         if let Ok(Some(block)) = db.latest_block_number().await {
             let elapsed = self.speed_sample.0.elapsed().as_secs_f64();
@@ -191,7 +198,7 @@ fn render_header(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
         ),
     };
 
-    let line = Line::from(vec![
+    let mut spans = vec![
         Span::raw("Mode: "),
         Span::styled(mode_str, mode_style),
         Span::raw(format!(
@@ -200,9 +207,27 @@ fn render_header(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
             state.blocks_per_sec,
             state.peer_count,
         )),
-    ]);
+    ];
 
-    f.render_widget(Paragraph::new(line), area);
+    if area.width >= 100 {
+        let (label, color) = beacon_label_and_color(&state.beacon_status);
+        spans.push(Span::raw("   beacon: "));
+        spans.push(Span::styled(label, Style::default().fg(color)));
+    }
+
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Map a `BeaconStatus` to a short label and ratatui color for the TUI header.
+fn beacon_label_and_color(s: &BeaconStatus) -> (&'static str, Color) {
+    match s {
+        BeaconStatus::NotConfigured => ("not configured", Color::DarkGray),
+        BeaconStatus::Syncing { .. } => ("syncing", Color::Yellow),
+        BeaconStatus::Synced { .. } => ("synced", Color::Green),
+        BeaconStatus::Stalled { .. } => ("stalled", Color::LightYellow),
+        BeaconStatus::Error(_) => ("error", Color::Red),
+        BeaconStatus::FallbackUnverified => ("unverified", Color::Red),
+    }
 }
 
 fn render_body(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
@@ -307,6 +332,61 @@ fn sync_progress(state: &AppState, config: &Config) -> (f64, String) {
                 _ => (0.0, format!("syncing — {}", fmt_block(state.current_block))),
             }
         }
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::B256;
+    use std::time::Instant;
+
+    #[test]
+    fn beacon_label_not_configured() {
+        let (label, color) = beacon_label_and_color(&BeaconStatus::NotConfigured);
+        assert_eq!(label, "not configured");
+        assert_eq!(color, Color::DarkGray);
+    }
+
+    #[test]
+    fn beacon_label_syncing() {
+        let (label, color) = beacon_label_and_color(&BeaconStatus::Syncing { started: Instant::now() });
+        assert_eq!(label, "syncing");
+        assert_eq!(color, Color::Yellow);
+    }
+
+    #[test]
+    fn beacon_label_synced() {
+        let (label, color) = beacon_label_and_color(&BeaconStatus::Synced {
+            head_block: 20_000_000,
+            head_hash: B256::ZERO,
+        });
+        assert_eq!(label, "synced");
+        assert_eq!(color, Color::Green);
+    }
+
+    #[test]
+    fn beacon_label_stalled() {
+        let (label, color) =
+            beacon_label_and_color(&BeaconStatus::Stalled { consecutive_mismatches: 3, at_block: 100 });
+        assert_eq!(label, "stalled");
+        assert_eq!(color, Color::LightYellow);
+    }
+
+    #[test]
+    fn beacon_label_error() {
+        let (label, color) = beacon_label_and_color(&BeaconStatus::Error("timeout".into()));
+        assert_eq!(label, "error");
+        assert_eq!(color, Color::Red);
+    }
+
+    #[test]
+    fn beacon_label_fallback_unverified() {
+        let (label, color) = beacon_label_and_color(&BeaconStatus::FallbackUnverified);
+        assert_eq!(label, "unverified");
+        assert_eq!(color, Color::Red);
     }
 }
 

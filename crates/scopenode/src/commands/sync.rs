@@ -15,6 +15,7 @@
 //! 4. Start JSON-RPC server on the configured port
 //! 5. If any contract has no `to_block`, enter live sync mode
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,6 +23,7 @@ use anyhow::{Context, Result};
 use crossterm::event::EventStream;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use scopenode_core::{
+    beacon::BeaconStatus,
     config::Config,
     live::LiveSyncer,
     network::{DevP2PNetwork, EthNetwork},
@@ -30,7 +32,7 @@ use scopenode_core::{
 };
 use scopenode_rpc::{start_rest_server, start_server};
 use scopenode_storage::Db;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tokio_stream::StreamExt as _;
 use tracing::info;
 
@@ -43,6 +45,7 @@ pub async fn run(
     dry_run: bool,
     quiet: bool,
     blocks_override: Option<String>,
+    data_dir: PathBuf,
 ) -> Result<()> {
     if let Some(ref range_str) = blocks_override {
         let (from, to) = parse_blocks_flag(range_str)
@@ -103,7 +106,10 @@ pub async fn run(
 
             if has_live {
                 println!("Entering live sync (Ctrl+C to stop)...");
-                let syncer = LiveSyncer::new(config, network, db, tx);
+                let (beacon_tx, _beacon_rx) = watch::channel(BeaconStatus::NotConfigured);
+                let beacon_tx = Arc::new(beacon_tx);
+                let syncer =
+                    LiveSyncer::new(config, network, db, tx, beacon_tx, Some(data_dir.clone()));
                 tokio::select! {
                     res = syncer.run() => {
                         if let Err(e) = res { eprintln!("Live sync error: {e:#}"); }
@@ -123,7 +129,7 @@ pub async fn run(
     } else {
         // TUI mode: clear the spinner line before entering the alternate screen.
         spinner.finish_and_clear();
-        run_with_tui(config, db, network, port, has_live).await?;
+        run_with_tui(config, db, network, port, has_live, data_dir).await?;
     }
 
     Ok(())
@@ -142,8 +148,11 @@ async fn run_with_tui<N: EthNetwork + 'static>(
     network: Arc<N>,
     port: u16,
     has_live: bool,
+    data_dir: PathBuf,
 ) -> Result<()> {
-    let mut state = AppState::new(&config);
+    let (beacon_tx, beacon_rx) = watch::channel(BeaconStatus::NotConfigured);
+    let beacon_tx = Arc::new(beacon_tx);
+    let mut state = AppState::new(&config, beacon_rx);
     let (broadcast_tx, mut broadcast_rx) = broadcast::channel::<StoredEvent>(1024);
 
     // Set up the terminal before spawning anything so any early errors go to
@@ -214,6 +223,8 @@ async fn run_with_tui<N: EthNetwork + 'static>(
                             Arc::clone(&network),
                             db.clone(),
                             broadcast_tx.clone(),
+                            Arc::clone(&beacon_tx),
+                            Some(data_dir.clone()),
                         );
                         tokio::spawn(async move {
                             if let Err(e) = syncer.run().await {
