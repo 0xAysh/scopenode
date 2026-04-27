@@ -5,3 +5,8 @@ config.test.toml
 .env
 .claude
 .worktrees/
+/graphify-out
+/docs/plans
+/docs/brainstorms
+/docs/superpowers
+.context
