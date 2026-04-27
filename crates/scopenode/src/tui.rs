@@ -39,8 +39,9 @@ use ratatui::{
     widgets::{Block, Borders, Gauge, List, ListItem, Paragraph},
     Frame, Terminal,
 };
-use scopenode_core::{config::Config, types::StoredEvent};
+use scopenode_core::{beacon::BeaconStatus, config::Config, types::StoredEvent};
 use scopenode_storage::Db;
+use tokio::sync::watch;
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
@@ -65,11 +66,15 @@ pub struct AppState {
     pub reorg_count: u64,
     pub contract_stats: Vec<ContractStat>,
     pub recent_events: VecDeque<StoredEvent>,
+    /// Beacon light-client status feed. Rendered in the TUI header by the
+    /// beacon indicator (see render()).
+    #[allow(dead_code)]
+    pub beacon_status_rx: watch::Receiver<BeaconStatus>,
     speed_sample: (Instant, u64),
 }
 
 impl AppState {
-    pub fn new(config: &Config) -> Self {
+    pub fn new(config: &Config, beacon_status_rx: watch::Receiver<BeaconStatus>) -> Self {
         Self {
             mode: SyncMode::Historical,
             current_block: 0,
@@ -87,6 +92,7 @@ impl AppState {
                 })
                 .collect(),
             recent_events: VecDeque::with_capacity(20),
+            beacon_status_rx,
             speed_sample: (Instant::now(), 0),
         }
     }

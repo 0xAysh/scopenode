@@ -65,7 +65,7 @@ async fn main() -> Result<()> {
                 .await
                 .context("Failed to open database")?;
 
-            commands::sync::run(cfg, db, *dry_run, cli.quiet, blocks.clone()).await?;
+            commands::sync::run(cfg, db, *dry_run, cli.quiet, blocks.clone(), data_dir).await?;
         }
 
         Command::Status => {
