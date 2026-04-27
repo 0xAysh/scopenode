@@ -32,6 +32,8 @@ tokio-stream             = { workspace = true }
 helios-ethereum          = { workspace = true }
 openssl                  = { workspace = true }
 futures                  = { workspace = true }
+hex                      = { workspace = true }
+eyre                     = { workspace = true }
 
 [dev-dependencies]
 tokio    = { workspace = true }
