@@ -140,7 +140,7 @@ async fn main() -> Result<()> {
             let db = Db::open(data_dir.join("scopenode.db"))
                 .await
                 .context("Failed to open database")?;
-            commands::doctor::run(db).await?;
+            commands::doctor::run(db, &data_dir).await?;
         }
 
         Command::Export {

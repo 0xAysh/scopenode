@@ -24,3 +24,6 @@ sqlx              = { workspace = true }
 ratatui           = { workspace = true }
 crossterm         = { workspace = true }
 tokio-stream      = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
