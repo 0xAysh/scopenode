@@ -7830,6 +7830,7 @@ dependencies = [
  "scopenode-storage",
  "serde_json",
  "sqlx",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tracing",
