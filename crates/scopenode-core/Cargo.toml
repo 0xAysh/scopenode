@@ -29,6 +29,8 @@ reth-storage-api         = { workspace = true }
 reth-ethereum-primitives = { workspace = true }
 reth-ethereum-forks      = { workspace = true }
 tokio-stream             = { workspace = true }
+helios-ethereum          = { workspace = true }
+openssl                  = { workspace = true }
 
 [dev-dependencies]
 tokio    = { workspace = true }

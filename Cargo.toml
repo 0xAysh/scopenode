@@ -46,3 +46,7 @@ crossterm                = { version = "0.28", features = ["event-stream"] }
 scopenode-core    = { path = "crates/scopenode-core" }
 scopenode-storage = { path = "crates/scopenode-storage" }
 scopenode-rpc     = { path = "crates/scopenode-rpc" }
+# beacon light client — git-only, unrelated to the "helios" geometry crate on crates.io
+helios-ethereum   = { git = "https://github.com/a16z/helios", tag = "0.11.1" }
+# openssl vendored: required by helios for non-WASM builds (needs cc + make on CI)
+openssl           = { version = "0.10", features = ["vendored"] }
