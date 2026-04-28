@@ -17,9 +17,15 @@
 //! │ Peers: 12   Reorgs: 0   Retries: 3                               │
 //! │ ████████████████████  19,842,301 / 20,000,000                   │
 //! │                                                                  │
-//! │ q quit                                                           │
+//! │ q quit · p peers · l logs · r events                            │
 //! └──────────────────────────────────────────────────────────────────┘
 //! ```
+//!
+//! Key bindings:
+//! - `q` / `Q` / Ctrl+C — quit
+//! - `p` — toggle right panel to peer list
+//! - `l` — toggle right panel to log view
+//! - `r` — return right panel to recent events (default)
 
 use std::collections::VecDeque;
 use std::io::Stdout;
@@ -51,6 +57,15 @@ pub enum SyncMode {
     Live,
 }
 
+/// Which view is shown in the right panel of the TUI body.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum Panel {
+    #[default]
+    Events,
+    PeerList,
+    Logs,
+}
+
 pub struct ContractStat {
     pub name: Option<String>,
     pub address: String,
@@ -66,6 +81,10 @@ pub struct AppState {
     pub reorg_count: u64,
     pub contract_stats: Vec<ContractStat>,
     pub recent_events: VecDeque<StoredEvent>,
+    /// Ring buffer of key log messages pushed from the sync loop.
+    pub log_lines: VecDeque<String>,
+    /// Which view is shown in the right body panel.
+    pub panel: Panel,
     /// Current beacon verification state; updated each refresh tick.
     pub beacon_status: BeaconStatus,
     beacon_status_rx: watch::Receiver<BeaconStatus>,
@@ -91,6 +110,8 @@ impl AppState {
                 })
                 .collect(),
             recent_events: VecDeque::with_capacity(20),
+            log_lines: VecDeque::with_capacity(50),
+            panel: Panel::Events,
             beacon_status: BeaconStatus::NotConfigured,
             beacon_status_rx,
             speed_sample: (Instant::now(), 0),
@@ -136,6 +157,19 @@ impl AppState {
         }
         self.recent_events.push_back(ev);
     }
+
+    /// Append a log line to the ring buffer (capped at 50 entries).
+    pub fn push_log(&mut self, line: String) {
+        if self.log_lines.len() >= 50 {
+            self.log_lines.pop_front();
+        }
+        self.log_lines.push_back(line);
+    }
+
+    /// Switch the right panel to a different view.
+    pub fn set_panel(&mut self, panel: Panel) {
+        self.panel = panel;
+    }
 }
 
 // ── Terminal lifecycle ────────────────────────────────────────────────────────
@@ -163,6 +197,21 @@ pub fn is_quit_event(ev: &Event) -> bool {
                 || (key.code == KeyCode::Char('c')
                     && key.modifiers.contains(KeyModifiers::CONTROL))
     )
+}
+
+/// Returns the [`Panel`] to switch to for panel-toggle keys (`p`, `l`, `r`),
+/// or `None` for any other key event.
+pub fn handle_key_event(ev: &Event) -> Option<Panel> {
+    if let Event::Key(key) = ev {
+        match key.code {
+            KeyCode::Char('p') | KeyCode::Char('P') => Some(Panel::PeerList),
+            KeyCode::Char('l') | KeyCode::Char('L') => Some(Panel::Logs),
+            KeyCode::Char('r') | KeyCode::Char('R') => Some(Panel::Events),
+            _ => None,
+        }
+    } else {
+        None
+    }
 }
 
 // ── Rendering ─────────────────────────────────────────────────────────────────
@@ -234,7 +283,7 @@ fn render_body(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
     let cols = Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)])
         .split(area);
 
-    // Contracts panel
+    // Contracts panel (always visible on the left)
     let mut items: Vec<ListItem> = Vec::new();
     for stat in &state.contract_stats {
         let label = stat.name.as_deref().unwrap_or(&stat.address);
@@ -251,8 +300,16 @@ fn render_body(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
         cols[0],
     );
 
-    // Recent events panel
-    let event_items: Vec<ListItem> = state
+    // Right panel — switches based on state.panel
+    match state.panel {
+        Panel::Events => render_right_events(f, cols[1], state),
+        Panel::PeerList => render_right_peers(f, cols[1], state),
+        Panel::Logs => render_right_logs(f, cols[1], state),
+    }
+}
+
+fn render_right_events(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
+    let items: Vec<ListItem> = state
         .recent_events
         .iter()
         .rev()
@@ -265,9 +322,53 @@ fn render_body(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
         })
         .collect();
     f.render_widget(
-        List::new(event_items)
+        List::new(items)
             .block(Block::default().title(" Recent Events ").borders(Borders::ALL)),
-        cols[1],
+        area,
+    );
+}
+
+fn render_right_peers(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
+    let text = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  Connected peers: {}", state.peer_count),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Per-peer detail not yet tracked.",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(
+            "  Press r to return to Recent Events.",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    f.render_widget(
+        Paragraph::new(text)
+            .block(Block::default().title(" Peer List ").borders(Borders::ALL)),
+        area,
+    );
+}
+
+fn render_right_logs(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
+    let items: Vec<ListItem> = if state.log_lines.is_empty() {
+        vec![ListItem::new(Span::styled(
+            "  No log entries yet.",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        state
+            .log_lines
+            .iter()
+            .rev()
+            .map(|line| ListItem::new(format!("  {line}")))
+            .collect()
+    };
+    f.render_widget(
+        List::new(items).block(Block::default().title(" Logs ").borders(Borders::ALL)),
+        area,
     );
 }
 
@@ -308,7 +409,7 @@ fn render_footer(
 
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "q quit",
+            "q quit · p peers · l logs · r events",
             Style::default().fg(Color::DarkGray),
         ))),
         rows[3],

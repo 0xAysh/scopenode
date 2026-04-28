@@ -135,7 +135,7 @@ Key bindings: `q` quit · `p` peer list · `r` recent events · `l` logs
 - [ ] Reorg detected (parent_hash mismatch): orphaned events marked `reorged = 1`
 - [ ] `eth_getLogs` excludes reorged events by default
 - [ ] ratatui TUI: mode, block, speed, peer count, per-contract event totals, recent events
-- [ ] TUI key bindings work: quit, peer list, logs
+- [x] TUI key bindings work: quit, peer list, logs
 - [ ] `scopenode snapshot` / `scopenode restore` work; restore auto-snaps before overwriting
 - [ ] `scopenode doctor` reports: peer count, beacon head, DB counts, pending_retry count
 - [ ] `scopenode retry` clears all `pending_retry` blocks on success
@@ -143,7 +143,7 @@ Key bindings: `q` quit · `p` peer list · `r` recent events · `l` logs
 - [ ] `scopenode sync --blocks 16M:+500` resolves to `from_block=16000000, to_block=16000500`
 - [ ] `reorg_buffer` config key respected; defaults to 64 when absent
 - [ ] Unit tests: reorg detection at depth 1/5/64, live syncer broadcast fan-out
-- [ ] Integration test: live sync processes 10 real blocks after historical completes
+- [x] Integration test: live sync processes 10 real blocks after historical completes
 
 ## New dependencies
 

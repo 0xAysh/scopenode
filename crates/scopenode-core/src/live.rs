@@ -526,6 +526,47 @@ mod tests {
         let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
         let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
     }
+
+    /// After historical sync completes the live syncer picks up from the stored
+    /// tip and processes the next 10 blocks.
+    #[tokio::test]
+    async fn live_syncer_processes_ten_blocks_after_historical() {
+        use crate::pipeline::scope_header_to_stored;
+
+        let addr: Address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".parse().unwrap();
+        let addr_str = addr.to_checksum(None);
+
+        let db_path = unique_db_path();
+        let db = scopenode_storage::Db::open(db_path.clone()).await.unwrap();
+        db.upsert_contract(&addr_str, Some("test"), &transfer_abi_json())
+            .await
+            .unwrap();
+
+        // Simulate historical sync: insert headers 1–100 into the DB.
+        for n in 1u64..=100 {
+            let h = scope_header(n);
+            db.insert_header(&scope_header_to_stored(&h)).await.unwrap();
+        }
+
+        // Network serves blocks 101–110 (10 new live blocks).
+        let live_headers: Vec<ScopeHeader> = (101u64..=110).map(scope_header).collect();
+        let network = Arc::new(MockNetwork { headers: live_headers });
+
+        let (tx, _rx) = broadcast::channel(32);
+        let beacon_tx = dummy_beacon_tx();
+
+        let syncer = LiveSyncer::new(live_config(addr), network, db.clone(), tx, beacon_tx, None);
+
+        // run() loops forever — interrupt after the batch is processed.
+        let _ = tokio::time::timeout(Duration::from_secs(2), syncer.run()).await;
+
+        let stored = db.get_headers(101, 110).await.unwrap();
+        assert_eq!(stored.len(), 10, "expected 10 live blocks stored after historical tip");
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+    }
 }
 
 /// Call `mark_retry` for every contract whose bloom targets match `bloom`.

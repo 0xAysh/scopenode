@@ -207,17 +207,21 @@ async fn run_with_tui<N: EthNetwork + 'static>(
                         .unwrap_or_else(|_| Err(anyhow::anyhow!("pipeline task panicked")));
                     pipeline_result?;
 
+                    state.push_log("Historical sync complete.".to_string());
+
                     let handle = start_server(port, db.clone())
                         .await
                         .context("Failed to start JSON-RPC server")?;
                     start_rest_server(port + 1, db.clone(), broadcast_tx.clone())
                         .await
                         .context("Failed to start REST server")?;
+                    state.push_log(format!("JSON-RPC server listening on port {port}."));
                     // Store the stop function for cleanup after the loop.
                     rpc_handle = Some(Box::new(move || handle.stop().map_err(anyhow::Error::from)));
 
                     if has_live {
                         state.set_live();
+                        state.push_log("Live sync started — following chain tip.".to_string());
                         let syncer = LiveSyncer::new(
                             config.clone(),
                             Arc::clone(&network),
@@ -237,6 +241,11 @@ async fn run_with_tui<N: EthNetwork + 'static>(
                 maybe_ev = event_stream.next() => {
                     match maybe_ev {
                         Some(Ok(ref ev)) if tui::is_quit_event(ev) => break,
+                        Some(Ok(ref ev)) => {
+                            if let Some(panel) = tui::handle_key_event(ev) {
+                                state.set_panel(panel);
+                            }
+                        }
                         None => break,
                         _ => {}
                     }
