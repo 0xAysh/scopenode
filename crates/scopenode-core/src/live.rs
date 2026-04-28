@@ -44,6 +44,9 @@ pub struct LiveSyncer<N: EthNetwork> {
     db: Db,
     abi_cache: AbiCache,
     broadcast: broadcast::Sender<StoredEvent>,
+    /// Fires for every processed block — used by `eth_subscribe "newHeads"`.
+    /// Tuple is (block_number, block_hash, timestamp).
+    headers_tx: broadcast::Sender<(u64, B256, u64)>,
     reorg_detector: ReorgDetector,
     beacon_status_tx: BeaconStatusTx,
     data_dir: Option<PathBuf>,
@@ -55,6 +58,7 @@ impl<N: EthNetwork + 'static> LiveSyncer<N> {
         network: Arc<N>,
         db: Db,
         broadcast: broadcast::Sender<StoredEvent>,
+        headers_tx: broadcast::Sender<(u64, B256, u64)>,
         beacon_status_tx: BeaconStatusTx,
         data_dir: Option<PathBuf>,
     ) -> Self {
@@ -66,6 +70,7 @@ impl<N: EthNetwork + 'static> LiveSyncer<N> {
             db,
             abi_cache,
             broadcast,
+            headers_tx,
             reorg_detector: ReorgDetector::new(capacity),
             beacon_status_tx,
             data_dir,
@@ -254,6 +259,7 @@ impl<N: EthNetwork + 'static> LiveSyncer<N> {
         };
 
         self.db.insert_header(&scope_header_to_stored(&header)).await?;
+        let _ = self.headers_tx.send((header.number, header.hash, header.timestamp));
 
         if let Some(reorg) = self
             .reorg_detector
@@ -514,13 +520,50 @@ mod tests {
         let (tx, _rx) = broadcast::channel(32);
         let beacon_tx = dummy_beacon_tx();
 
-        let syncer = LiveSyncer::new(live_config(addr), network, db.clone(), tx, beacon_tx, None);
+        let (headers_tx, _) = broadcast::channel(32);
+        let syncer = LiveSyncer::new(live_config(addr), network, db.clone(), tx, headers_tx, beacon_tx, None);
 
         // run() loops forever — interrupt after the first batch completes.
         let _ = tokio::time::timeout(Duration::from_secs(1), syncer.run()).await;
 
         let stored = db.get_headers(1, 5).await.unwrap();
         assert_eq!(stored.len(), 5);
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+    }
+
+    /// Header broadcast fires for every processed block, including bloom-miss blocks.
+    #[tokio::test]
+    async fn header_broadcast_fires_for_every_block() {
+        let addr: Address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".parse().unwrap();
+        let addr_str = addr.to_checksum(None);
+
+        let db_path = unique_db_path();
+        let db = scopenode_storage::Db::open(db_path.clone()).await.unwrap();
+        db.upsert_contract(&addr_str, Some("test"), &transfer_abi_json())
+            .await
+            .unwrap();
+
+        // All 5 headers have empty bloom — no events, so event broadcast never fires.
+        let headers: Vec<ScopeHeader> = (1u64..=5).map(scope_header).collect();
+        let network = Arc::new(MockNetwork { headers });
+
+        let (tx, _rx) = broadcast::channel(32);
+        let (headers_tx, mut headers_rx) = broadcast::channel::<(u64, B256, u64)>(32);
+        let beacon_tx = dummy_beacon_tx();
+
+        let syncer = LiveSyncer::new(live_config(addr), network, db.clone(), tx, headers_tx, beacon_tx, None);
+
+        let _ = tokio::time::timeout(Duration::from_secs(1), syncer.run()).await;
+
+        let mut received_blocks = Vec::new();
+        while let Ok((block_num, _, _)) = headers_rx.try_recv() {
+            received_blocks.push(block_num);
+        }
+        received_blocks.sort();
+        assert_eq!(received_blocks, vec![1, 2, 3, 4, 5], "header broadcast must fire for all 5 blocks");
 
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
@@ -555,7 +598,8 @@ mod tests {
         let (tx, _rx) = broadcast::channel(32);
         let beacon_tx = dummy_beacon_tx();
 
-        let syncer = LiveSyncer::new(live_config(addr), network, db.clone(), tx, beacon_tx, None);
+        let (headers_tx, _) = broadcast::channel(32);
+        let syncer = LiveSyncer::new(live_config(addr), network, db.clone(), tx, headers_tx, beacon_tx, None);
 
         // run() loops forever — interrupt after the batch is processed.
         let _ = tokio::time::timeout(Duration::from_secs(2), syncer.run()).await;
