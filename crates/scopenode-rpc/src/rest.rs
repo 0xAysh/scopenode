@@ -236,18 +236,11 @@ async fn stream_events(
     let stream = BroadcastStream::new(rx).filter_map(move |result| {
         let ev = result.ok()?; // swallow lagged errors — slow clients miss some events
 
-        let addr = ev.contract.to_checksum(None);
-        if let Some(ref c) = contract_filter {
-            if !addr.eq_ignore_ascii_case(c) {
-                return None;
-            }
-        }
-        if let Some(ref e) = event_filter {
-            if !ev.event_name.eq_ignore_ascii_case(e) {
-                return None;
-            }
+        if !sse_matches(&ev, contract_filter.as_deref(), event_filter.as_deref()) {
+            return None;
         }
 
+        let addr = ev.contract.to_checksum(None);
         let data = serde_json::json!({
             "contract": addr,
             "event_name": ev.event_name,
@@ -261,6 +254,26 @@ async fn stream_events(
     });
 
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+// ── SSE filter helper ─────────────────────────────────────────────────────────
+
+/// Returns `true` when `ev` passes the optional contract and event-name filters.
+///
+/// Both comparisons are case-insensitive. An absent filter matches everything.
+fn sse_matches(ev: &LiveEvent, contract_filter: Option<&str>, event_filter: Option<&str>) -> bool {
+    let addr = ev.contract.to_checksum(None);
+    if let Some(c) = contract_filter {
+        if !addr.eq_ignore_ascii_case(c) {
+            return false;
+        }
+    }
+    if let Some(e) = event_filter {
+        if !ev.event_name.eq_ignore_ascii_case(e) {
+            return false;
+        }
+    }
+    true
 }
 
 // ── Server startup ────────────────────────────────────────────────────────────
@@ -298,4 +311,83 @@ pub async fn start_rest_server(
     });
 
     Ok(())
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::{Address, Bytes, B256};
+    use tokio::sync::broadcast;
+
+    fn make_event(contract: Address, event_name: &str) -> LiveEvent {
+        LiveEvent {
+            contract,
+            event_name: event_name.to_string(),
+            topic0: B256::ZERO,
+            block_number: 1,
+            block_hash: B256::ZERO,
+            tx_hash: B256::ZERO,
+            tx_index: 0,
+            log_index: 0,
+            raw_topics: vec![],
+            raw_data: Bytes::default(),
+            decoded: serde_json::json!({}),
+            source: "devp2p".to_string(),
+            timestamp: 0,
+        }
+    }
+
+    #[test]
+    fn sse_no_filter_passes_all() {
+        let addr: Address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".parse().unwrap();
+        let ev = make_event(addr, "Transfer");
+        assert!(sse_matches(&ev, None, None));
+    }
+
+    #[test]
+    fn sse_contract_filter_passes_matching() {
+        let addr: Address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".parse().unwrap();
+        let ev = make_event(addr, "Transfer");
+        assert!(sse_matches(&ev, Some(&addr.to_checksum(None)), None));
+    }
+
+    #[test]
+    fn sse_contract_filter_blocks_other_contract() {
+        let addr: Address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".parse().unwrap();
+        let other = "0x0000000000000000000000000000000000000001";
+        let ev = make_event(addr, "Transfer");
+        assert!(!sse_matches(&ev, Some(other), None));
+    }
+
+    #[test]
+    fn sse_event_filter_passes_matching_case_insensitive() {
+        let addr: Address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".parse().unwrap();
+        let ev = make_event(addr, "Transfer");
+        assert!(sse_matches(&ev, None, Some("transfer")));
+        assert!(sse_matches(&ev, None, Some("TRANSFER")));
+    }
+
+    #[test]
+    fn sse_event_filter_blocks_other_event() {
+        let addr: Address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".parse().unwrap();
+        let ev = make_event(addr, "Transfer");
+        assert!(!sse_matches(&ev, None, Some("Swap")));
+    }
+
+    /// Events sent on the broadcast channel are received by all active subscribers.
+    #[tokio::test]
+    async fn sse_broadcast_fan_out_reaches_all_receivers() {
+        let addr: Address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".parse().unwrap();
+        let (tx, mut rx1) = broadcast::channel::<LiveEvent>(8);
+        let mut rx2 = tx.subscribe();
+
+        tx.send(make_event(addr, "Transfer")).unwrap();
+
+        let e1 = rx1.recv().await.unwrap();
+        let e2 = rx2.recv().await.unwrap();
+        assert_eq!(e1.event_name, "Transfer");
+        assert_eq!(e2.event_name, "Transfer");
+    }
 }
