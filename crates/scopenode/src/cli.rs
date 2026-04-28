@@ -49,6 +49,9 @@ pub enum Command {
         /// Filter by event name
         #[arg(long)]
         event: Option<String>,
+        /// Filter by raw keccak256 topic0 hash (0x-prefixed hex)
+        #[arg(long)]
+        topic0: Option<String>,
         /// Only return events at or after this block number
         #[arg(long)]
         from_block: Option<u64>,

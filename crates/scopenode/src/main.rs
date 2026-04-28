@@ -83,6 +83,7 @@ async fn main() -> Result<()> {
         Command::Query {
             contract,
             event,
+            topic0,
             from_block,
             to_block,
             limit,
@@ -100,6 +101,7 @@ async fn main() -> Result<()> {
                 db,
                 contract.clone(),
                 event.clone(),
+                topic0.clone(),
                 *from_block,
                 *to_block,
                 *limit,

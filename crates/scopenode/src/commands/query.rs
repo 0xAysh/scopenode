@@ -6,6 +6,7 @@
 //! # Filters
 //! - `--contract <address>` — filter by contract address
 //! - `--event <name>` — filter by event name (e.g. `"Swap"`)
+//! - `--topic0 <hex>` — filter by raw keccak256 topic0 hash (alternative to `--event`)
 //! - `--limit <n>` — maximum number of rows to return (default: 100)
 //!
 //! # Output formats
@@ -17,7 +18,7 @@ use scopenode_storage::Db;
 
 /// Query events from SQLite and print them.
 ///
-/// Filters: `--contract` (address), `--event` (event name), `--limit` (max rows).
+/// Filters: `--contract`, `--event`, `--topic0`, `--from-block`, `--to-block`, `--limit`.
 ///
 /// Output: `"table"` (default) prints aligned columns; `"json"` prints a JSON
 /// array including the `decoded` fields — useful for piping to `jq` or scripts.
@@ -25,18 +26,21 @@ pub async fn run(
     db: Db,
     contract: Option<String>,
     event: Option<String>,
+    topic0: Option<String>,
     from_block: Option<u64>,
     to_block: Option<u64>,
     limit: usize,
     output: String,
 ) -> Result<()> {
     let events = db
-        .query_events(
+        .query_events_for_filter(
             contract.as_deref(),
             event.as_deref(),
+            topic0.as_deref(),
             from_block,
             to_block,
             limit,
+            0,
         )
         .await?;
 
