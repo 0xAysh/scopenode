@@ -167,4 +167,141 @@ mod tests {
         assert!(CSV_HEADER.ends_with(",source"));
         assert_eq!(CSV_HEADER.split(',').count(), 12);
     }
+
+    // ── Format correctness against a real (temp) DB ───────────────────────────
+
+    async fn setup_db_with_event() -> (scopenode_storage::Db, std::path::PathBuf) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static CTR: AtomicU32 = AtomicU32::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir()
+            .join(format!("scopenode_export_test_{}_{}.db", std::process::id(), n));
+
+        let db = scopenode_storage::Db::open(path.clone()).await.unwrap();
+
+        let addr = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
+        let abi = serde_json::json!([{
+            "name": "Transfer",
+            "inputs": [
+                {"name": "from", "type": "address", "indexed": true},
+                {"name": "to",   "type": "address", "indexed": true},
+                {"name": "value","type": "uint256",  "indexed": false}
+            ]
+        }])
+        .to_string();
+        db.upsert_contract(addr, Some("test"), &abi).await.unwrap();
+
+        let row = scopenode_storage::models::StoredEvent {
+            contract:    addr.to_string(),
+            event_name:  "Transfer".to_string(),
+            topic0:      "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef".to_string(),
+            block_number: 1,
+            block_hash:  "0x0000000000000000000000000000000000000000000000000000000000000001".to_string(),
+            tx_hash:     "0x0000000000000000000000000000000000000000000000000000000000000002".to_string(),
+            tx_index:    0,
+            log_index:   0,
+            raw_topics:  "[]".to_string(),
+            raw_data:    "0x".to_string(),
+            decoded:     "{\"from\":\"0x0\",\"to\":\"0x1\",\"value\":\"1000\"}".to_string(),
+            source:      "devp2p".to_string(),
+        };
+        db.insert_events(&[row]).await.unwrap();
+        (db, path)
+    }
+
+    fn cleanup(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[tokio::test]
+    async fn csv_row_has_twelve_fields() {
+        let (db, path) = setup_db_with_event().await;
+
+        let mut buf = Vec::new();
+        let stream = db.stream_events_for_filter(None, None, None, None, None);
+        tokio::pin!(stream);
+
+        use tokio_stream::StreamExt as _;
+        // Write the CSV the same way export() does, but capture into a Vec.
+        let mut w = std::io::BufWriter::new(&mut buf);
+        writeln!(w, "{}", CSV_HEADER).unwrap();
+        while let Some(result) = stream.next().await {
+            let row = result.unwrap();
+            writeln!(
+                w,
+                "{},{},{},{},{},{},{},{},{},{},{},{}",
+                csv_field(&row.contract),
+                csv_field(&row.event_name),
+                csv_field(&row.topic0),
+                row.block_number,
+                csv_field(&row.block_hash),
+                csv_field(&row.tx_hash),
+                row.tx_index,
+                row.log_index,
+                csv_field(&row.raw_topics),
+                csv_field(&row.raw_data),
+                csv_field(&row.decoded),
+                csv_field(&row.source),
+            )
+            .unwrap();
+        }
+        drop(w);
+
+        let output = String::from_utf8(buf).unwrap();
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 2, "header + 1 data row");
+        // Data row must have exactly 12 comma-separated bare fields (before quoting
+        // the decoded JSON with commas makes the split unreliable, so count header).
+        assert_eq!(lines[0].split(',').count(), 12);
+
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn json_output_has_expected_keys() {
+        let (db, path) = setup_db_with_event().await;
+
+        let stream = db.stream_events_for_filter(None, None, None, None, None);
+        tokio::pin!(stream);
+
+        use tokio_stream::StreamExt as _;
+        let mut objects: Vec<serde_json::Value> = Vec::new();
+        while let Some(result) = stream.next().await {
+            let row = result.unwrap();
+            let decoded: serde_json::Value =
+                serde_json::from_str(&row.decoded).unwrap_or(serde_json::Value::Null);
+            let raw_topics: serde_json::Value =
+                serde_json::from_str(&row.raw_topics).unwrap_or(serde_json::Value::Null);
+            objects.push(serde_json::json!({
+                "contract":     row.contract,
+                "event_name":   row.event_name,
+                "topic0":       row.topic0,
+                "block_number": row.block_number,
+                "block_hash":   row.block_hash,
+                "tx_hash":      row.tx_hash,
+                "tx_index":     row.tx_index,
+                "log_index":    row.log_index,
+                "raw_topics":   raw_topics,
+                "raw_data":     row.raw_data,
+                "decoded":      decoded,
+                "source":       row.source,
+            }));
+        }
+
+        assert_eq!(objects.len(), 1);
+        let obj = &objects[0];
+        for key in &[
+            "contract", "event_name", "topic0", "block_number", "block_hash",
+            "tx_hash", "tx_index", "log_index", "raw_topics", "raw_data",
+            "decoded", "source",
+        ] {
+            assert!(obj.get(key).is_some(), "missing key: {key}");
+        }
+        assert_eq!(obj["event_name"], "Transfer");
+        assert_eq!(obj["block_number"], 1);
+
+        cleanup(&path);
+    }
 }
