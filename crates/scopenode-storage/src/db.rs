@@ -1194,4 +1194,40 @@ mod tests {
         assert_eq!(rows.len(), 1, "reorged event must be excluded");
         assert_eq!(rows[0].block_hash, canonical_hash);
     }
+
+    #[tokio::test]
+    async fn topic0_filter_returns_matching_events() {
+        let (db, _guard) = open_test_db().await;
+
+        let contract = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
+        let transfer_topic0 = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+
+        let ev = make_event(contract, 100, "0x1111", "0xaaaa", 0);
+        db.insert_events(&[ev]).await.unwrap();
+
+        let rows = db
+            .query_events_for_filter(None, None, Some(transfer_topic0), None, None, 100, 0)
+            .await
+            .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].topic0, transfer_topic0);
+    }
+
+    #[tokio::test]
+    async fn topic0_filter_unknown_hash_returns_empty_not_error() {
+        let (db, _guard) = open_test_db().await;
+
+        let contract = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
+        let ev = make_event(contract, 100, "0x1111", "0xaaaa", 0);
+        db.insert_events(&[ev]).await.unwrap();
+
+        let unknown_topic0 = "0x0000000000000000000000000000000000000000000000000000000000000000";
+        let rows = db
+            .query_events_for_filter(None, None, Some(unknown_topic0), None, None, 100, 0)
+            .await
+            .unwrap();
+
+        assert!(rows.is_empty(), "unknown topic0 must return empty list, not error");
+    }
 }
