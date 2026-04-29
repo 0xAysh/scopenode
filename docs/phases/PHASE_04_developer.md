@@ -80,15 +80,15 @@ load into memory.
 
 ## Definition of done
 
-- [ ] `GET /events` output matches `eth_getLogs` for same contract + block range
+- [x] `GET /events` output matches `eth_getLogs` for same contract + block range
 - [x] `GET /stream/events` delivers live events via SSE within 1s of block processing
 - [x] `scopenode export --format csv/json` both produce valid output
 - [x] `scopenode query --topic0 0x...` returns the same rows as `?event=<name>` for the matching signature
 - [x] `GET /events?topic0=0x...` returns correct results; unknown topic0 returns empty list (not error)
-- [ ] `eth_subscribe logs` delivers live events to a WebSocket client within 1s of indexing
-- [ ] `eth_subscribe newHeads` emits each new block header as it's indexed
-- [ ] `eth_unsubscribe` cancels a subscription; client disconnect auto-cleans the receiver
-- [x] Unit tests: SSE fan-out, export format correctness, topic0 filter (WebSocket deferred)
+- [x] `eth_subscribe logs` delivers live events to a WebSocket client within 1s of indexing
+- [x] `eth_subscribe newHeads` emits each new block header as it's indexed
+- [x] `eth_unsubscribe` cancels a subscription; client disconnect auto-cleans the receiver
+- [x] Unit tests: SSE fan-out, export format correctness, topic0 filter, WebSocket filter + fan-out, parity
 
 ## New dependencies
 
