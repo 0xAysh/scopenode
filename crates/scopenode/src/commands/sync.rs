@@ -22,6 +22,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use crossterm::event::EventStream;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
+use alloy_primitives::B256;
 use scopenode_core::{
     beacon::BeaconStatus,
     config::Config,
@@ -96,8 +97,9 @@ pub async fn run(
 
         if !dry_run {
             let (tx, _) = broadcast::channel::<StoredEvent>(1024);
+            let (headers_tx, _) = broadcast::channel::<(u64, B256, u64)>(1024);
             println!("\nSync complete. Starting servers on ports {port} (JSON-RPC) and {} (REST)...", port + 1);
-            let handle = start_server(port, db.clone())
+            let handle = start_server(port, db.clone(), tx.clone(), headers_tx.clone())
                 .await
                 .context("Failed to start JSON-RPC server")?;
             start_rest_server(port + 1, db.clone(), tx.clone())
@@ -109,7 +111,7 @@ pub async fn run(
                 let (beacon_tx, _beacon_rx) = watch::channel(BeaconStatus::NotConfigured);
                 let beacon_tx = Arc::new(beacon_tx);
                 let syncer =
-                    LiveSyncer::new(config, network, db, tx, beacon_tx, Some(data_dir.clone()));
+                    LiveSyncer::new(config, network, db, tx, headers_tx, beacon_tx, Some(data_dir.clone()));
                 tokio::select! {
                     res = syncer.run() => {
                         if let Err(e) = res { eprintln!("Live sync error: {e:#}"); }
@@ -154,6 +156,7 @@ async fn run_with_tui<N: EthNetwork + 'static>(
     let beacon_tx = Arc::new(beacon_tx);
     let mut state = AppState::new(&config, beacon_rx);
     let (broadcast_tx, mut broadcast_rx) = broadcast::channel::<StoredEvent>(1024);
+    let (headers_tx, _) = broadcast::channel::<(u64, B256, u64)>(1024);
 
     // Set up the terminal before spawning anything so any early errors go to
     // the alternate screen rather than clobbering the spinner output.
@@ -209,7 +212,7 @@ async fn run_with_tui<N: EthNetwork + 'static>(
 
                     state.push_log("Historical sync complete.".to_string());
 
-                    let handle = start_server(port, db.clone())
+                    let handle = start_server(port, db.clone(), broadcast_tx.clone(), headers_tx.clone())
                         .await
                         .context("Failed to start JSON-RPC server")?;
                     start_rest_server(port + 1, db.clone(), broadcast_tx.clone())
@@ -227,6 +230,7 @@ async fn run_with_tui<N: EthNetwork + 'static>(
                             Arc::clone(&network),
                             db.clone(),
                             broadcast_tx.clone(),
+                            headers_tx.clone(),
                             Arc::clone(&beacon_tx),
                             Some(data_dir.clone()),
                         );

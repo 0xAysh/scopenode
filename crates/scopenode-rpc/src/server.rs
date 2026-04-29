@@ -6,20 +6,27 @@
 //!
 //! All methods are backed by SQLite queries — there is no in-memory cache. For
 //! typical usage patterns (low QPS, small result sets), SQLite is fast enough.
-//! Phase 3 may add an LRU cache if needed.
 //!
 //! # Served methods
 //! - `eth_getLogs` — filtered event log query
 //! - `eth_blockNumber` — highest indexed block
 //! - `eth_chainId` — always `0x1` (Ethereum mainnet)
+//! - `eth_subscribe` — WebSocket push subscriptions: `"logs"` and `"newHeads"`
+//! - `eth_unsubscribe` — cancel a subscription (wired automatically by jsonrpsee)
+
+use std::time::Duration;
 
 use alloy::rpc::types::{Filter, Log};
 use alloy_primitives::{Address, Bytes, B256};
 use async_trait::async_trait;
-use jsonrpsee::core::RpcResult;
+use jsonrpsee::core::{to_json_raw_value, RpcResult, SubscriptionResult};
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::types::ErrorObject;
+use jsonrpsee::PendingSubscriptionSink;
+use scopenode_core::types::StoredEvent;
 use scopenode_storage::Db;
+use tokio::sync::broadcast;
+use tracing::warn;
 
 /// The subset of the Ethereum JSON-RPC API that scopenode serves.
 ///
@@ -38,6 +45,20 @@ pub trait EthApi {
     /// `eth_chainId` — return the chain ID as hex.
     #[method(name = "chainId")]
     async fn chain_id(&self) -> RpcResult<String>;
+
+    /// `eth_subscribe` — subscribe to live events or new block headers over WebSocket.
+    ///
+    /// Supported subscription types:
+    /// - `"logs"` — push each indexed event; optional filter: `{address, topics: [topic0]}`
+    /// - `"newHeads"` — push a block header for every processed block
+    ///
+    /// `eth_unsubscribe` is wired automatically by jsonrpsee.
+    #[subscription(name = "subscribe", unsubscribe = "unsubscribe", item = serde_json::Value)]
+    async fn subscribe(
+        &self,
+        sub_type: String,
+        filter: Option<serde_json::Value>,
+    ) -> SubscriptionResult;
 }
 
 /// Implementation of the Ethereum JSON-RPC interface backed by SQLite.
@@ -46,27 +67,25 @@ pub trait EthApi {
 /// delegate directly to `Db` without additional caching.
 pub struct EthApiImpl {
     db: Db,
+    broadcast: broadcast::Sender<StoredEvent>,
+    headers: broadcast::Sender<(u64, B256, u64)>,
 }
 
 impl EthApiImpl {
-    /// Create a new `EthApiImpl` backed by the given database.
-    pub fn new(db: Db) -> Self {
-        Self { db }
+    /// Create a new `EthApiImpl` backed by the given database and broadcast channels.
+    pub fn new(
+        db: Db,
+        broadcast: broadcast::Sender<StoredEvent>,
+        headers: broadcast::Sender<(u64, B256, u64)>,
+    ) -> Self {
+        Self { db, broadcast, headers }
     }
 }
 
 #[async_trait]
 impl EthApiServer for EthApiImpl {
     /// `eth_getLogs` implementation.
-    ///
-    /// Checks if the queried contract is indexed; if not, returns a clear error
-    /// message telling the user to run `scopenode status`. Translates the filter
-    /// into a SQL query and maps the results to alloy `Log` types.
-    ///
-    /// Only returns non-reorged events. Caps results at 10,000 rows to protect
-    /// against oversized responses.
     async fn get_logs(&self, filter: Filter) -> RpcResult<Vec<Log>> {
-        // Extract the first address from the filter to check if it's indexed.
         let address: Option<Address> = filter.address.iter().next().copied();
 
         let in_scope = if let Some(addr) = address {
@@ -86,11 +105,6 @@ impl EthApiServer for EthApiImpl {
         let from_block = filter.get_from_block();
         let to_block = filter.get_to_block();
 
-        // Extract topic0 from the filter if provided — used to narrow the query to
-        // a specific event type. topic0 = keccak256(event signature), e.g. for
-        // Transfer(address,address,uint256) it's 0xddf252ad...
-        // If multiple topic0 values are given (OR semantics), we take the first only —
-        // multi-topic OR queries are rare and add significant query complexity.
         let topic0_str: Option<String> = filter
             .topics
             .first()
@@ -101,12 +115,12 @@ impl EthApiServer for EthApiImpl {
             .db
             .query_events_for_filter(
                 contract_str.as_deref(),
-                None,           // event_name: JSON-RPC uses topic0, not name
+                None,
                 topic0_str.as_deref(),
                 from_block,
                 to_block,
-                10_000, // Safety cap: prevent response size explosions.
-                0,      // offset: not used from JSON-RPC path
+                10_000,
+                0,
             )
             .await
             .map_err(|e| internal_error(&e.to_string()))?;
@@ -120,9 +134,6 @@ impl EthApiServer for EthApiImpl {
     }
 
     /// `eth_blockNumber` — return the highest block number in our headers table.
-    ///
-    /// The value reflects how far scopenode has synced, not the current chain tip.
-    /// Returned as a `0x`-prefixed hex string per the Ethereum JSON-RPC spec.
     async fn block_number(&self) -> RpcResult<String> {
         let n = self
             .db
@@ -133,19 +144,162 @@ impl EthApiServer for EthApiImpl {
     }
 
     /// `eth_chainId` — always returns `0x1` (Ethereum mainnet).
-    ///
-    /// Phase 2 could make this dynamic based on the config. For now, scopenode
-    /// only supports mainnet (chain ID 1).
     async fn chain_id(&self) -> RpcResult<String> {
         Ok("0x1".into())
     }
+
+    /// `eth_subscribe` — WebSocket push subscriptions.
+    ///
+    /// Dispatches to the appropriate broadcast channel based on `sub_type`.
+    /// Slow clients that lag more than the channel capacity will miss events
+    /// but the subscription stays open (matching the SSE policy in rest.rs).
+    async fn subscribe(
+        &self,
+        pending: PendingSubscriptionSink,
+        sub_type: String,
+        filter: Option<serde_json::Value>,
+    ) -> SubscriptionResult {
+        match sub_type.as_str() {
+            "logs" => {
+                let sink = pending.accept().await?;
+                let mut rx = self.broadcast.subscribe();
+
+                // Parse optional address and topic0 filters; normalize to lowercase.
+                let addr_filter = filter
+                    .as_ref()
+                    .and_then(|f| f["address"].as_str())
+                    .map(|s| s.to_lowercase());
+                let topic0_filter = filter
+                    .as_ref()
+                    .and_then(|f| f["topics"][0].as_str())
+                    .map(|s| s.to_lowercase());
+
+                loop {
+                    let event = match rx.recv().await {
+                        Ok(e) => e,
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            warn!(n, "eth_subscribe logs: subscriber lagged, events dropped");
+                            continue;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    };
+
+                    if !logs_matches(&event, addr_filter.as_deref(), topic0_filter.as_deref()) {
+                        continue;
+                    }
+
+                    let val = event_to_log_json(&event);
+                    let msg = match to_json_raw_value(&val) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            warn!("eth_subscribe logs: serialization error: {e}");
+                            continue;
+                        }
+                    };
+                    if sink.send_timeout(msg, Duration::from_secs(5)).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            "newHeads" => {
+                let sink = pending.accept().await?;
+                let mut rx = self.headers.subscribe();
+                // Per-subscriber state — not shared across concurrent subscribers.
+                let mut last_seen_block: u64 = 0;
+
+                loop {
+                    let (block_number, block_hash, timestamp) = match rx.recv().await {
+                        Ok(h) => h,
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            warn!(n, "eth_subscribe newHeads: subscriber lagged, headers dropped");
+                            continue;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    };
+
+                    if block_number <= last_seen_block {
+                        continue;
+                    }
+                    last_seen_block = block_number;
+
+                    let val = serde_json::json!({
+                        "blockNumber": format!("0x{:x}", block_number),
+                        "blockHash":   format!("{:?}", block_hash),
+                        "timestamp":   format!("0x{:x}", timestamp),
+                    });
+                    let msg = match to_json_raw_value(&val) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            warn!("eth_subscribe newHeads: serialization error: {e}");
+                            continue;
+                        }
+                    };
+                    if sink.send_timeout(msg, Duration::from_secs(5)).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            other => {
+                pending
+                    .reject(ErrorObject::owned(
+                        -32602,
+                        format!("unsupported subscription type: {other:?}"),
+                        None::<()>,
+                    ))
+                    .await;
+            }
+        }
+
+        Ok(())
+    }
 }
 
-/// JSON-RPC error returned when the queried contract hasn't been indexed.
+// ── Filter helper ─────────────────────────────────────────────────────────────
+
+/// Returns `true` when `event` passes the optional address and topic0 filters.
 ///
-/// Error code `-32000` is in the standard range for application-level errors
-/// (as opposed to protocol errors like `-32700` parse error or `-32601` method
-/// not found). The message is intentionally actionable.
+/// Both comparisons are case-insensitive (caller must pass lowercased filters).
+fn logs_matches(
+    event: &StoredEvent,
+    addr_filter: Option<&str>,
+    topic0_filter: Option<&str>,
+) -> bool {
+    if let Some(addr) = addr_filter {
+        if event.contract.to_checksum(None).to_lowercase() != addr {
+            return false;
+        }
+    }
+    if let Some(t0) = topic0_filter {
+        if format!("{:?}", event.topic0).to_lowercase() != t0 {
+            return false;
+        }
+    }
+    true
+}
+
+// ── Serialization helpers ─────────────────────────────────────────────────────
+
+/// Serialize a core `StoredEvent` into the Ethereum `eth_getLogs` Log JSON shape.
+fn event_to_log_json(event: &StoredEvent) -> serde_json::Value {
+    let topics: Vec<String> = std::iter::once(format!("{:?}", event.topic0))
+        .chain(event.raw_topics.iter().skip(1).map(|t| format!("{:?}", t)))
+        .collect();
+
+    serde_json::json!({
+        "address":          event.contract.to_checksum(None),
+        "topics":           topics,
+        "data":             format!("0x{}", hex::encode(&event.raw_data)),
+        "blockNumber":      format!("0x{:x}", event.block_number),
+        "blockHash":        format!("{:?}", event.block_hash),
+        "transactionHash":  format!("{:?}", event.tx_hash),
+        "transactionIndex": format!("0x{:x}", event.tx_index),
+        "logIndex":         format!("0x{:x}", event.log_index),
+        "removed":          false,
+    })
+}
+
+// ── JSON-RPC error helpers ────────────────────────────────────────────────────
+
 fn not_indexed_error() -> ErrorObject<'static> {
     ErrorObject::owned(
         -32000,
@@ -154,18 +308,13 @@ fn not_indexed_error() -> ErrorObject<'static> {
     )
 }
 
-/// JSON-RPC internal error (`-32603`) for unexpected failures.
-///
-/// Used when a DB query fails unexpectedly. The error message includes the
-/// underlying cause for debugging.
 fn internal_error(msg: &str) -> ErrorObject<'static> {
     ErrorObject::owned(-32603, format!("Internal error: {msg}"), None::<()>)
 }
 
+// ── row_to_log (for eth_getLogs) ──────────────────────────────────────────────
+
 /// Convert a [`StoredEvent`] row from SQLite into an alloy [`Log`] type.
-///
-/// Returns `None` if any field can't be parsed (e.g. a corrupt hex string in the DB).
-/// Well-formed data should never fail here since the pipeline validates fields on insert.
 fn row_to_log(row: &scopenode_storage::models::StoredEvent) -> Option<Log> {
     use alloy::primitives::LogData;
 
@@ -173,19 +322,15 @@ fn row_to_log(row: &scopenode_storage::models::StoredEvent) -> Option<Log> {
     let tx_hash: B256 = row.tx_hash.parse().ok()?;
     let block_hash: B256 = row.block_hash.parse().ok()?;
 
-    // Parse topics from the JSON array stored in raw_topics.
-    // The array contains hex strings like ["0xddf252...", "0x0000...sender", ...].
     let topics: Vec<B256> = serde_json::from_str::<Vec<String>>(&row.raw_topics)
         .ok()?
         .iter()
         .filter_map(|t| t.parse().ok())
         .collect();
 
-    // Parse the raw ABI-encoded data from its hex string representation.
     let data_bytes = alloy_primitives::hex::decode(&row.raw_data).unwrap_or_default();
     let data = Bytes::from(data_bytes);
 
-    // `LogData::new` validates that topics.len() <= 4 (EVM constraint).
     let log_data = LogData::new(topics, data)?;
 
     let inner_log = alloy::primitives::Log {
@@ -203,4 +348,101 @@ fn row_to_log(row: &scopenode_storage::models::StoredEvent) -> Option<Log> {
         log_index: Some(row.log_index as u64),
         removed: false,
     })
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::{Address, Bytes};
+    use tokio::sync::broadcast;
+
+    fn make_event(contract: Address, event_name: &str, topic0: B256) -> StoredEvent {
+        StoredEvent {
+            contract,
+            event_name: event_name.to_string(),
+            topic0,
+            block_number: 1,
+            block_hash: B256::ZERO,
+            tx_hash: B256::ZERO,
+            tx_index: 0,
+            log_index: 0,
+            raw_topics: vec![topic0],
+            raw_data: Bytes::default(),
+            decoded: serde_json::json!({}),
+            source: "devp2p".to_string(),
+            timestamp: 0,
+        }
+    }
+
+    #[test]
+    fn logs_matches_no_filter_passes_all() {
+        let addr: Address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".parse().unwrap();
+        let ev = make_event(addr, "Transfer", B256::ZERO);
+        assert!(logs_matches(&ev, None, None));
+    }
+
+    #[test]
+    fn logs_matches_address_filter_passes_exact() {
+        let addr: Address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".parse().unwrap();
+        let ev = make_event(addr, "Transfer", B256::ZERO);
+        let filter = addr.to_checksum(None).to_lowercase();
+        assert!(logs_matches(&ev, Some(&filter), None));
+    }
+
+    #[test]
+    fn logs_matches_address_filter_blocks_other() {
+        let addr: Address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".parse().unwrap();
+        let other = "0x0000000000000000000000000000000000000001";
+        let ev = make_event(addr, "Transfer", B256::ZERO);
+        assert!(!logs_matches(&ev, Some(other), None));
+    }
+
+    #[test]
+    fn logs_matches_topic0_filter_passes_matching() {
+        let addr: Address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".parse().unwrap();
+        let topic0 = B256::from([1u8; 32]);
+        let ev = make_event(addr, "Transfer", topic0);
+        let filter = format!("{:?}", topic0).to_lowercase();
+        assert!(logs_matches(&ev, None, Some(&filter)));
+    }
+
+    #[test]
+    fn logs_matches_topic0_filter_blocks_other() {
+        let addr: Address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".parse().unwrap();
+        let topic0 = B256::from([1u8; 32]);
+        let other_t0 = B256::from([2u8; 32]);
+        let ev = make_event(addr, "Transfer", topic0);
+        let filter = format!("{:?}", other_t0).to_lowercase();
+        assert!(!logs_matches(&ev, None, Some(&filter)));
+    }
+
+    #[test]
+    fn event_to_log_json_has_expected_keys() {
+        let addr: Address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".parse().unwrap();
+        let ev = make_event(addr, "Transfer", B256::ZERO);
+        let json = event_to_log_json(&ev);
+        for key in &["address", "topics", "data", "blockNumber", "blockHash",
+                     "transactionHash", "transactionIndex", "logIndex", "removed"] {
+            assert!(json.get(key).is_some(), "missing key: {key}");
+        }
+        assert_eq!(json["removed"], false);
+        assert_eq!(json["blockNumber"], "0x1");
+    }
+
+    /// Broadcast channel fans events to all subscribers (including WS subscriptions).
+    #[tokio::test]
+    async fn broadcast_fan_out_reaches_all_ws_subscribers() {
+        let addr: Address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".parse().unwrap();
+        let (tx, mut rx1) = broadcast::channel::<StoredEvent>(8);
+        let mut rx2 = tx.subscribe();
+
+        tx.send(make_event(addr, "Transfer", B256::ZERO)).unwrap();
+
+        let e1 = rx1.recv().await.unwrap();
+        let e2 = rx2.recv().await.unwrap();
+        assert_eq!(e1.event_name, "Transfer");
+        assert_eq!(e2.event_name, "Transfer");
+    }
 }

@@ -278,6 +278,20 @@ fn sse_matches(ev: &LiveEvent, contract_filter: Option<&str>, event_filter: Opti
 
 // ── Server startup ────────────────────────────────────────────────────────────
 
+/// Build the REST API router without binding a port — used in integration tests.
+#[doc(hidden)]
+pub fn build_rest_router(db: Db, broadcast: broadcast::Sender<LiveEvent>) -> Router {
+    let state = Arc::new(AppState { db, broadcast });
+    Router::new()
+        .route("/events", get(get_events))
+        .route("/status", get(get_status))
+        .route("/contracts", get(get_contracts))
+        .route("/abi/:address", get(get_abi))
+        .route("/stream/events", get(stream_events))
+        .layer(CorsLayer::permissive())
+        .with_state(state)
+}
+
 /// Start the REST API server on `127.0.0.1:<port>`.
 ///
 /// The server runs as a background tokio task for the process lifetime.
