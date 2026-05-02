@@ -42,7 +42,7 @@ use ratatui::{
     layout::{Constraint, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Gauge, List, ListItem, Paragraph},
+    widgets::{Block, Borders, Gauge, Paragraph},
     Frame, Terminal,
 };
 use scopenode_core::{beacon::BeaconStatus, config::Config, types::StoredEvent};
@@ -57,12 +57,11 @@ pub enum SyncMode {
     Live,
 }
 
-/// Which view is shown in the right panel of the TUI body.
+/// Which view is shown in the activity section of the TUI body.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum Panel {
     #[default]
     Events,
-    PeerList,
     Logs,
 }
 
@@ -78,6 +77,7 @@ pub struct AppState {
     pub blocks_per_sec: f64,
     pub peer_count: usize,
     pub retry_count: i64,
+    #[allow(dead_code)]
     pub reorg_count: u64,
     pub contract_stats: Vec<ContractStat>,
     pub recent_events: VecDeque<StoredEvent>,
@@ -199,12 +199,11 @@ pub fn is_quit_event(ev: &Event) -> bool {
     )
 }
 
-/// Returns the [`Panel`] to switch to for panel-toggle keys (`p`, `l`, `r`),
+/// Returns the [`Panel`] to switch to for panel-toggle keys (`l`, `r`),
 /// or `None` for any other key event.
 pub fn handle_key_event(ev: &Event) -> Option<Panel> {
     if let Event::Key(key) = ev {
         match key.code {
-            KeyCode::Char('p') | KeyCode::Char('P') => Some(Panel::PeerList),
             KeyCode::Char('l') | KeyCode::Char('L') => Some(Panel::Logs),
             KeyCode::Char('r') | KeyCode::Char('R') => Some(Panel::Events),
             _ => None,
@@ -216,52 +215,70 @@ pub fn handle_key_event(ev: &Event) -> Option<Panel> {
 
 // ── Rendering ─────────────────────────────────────────────────────────────────
 
+/// Top-level render: single-column, no borders.
+///
+/// Layout (rows):
+///   [0]  header   — mode indicator + live stats
+///   [1]  rule     — ─── separator
+///   [2]  body     — contracts then activity feed, flex height
+///   [3]  rule     — ─── separator
+///   [4]  gauge    — progress bar
+///   [5]  footer   — peers · reorgs · retries
+///   [6]  hints    — key bindings
 pub fn render(f: &mut Frame, state: &AppState, config: &Config) {
     let area = f.area();
 
-    let outer = Block::default().borders(Borders::ALL).title(" scopenode ");
-    let inner = outer.inner(area);
-    f.render_widget(outer, area);
-
-    let layout = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(0),
-        Constraint::Length(4),
+    let rows = Layout::vertical([
+        Constraint::Length(1), // header
+        Constraint::Length(1), // rule
+        Constraint::Min(0),    // body
+        Constraint::Length(1), // rule
+        Constraint::Length(1), // gauge
+        Constraint::Length(1), // footer
+        Constraint::Length(1), // hints
     ])
-    .split(inner);
+    .split(area);
 
-    render_header(f, layout[0], state);
-    render_body(f, layout[1], state);
-    render_footer(f, layout[2], state, config);
+    render_header(f, rows[0], state);
+    render_rule(f, rows[1], area.width);
+    render_body(f, rows[2], state);
+    render_rule(f, rows[3], area.width);
+    render_gauge(f, rows[4], state, config);
+    render_footer(f, rows[5], state);
+    render_hints(f, rows[6], state);
 }
 
 fn render_header(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
-    let (mode_str, mode_style) = match state.mode {
+    let (indicator, mode_style) = match state.mode {
         SyncMode::Historical => (
-            "HISTORICAL",
+            "▸ HISTORICAL",
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         ),
         SyncMode::Live => (
-            "LIVE      ",
+            "● LIVE",
             Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
         ),
     };
 
+    let (beacon_label, beacon_color) = beacon_label_and_color(&state.beacon_status);
+
     let mut spans = vec![
-        Span::raw("Mode: "),
-        Span::styled(mode_str, mode_style),
-        Span::raw(format!(
-            "   Block: {:>13}   Speed: {:>7.1} blk/s   Peers: {}",
-            fmt_block(state.current_block),
-            state.blocks_per_sec,
-            state.peer_count,
-        )),
+        Span::styled(" scopenode  ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(indicator, mode_style),
+        Span::styled(
+            format!("  ·  {}", fmt_block(state.current_block)),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  ·  {:.1} blk/s", state.blocks_per_sec),
+            Style::default().fg(Color::Cyan),
+        ),
+        Span::raw(format!("  ·  {} peers", state.peer_count)),
     ];
 
-    if area.width >= 100 {
-        let (label, color) = beacon_label_and_color(&state.beacon_status);
-        spans.push(Span::raw("   beacon: "));
-        spans.push(Span::styled(label, Style::default().fg(color)));
+    if area.width >= 90 {
+        spans.push(Span::styled("  ·  beacon: ", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(beacon_label, Style::default().fg(beacon_color)));
     }
 
     f.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -270,7 +287,7 @@ fn render_header(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
 /// Map a `BeaconStatus` to a short label and ratatui color for the TUI header.
 fn beacon_label_and_color(s: &BeaconStatus) -> (&'static str, Color) {
     match s {
-        BeaconStatus::NotConfigured => ("not configured", Color::DarkGray),
+        BeaconStatus::NotConfigured => ("off", Color::DarkGray),
         BeaconStatus::Syncing { .. } => ("syncing", Color::Yellow),
         BeaconStatus::Synced { .. } => ("synced", Color::Green),
         BeaconStatus::Stalled { .. } => ("stalled", Color::LightYellow),
@@ -279,121 +296,86 @@ fn beacon_label_and_color(s: &BeaconStatus) -> (&'static str, Color) {
     }
 }
 
+fn render_rule(f: &mut Frame, area: ratatui::layout::Rect, width: u16) {
+    let line = "─".repeat(width as usize);
+    f.render_widget(
+        Paragraph::new(Span::styled(line, Style::default().fg(Color::DarkGray))),
+        area,
+    );
+}
+
 fn render_body(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
-    let cols = Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)])
-        .split(area);
+    f.render_widget(Paragraph::new(build_body_lines(state)), area);
+}
 
-    // Contracts panel (always visible on the left)
-    let mut items: Vec<ListItem> = Vec::new();
+/// Build all body lines in a single pass: contracts, then activity feed.
+///
+/// Activity section appended only when there is content:
+/// - LIVE + Events panel: recent events list
+/// - Any mode + Logs panel: log ring buffer
+/// - HISTORICAL + Events panel: nothing (feed is naturally empty)
+pub(crate) fn build_body_lines(state: &AppState) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // Contract stats
     for stat in &state.contract_stats {
-        let label = stat.name.as_deref().unwrap_or(&stat.address);
-        items.push(ListItem::new(Line::from(Span::styled(
-            label.to_string(),
-            Style::default().add_modifier(Modifier::BOLD),
-        ))));
+        let label = stat.name.as_deref().unwrap_or(&stat.address).to_owned();
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(label, Style::default().add_modifier(Modifier::BOLD)),
+        ]));
         for (name, count) in &stat.events {
-            items.push(ListItem::new(format!("  {:<16} {:>10} evts", name, count)));
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("    {:<14}", name),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(
+                    format!("{:>10}", fmt_num(*count as u64)),
+                    Style::default().fg(Color::White),
+                ),
+            ]));
         }
+        lines.push(Line::from(""));
     }
-    f.render_widget(
-        List::new(items).block(Block::default().title(" Contracts ").borders(Borders::ALL)),
-        cols[0],
-    );
 
-    // Right panel — switches based on state.panel
-    match state.panel {
-        Panel::Events => render_right_events(f, cols[1], state),
-        Panel::PeerList => render_right_peers(f, cols[1], state),
-        Panel::Logs => render_right_logs(f, cols[1], state),
+    // Activity feed
+    match (&state.mode, &state.panel) {
+        (SyncMode::Live, Panel::Events) if !state.recent_events.is_empty() => {
+            lines.push(Line::from(""));
+            for ev in state.recent_events.iter().rev() {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("  {:>13}  ", fmt_block(ev.block_number)),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(ev.event_name.clone(), Style::default().fg(Color::White)),
+                ]));
+            }
+        }
+        (_, Panel::Logs) => {
+            lines.push(Line::from(""));
+            if state.log_lines.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "  no log entries yet",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            } else {
+                for line in state.log_lines.iter().rev() {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {line}"),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+            }
+        }
+        _ => {}
     }
+
+    lines
 }
 
-fn render_right_events(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
-    let items: Vec<ListItem> = state
-        .recent_events
-        .iter()
-        .rev()
-        .map(|ev| {
-            ListItem::new(format!(
-                "{:>13}  {}",
-                fmt_block(ev.block_number),
-                ev.event_name
-            ))
-        })
-        .collect();
-    f.render_widget(
-        List::new(items)
-            .block(Block::default().title(" Recent Events ").borders(Borders::ALL)),
-        area,
-    );
-}
-
-fn render_right_peers(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
-    let text = vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            format!("  Connected peers: {}", state.peer_count),
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            "  Per-peer detail not yet tracked.",
-            Style::default().fg(Color::DarkGray),
-        )),
-        Line::from(Span::styled(
-            "  Press r to return to Recent Events.",
-            Style::default().fg(Color::DarkGray),
-        )),
-    ];
-    f.render_widget(
-        Paragraph::new(text)
-            .block(Block::default().title(" Peer List ").borders(Borders::ALL)),
-        area,
-    );
-}
-
-fn render_right_logs(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
-    let items: Vec<ListItem> = if state.log_lines.is_empty() {
-        vec![ListItem::new(Span::styled(
-            "  No log entries yet.",
-            Style::default().fg(Color::DarkGray),
-        ))]
-    } else {
-        state
-            .log_lines
-            .iter()
-            .rev()
-            .map(|line| ListItem::new(format!("  {line}")))
-            .collect()
-    };
-    f.render_widget(
-        List::new(items).block(Block::default().title(" Logs ").borders(Borders::ALL)),
-        area,
-    );
-}
-
-fn render_footer(
-    f: &mut Frame,
-    area: ratatui::layout::Rect,
-    state: &AppState,
-    config: &Config,
-) {
-    let rows = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .split(area);
-
-    f.render_widget(
-        Paragraph::new(format!(
-            "Peers: {:>3}   Reorgs: {}   Retries: {}",
-            state.peer_count, state.reorg_count, state.retry_count,
-        )),
-        rows[0],
-    );
-
+fn render_gauge(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState, config: &Config) {
     let (ratio, label) = sync_progress(state, config);
     let gauge_style = match state.mode {
         SyncMode::Historical => Style::default().fg(Color::Yellow),
@@ -401,18 +383,39 @@ fn render_footer(
     };
     f.render_widget(
         Gauge::default()
+            .block(Block::default().borders(Borders::NONE))
             .gauge_style(gauge_style)
             .ratio(ratio)
             .label(label),
-        rows[1],
+        area,
     );
+}
 
+fn render_footer(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "q quit · p peers · l logs · r events",
+            format!(
+                " peers {}  ·  reorgs {}  ·  retries {}",
+                state.peer_count, state.reorg_count, state.retry_count,
+            ),
             Style::default().fg(Color::DarkGray),
         ))),
-        rows[3],
+        area,
+    );
+}
+
+fn render_hints(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
+    let text = if state.panel == Panel::Logs {
+        " q quit  ·  l logs  ·  r events"
+    } else {
+        " q quit  ·  l logs"
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            text,
+            Style::default().fg(Color::DarkGray),
+        ))),
+        area,
     );
 }
 
@@ -447,7 +450,7 @@ mod tests {
     #[test]
     fn beacon_label_not_configured() {
         let (label, color) = beacon_label_and_color(&BeaconStatus::NotConfigured);
-        assert_eq!(label, "not configured");
+        assert_eq!(label, "off");
         assert_eq!(color, Color::DarkGray);
     }
 
@@ -489,6 +492,161 @@ mod tests {
         assert_eq!(label, "unverified");
         assert_eq!(color, Color::Red);
     }
+
+    // ── handle_key_event ──────────────────────────────────────────────────────
+
+    fn key_event(code: KeyCode) -> Event {
+        Event::Key(crossterm::event::KeyEvent::new(
+            code,
+            crossterm::event::KeyModifiers::NONE,
+        ))
+    }
+
+    #[test]
+    fn key_l_returns_logs() {
+        assert_eq!(handle_key_event(&key_event(KeyCode::Char('l'))), Some(Panel::Logs));
+    }
+
+    #[test]
+    fn key_r_returns_events() {
+        assert_eq!(handle_key_event(&key_event(KeyCode::Char('r'))), Some(Panel::Events));
+    }
+
+    #[test]
+    fn key_p_returns_none() {
+        assert_eq!(handle_key_event(&key_event(KeyCode::Char('p'))), None);
+    }
+
+    #[test]
+    fn key_unknown_returns_none() {
+        assert_eq!(handle_key_event(&key_event(KeyCode::Char('x'))), None);
+    }
+
+    // ── fmt_num ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn fmt_num_zero_shows_zero() {
+        assert_eq!(fmt_num(0), "0");
+    }
+
+    #[test]
+    fn fmt_num_formats_with_commas() {
+        assert_eq!(fmt_num(12431), "12,431");
+    }
+
+    // ── build_body_lines ──────────────────────────────────────────────────────
+
+    fn make_state(mode: SyncMode, panel: Panel) -> AppState {
+        use scopenode_core::beacon::BeaconStatus;
+        let (_tx, rx) = tokio::sync::watch::channel(BeaconStatus::NotConfigured);
+        let mut s = AppState {
+            mode,
+            current_block: 0,
+            blocks_per_sec: 0.0,
+            peer_count: 0,
+            retry_count: 0,
+            reorg_count: 0,
+            contract_stats: vec![ContractStat {
+                name: Some("TestContract".to_string()),
+                address: "0xabc".to_string(),
+                events: vec![
+                    ("Swap".to_string(), 12431),
+                    ("Mint".to_string(), 0),
+                ],
+            }],
+            recent_events: std::collections::VecDeque::new(),
+            log_lines: std::collections::VecDeque::new(),
+            panel,
+            beacon_status: BeaconStatus::NotConfigured,
+            beacon_status_rx: rx,
+            speed_sample: (std::time::Instant::now(), 0),
+        };
+        s.panel = s.panel.clone(); // satisfy borrow
+        s
+    }
+
+    #[test]
+    fn body_contains_contract_name_and_counts() {
+        let state = make_state(SyncMode::Historical, Panel::Events);
+        let lines = build_body_lines(&state);
+        let text: String = lines.iter().flat_map(|l| l.spans.iter().map(|s| s.content.as_ref())).collect::<Vec<_>>().join("");
+        assert!(text.contains("TestContract"), "contract name missing");
+        assert!(text.contains("12,431"), "Swap count missing");
+        assert!(text.contains("0"), "Mint zero count missing");
+    }
+
+    #[test]
+    fn body_historical_events_panel_has_no_feed() {
+        let state = make_state(SyncMode::Historical, Panel::Events);
+        let lines = build_body_lines(&state);
+        // No feed rows — only contract block (name + 2 events + blank = 4 lines)
+        assert_eq!(lines.len(), 4);
+    }
+
+    #[test]
+    fn body_live_events_panel_empty_feed_has_no_feed_rows() {
+        let state = make_state(SyncMode::Live, Panel::Events);
+        // recent_events is empty → no feed section appended
+        let lines = build_body_lines(&state);
+        assert_eq!(lines.len(), 4);
+    }
+
+    #[test]
+    fn body_live_events_panel_with_events_appends_feed() {
+        let mut state = make_state(SyncMode::Live, Panel::Events);
+        use alloy_primitives::{Address, Bytes, B256};
+        state.push_event(StoredEvent {
+            contract: Address::ZERO,
+            event_name: "Swap".to_string(),
+            topic0: B256::ZERO,
+            block_number: 24_580_142,
+            block_hash: B256::ZERO,
+            tx_hash: B256::ZERO,
+            tx_index: 0,
+            log_index: 0,
+            raw_topics: vec![],
+            raw_data: Bytes::new(),
+            decoded: serde_json::Value::Null,
+            source: "rpc".to_string(),
+            timestamp: 0,
+        });
+        let lines = build_body_lines(&state);
+        // 4 contract lines + 1 blank separator + 1 event row = 6
+        assert_eq!(lines.len(), 6);
+        let last = lines.last().unwrap();
+        let text: String = last.spans.iter().map(|s| s.content.as_ref()).collect::<Vec<_>>().join("");
+        assert!(text.contains("Swap"), "event name missing in feed");
+    }
+
+    #[test]
+    fn body_logs_panel_shows_logs_in_historical_mode() {
+        let mut state = make_state(SyncMode::Historical, Panel::Logs);
+        state.push_log("peer connected".to_string());
+        let lines = build_body_lines(&state);
+        // 4 contract lines + 1 blank separator + 1 log row = 6
+        assert_eq!(lines.len(), 6);
+        let last = lines.last().unwrap();
+        let text: String = last.spans.iter().map(|s| s.content.as_ref()).collect::<Vec<_>>().join("");
+        assert!(text.contains("peer connected"));
+    }
+
+    #[test]
+    fn body_logs_panel_empty_shows_placeholder() {
+        let state = make_state(SyncMode::Historical, Panel::Logs);
+        let lines = build_body_lines(&state);
+        // 4 contract lines + 1 blank + 1 placeholder = 6
+        assert_eq!(lines.len(), 6);
+        let last_text: String = lines.last().unwrap().spans.iter().map(|s| s.content.as_ref()).collect::<Vec<_>>().join("");
+        assert!(last_text.contains("no log entries yet"));
+    }
+}
+
+/// Format any u64 with comma separators: 12431 → "12,431". Zero shows as "0".
+fn fmt_num(n: u64) -> String {
+    if n == 0 {
+        return "0".to_string();
+    }
+    fmt_block(n)
 }
 
 /// Format a block number with comma separators: 19842301 → "19,842,301".
