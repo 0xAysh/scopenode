@@ -255,7 +255,11 @@ pub fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Re
 }
 
 /// Returns `true` if the event should quit the TUI (q, Q, or Ctrl+C).
-pub fn is_quit_event(ev: &Event) -> bool {
+/// Always returns `false` in Command mode so typing 'q' doesn't exit.
+pub fn is_quit_event(ev: &Event, input_mode: &InputMode) -> bool {
+    if *input_mode != InputMode::Normal {
+        return false;
+    }
     matches!(
         ev,
         Event::Key(key)
@@ -265,17 +269,63 @@ pub fn is_quit_event(ev: &Event) -> bool {
     )
 }
 
-/// Returns the [`Panel`] to switch to for panel-toggle keys (`l`, `r`),
-/// or `None` for any other key event.
-pub fn handle_key_event(ev: &Event) -> Option<Panel> {
+/// Returns the [`Panel`] to switch to for panel-toggle keys (`l`, `r`, `Esc`),
+/// or `None` in Command mode or for unrecognised keys.
+pub fn handle_key_event(ev: &Event, input_mode: &InputMode, panel: &Panel) -> Option<Panel> {
+    if *input_mode != InputMode::Normal {
+        return None;
+    }
     if let Event::Key(key) = ev {
         match key.code {
             KeyCode::Char('l') | KeyCode::Char('L') => Some(Panel::Logs),
             KeyCode::Char('r') | KeyCode::Char('R') => Some(Panel::Events),
+            KeyCode::Esc if matches!(panel, Panel::Results { .. }) => Some(Panel::Events),
             _ => None,
         }
     } else {
         None
+    }
+}
+
+/// Actions returned by the command-mode input handler.
+pub enum CommandInput {
+    /// Append a printable character to the buffer.
+    Append(char),
+    /// Delete the last character.
+    Pop,
+    /// Submit the current buffer for execution.
+    Submit(String),
+    /// Cancel without executing.
+    Cancel,
+    /// No action (unrecognised key or buf at capacity).
+    Ignored,
+}
+
+/// Route a key event while in Command mode.
+///
+/// `max_len` caps the input buffer (pass `terminal_width - 3`).
+pub fn handle_command_input(ev: &Event, buf: &str, max_len: usize) -> CommandInput {
+    let Event::Key(key) = ev else {
+        return CommandInput::Ignored;
+    };
+    match key.code {
+        KeyCode::Enter => CommandInput::Submit(buf.to_owned()),
+        KeyCode::Esc => CommandInput::Cancel,
+        KeyCode::Backspace => {
+            if buf.is_empty() {
+                CommandInput::Ignored
+            } else {
+                CommandInput::Pop
+            }
+        }
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if buf.len() < max_len {
+                CommandInput::Append(c)
+            } else {
+                CommandInput::Ignored
+            }
+        }
+        _ => CommandInput::Ignored,
     }
 }
 
@@ -595,22 +645,80 @@ mod tests {
 
     #[test]
     fn key_l_returns_logs() {
-        assert_eq!(handle_key_event(&key_event(KeyCode::Char('l'))), Some(Panel::Logs));
+        assert_eq!(handle_key_event(&key_event(KeyCode::Char('l')), &InputMode::Normal, &Panel::Events), Some(Panel::Logs));
     }
 
     #[test]
     fn key_r_returns_events() {
-        assert_eq!(handle_key_event(&key_event(KeyCode::Char('r'))), Some(Panel::Events));
+        assert_eq!(handle_key_event(&key_event(KeyCode::Char('r')), &InputMode::Normal, &Panel::Logs), Some(Panel::Events));
     }
 
     #[test]
     fn key_p_returns_none() {
-        assert_eq!(handle_key_event(&key_event(KeyCode::Char('p'))), None);
+        assert_eq!(handle_key_event(&key_event(KeyCode::Char('p')), &InputMode::Normal, &Panel::Events), None);
     }
 
     #[test]
     fn key_unknown_returns_none() {
-        assert_eq!(handle_key_event(&key_event(KeyCode::Char('x'))), None);
+        assert_eq!(handle_key_event(&key_event(KeyCode::Char('x')), &InputMode::Normal, &Panel::Events), None);
+    }
+
+    #[test]
+    fn key_event_ignored_in_command_mode() {
+        assert_eq!(handle_key_event(&key_event(KeyCode::Char('l')), &InputMode::Command { buf: String::new() }, &Panel::Events), None);
+    }
+
+    #[test]
+    fn esc_dismisses_results_panel() {
+        assert_eq!(
+            handle_key_event(
+                &key_event(KeyCode::Esc),
+                &InputMode::Normal,
+                &Panel::Results { lines: vec![], scroll: 0, prev: Box::new(Panel::Events) },
+            ),
+            Some(Panel::Events),
+        );
+    }
+
+    // ── handle_command_input ──────────────────────────────────────────────────
+
+    fn ctrl_key(code: KeyCode) -> Event {
+        Event::Key(crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::CONTROL))
+    }
+
+    #[test]
+    fn command_input_append_char() {
+        assert!(matches!(handle_command_input(&key_event(KeyCode::Char('q')), "", 80), CommandInput::Append('q')));
+    }
+
+    #[test]
+    fn command_input_backspace_on_non_empty() {
+        assert!(matches!(handle_command_input(&key_event(KeyCode::Backspace), "abc", 80), CommandInput::Pop));
+    }
+
+    #[test]
+    fn command_input_backspace_on_empty_ignored() {
+        assert!(matches!(handle_command_input(&key_event(KeyCode::Backspace), "", 80), CommandInput::Ignored));
+    }
+
+    #[test]
+    fn command_input_enter_submits() {
+        assert!(matches!(handle_command_input(&key_event(KeyCode::Enter), "query", 80), CommandInput::Submit(s) if s == "query"));
+    }
+
+    #[test]
+    fn command_input_esc_cancels() {
+        assert!(matches!(handle_command_input(&key_event(KeyCode::Esc), "foo", 80), CommandInput::Cancel));
+    }
+
+    #[test]
+    fn command_input_at_cap_ignored() {
+        assert!(matches!(handle_command_input(&key_event(KeyCode::Char('a')), "abc", 3), CommandInput::Ignored));
+    }
+
+    #[test]
+    fn command_input_ctrl_char_ignored() {
+        assert!(matches!(handle_command_input(&ctrl_key(KeyCode::Char('c')), "", 80), CommandInput::Ignored));
     }
 
     // ── fmt_num ───────────────────────────────────────────────────────────────

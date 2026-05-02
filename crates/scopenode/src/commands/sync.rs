@@ -38,7 +38,7 @@ use tokio::sync::{broadcast, watch};
 use tokio_stream::StreamExt as _;
 use tracing::info;
 
-use crate::tui::{self, AppState};
+use crate::tui::{self, AppState, CommandInput, InputMode, Panel};
 
 /// Run the `sync` command.
 pub async fn run(
@@ -134,6 +134,92 @@ pub async fn run(
         // TUI mode: clear the spinner line before entering the alternate screen.
         spinner.finish_and_clear();
         run_with_tui(config, db, network, port, has_live, data_dir).await?;
+    }
+
+    Ok(())
+}
+
+/// Process a single key event from the TUI event loop.
+///
+/// Routes to command-mode input handling or normal navigation depending on
+/// `state.input_mode`. Scroll, `:` entry, panel toggles, and Esc are all
+/// handled here. Ctrl+Z (shell pause) is handled in Unit 4.
+fn handle_key(
+    ev: &crossterm::event::Event,
+    state: &mut AppState,
+    _event_stream: &mut EventStream,
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+) -> Result<()> {
+    use crossterm::event::{Event, KeyCode};
+
+    // Command mode: route characters to the input buffer.
+    if let InputMode::Command { ref buf } = state.input_mode.clone() {
+        let term_width = terminal.size().map(|s| s.width as usize).unwrap_or(80);
+        let max_len = term_width.saturating_sub(3);
+        match tui::handle_command_input(ev, buf, max_len) {
+            CommandInput::Append(c) => {
+                if let InputMode::Command { ref mut buf } = state.input_mode {
+                    buf.push(c);
+                }
+            }
+            CommandInput::Pop => {
+                if let InputMode::Command { ref mut buf } = state.input_mode {
+                    buf.pop();
+                }
+            }
+            CommandInput::Submit(_s) => {
+                // Execution wired in Unit 3 — for now just clear input mode.
+                state.input_mode = InputMode::Normal;
+            }
+            CommandInput::Cancel => {
+                state.input_mode = InputMode::Normal;
+            }
+            CommandInput::Ignored => {}
+        }
+        return Ok(());
+    }
+
+    // Normal mode key routing.
+    let Event::Key(key) = ev else { return Ok(()); };
+
+    // Scroll results panel.
+    if let Panel::Results { ref mut scroll, ref lines, .. } = state.panel {
+        match key.code {
+            KeyCode::Up => {
+                *scroll = scroll.saturating_sub(1);
+                return Ok(());
+            }
+            KeyCode::Down => {
+                let max = (lines.len() as u16).saturating_sub(1);
+                *scroll = (*scroll + 1).min(max);
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+
+    // Enter command mode.
+    if let Event::Key(k) = ev {
+        if k.code == KeyCode::Char(':') {
+            let prev = state.panel.clone();
+            // Don't enter command mode if already in Results (use : to re-run).
+            let prev_non_results = match prev {
+                Panel::Results { prev: p, .. } => *p,
+                other => other,
+            };
+            state.input_mode = InputMode::Command { buf: String::new() };
+            let _ = prev_non_results; // prev_panel stored on Submit in Unit 3
+            return Ok(());
+        }
+    }
+
+    // Panel toggle / dismiss.
+    if let Some(panel) = tui::handle_key_event(ev, &state.input_mode, &state.panel) {
+        if matches!(panel, Panel::Events) && matches!(state.panel, Panel::Results { .. }) {
+            state.dismiss_results();
+        } else {
+            state.set_panel(panel);
+        }
     }
 
     Ok(())
@@ -249,11 +335,9 @@ async fn run_with_tui<N: EthNetwork + 'static>(
 
                 maybe_ev = event_stream.next() => {
                     match maybe_ev {
-                        Some(Ok(ref ev)) if tui::is_quit_event(ev) => break,
+                        Some(Ok(ref ev)) if tui::is_quit_event(ev, &state.input_mode) => break,
                         Some(Ok(ref ev)) => {
-                            if let Some(panel) = tui::handle_key_event(ev) {
-                                state.set_panel(panel);
-                            }
+                            handle_key(ev, &mut state, &mut event_stream, &mut terminal)?;
                         }
                         None => break,
                         _ => {}
