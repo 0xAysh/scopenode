@@ -12,7 +12,6 @@
 
 mod cli;
 mod commands;
-mod tui;
 
 use anyhow::{Context, Result};
 use clap::Parser;
