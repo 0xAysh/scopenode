@@ -62,7 +62,6 @@ pub enum SyncMode {
 pub enum InputMode {
     #[default]
     Normal,
-    #[allow(dead_code)] // wired in Unit 2
     Command { buf: String },
 }
 
@@ -75,7 +74,6 @@ pub enum Panel {
     /// Output from an inline command. Carries the result lines, a scroll
     /// offset, and the panel that was active before the command ran so
     /// `dismiss_results` can restore it exactly.
-    #[allow(dead_code)] // constructed in Unit 3
     Results {
         lines: Vec<String>,
         scroll: u16,
@@ -107,7 +105,6 @@ pub struct AppState {
     pub input_mode: InputMode,
     /// Pending command result — set when a command is dispatched, drained
     /// by the event loop when the spawned task completes.
-    #[allow(dead_code)] // read in Unit 3 event loop
     pub cmd_result_rx: Option<oneshot::Receiver<Vec<String>>>,
     /// Current beacon verification state; updated each refresh tick.
     pub beacon_status: BeaconStatus,
@@ -197,7 +194,6 @@ impl AppState {
         self.panel = panel;
     }
 
-    #[allow(dead_code)] // called in Unit 2
     /// Transition into Results state showing "running..." while a command executes.
     /// Saves the current panel so `dismiss_results` can restore it.
     pub fn start_command(&mut self, prev_panel: Panel) {
@@ -209,7 +205,6 @@ impl AppState {
         self.input_mode = InputMode::Normal;
     }
 
-    #[allow(dead_code)] // called in Unit 3
     /// Replace the result lines in the current Results panel.
     /// If the panel is not Results (race condition), creates a new Results panel.
     pub fn set_results(&mut self, lines: Vec<String>) {
@@ -225,7 +220,6 @@ impl AppState {
         }
     }
 
-    #[allow(dead_code)] // called in Unit 2
     /// Close the Results panel and restore the panel that was active before.
     /// No-op if the current panel is not Results.
     pub fn dismiss_results(&mut self) {

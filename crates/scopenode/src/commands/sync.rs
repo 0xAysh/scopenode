@@ -34,10 +34,11 @@ use scopenode_core::{
 };
 use scopenode_rpc::{start_rest_server, start_server};
 use scopenode_storage::Db;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, oneshot, watch};
 use tokio_stream::StreamExt as _;
 use tracing::info;
 
+use scopenode_core::beacon::{read_beacon_status, BeaconStatusFile};
 use crate::tui::{self, AppState, CommandInput, InputMode, Panel};
 
 /// Run the `sync` command.
@@ -139,17 +140,125 @@ pub async fn run(
     Ok(())
 }
 
+/// Execute a TUI command string and return result lines for display.
+///
+/// Only read-only subcommands (`query`, `status`, `doctor`) are accepted.
+/// All output is returned as `Vec<String>` — never printed to stdout.
+async fn execute_command(input: String, db: Db, data_dir: PathBuf) -> Vec<String> {
+    let parts: Vec<&str> = input.split_whitespace().collect();
+    let Some(&subcommand) = parts.first() else {
+        return vec!["error: empty command".to_string()];
+    };
+
+    match subcommand {
+        "query" => execute_query(&parts[1..], &db).await,
+        "status" => execute_status(&db).await,
+        "doctor" => execute_doctor(&db, &data_dir).await,
+        other => vec![format!("error: unknown or unsafe command '{other}'  (allowed: query, status, doctor)")],
+    }
+}
+
+async fn execute_query(args: &[&str], db: &Db) -> Vec<String> {
+    let mut event_name: Option<String> = None;
+    let mut contract: Option<String> = None;
+    let mut limit: usize = 20;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i] {
+            "--event" | "-e" if i + 1 < args.len() => { event_name = Some(args[i + 1].to_string()); i += 2; }
+            "--contract" | "-c" if i + 1 < args.len() => { contract = Some(args[i + 1].to_string()); i += 2; }
+            "--limit" | "-n" if i + 1 < args.len() => {
+                limit = args[i + 1].parse().unwrap_or(20);
+                i += 2;
+            }
+            _ => { i += 1; }
+        }
+    }
+
+    match db.query_events_for_filter(
+        contract.as_deref(), event_name.as_deref(), None, None, None, limit, 0,
+    ).await {
+        Ok(events) if events.is_empty() => vec!["no results".to_string()],
+        Ok(events) => {
+            let mut lines = vec![format!("─ {} result(s) ─", events.len())];
+            for ev in &events {
+                lines.push(format!("{:>13}  {}  {:.12}...", ev.block_number, ev.event_name, ev.tx_hash));
+            }
+            lines
+        }
+        Err(e) => vec![format!("error: {e}")],
+    }
+}
+
+async fn execute_status(db: &Db) -> Vec<String> {
+    let mut lines = vec!["─ status ─".to_string()];
+    match db.get_all_contracts().await {
+        Ok(contracts) => {
+            for c in &contracts {
+                let label = c.name.as_deref().unwrap_or(&c.address);
+                lines.push(format!("  {label}"));
+                match db.count_events_for_contract(&c.address).await {
+                    Ok(n) => lines.push(format!("    {n} events")),
+                    Err(e) => lines.push(format!("    error: {e}")),
+                }
+            }
+        }
+        Err(e) => lines.push(format!("error: {e}")),
+    }
+    match db.db_size_bytes().await {
+        Ok(b) => lines.push(format!("  DB size: {} KB", b / 1024)),
+        Err(e) => lines.push(format!("  DB size: error: {e}")),
+    }
+    lines
+}
+
+async fn execute_doctor(db: &Db, data_dir: &PathBuf) -> Vec<String> {
+    let mut lines = vec!["─ doctor ─".to_string()];
+
+    // Beacon status
+    match read_beacon_status(data_dir) {
+        Some(BeaconStatusFile::Synced { head_block, .. }) =>
+            lines.push(format!("  beacon: synced  block {head_block}")),
+        Some(BeaconStatusFile::Syncing { .. }) =>
+            lines.push("  beacon: syncing".to_string()),
+        Some(BeaconStatusFile::Error { message, .. }) =>
+            lines.push(format!("  beacon: error — {message}")),
+        Some(BeaconStatusFile::Stalled { consecutive_mismatches, .. }) =>
+            lines.push(format!("  beacon: stalled ({consecutive_mismatches} mismatches)")),
+        Some(BeaconStatusFile::NotConfigured { .. }) | None =>
+            lines.push("  beacon: not configured".to_string()),
+        Some(BeaconStatusFile::FallbackUnverified { .. }) =>
+            lines.push("  beacon: fallback unverified".to_string()),
+    }
+
+    // Pending retries
+    match db.count_pending_retry().await {
+        Ok(0) => lines.push("  retries: none pending".to_string()),
+        Ok(n) => lines.push(format!("  retries: {n} pending")),
+        Err(e) => lines.push(format!("  retries: error: {e}")),
+    }
+
+    // DB size
+    match db.db_size_bytes().await {
+        Ok(b) => lines.push(format!("  DB: {} KB", b / 1024)),
+        Err(e) => lines.push(format!("  DB: error: {e}")),
+    }
+
+    lines
+}
+
 /// Process a single key event from the TUI event loop.
 ///
-/// Routes to command-mode input handling or normal navigation depending on
-/// `state.input_mode`. Scroll, `:` entry, panel toggles, and Esc are all
-/// handled here. Ctrl+Z (shell pause) is handled in Unit 4.
+/// Returns `Some(command_string)` when the user submits a command for execution;
+/// the caller is responsible for spawning the async task. Returns `Ok(None)`
+/// for all other key events. Ctrl+Z (shell pause) is handled in Unit 4.
 fn handle_key(
     ev: &crossterm::event::Event,
     state: &mut AppState,
     _event_stream: &mut EventStream,
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
-) -> Result<()> {
+) -> Result<Option<String>> {
     use crossterm::event::{Event, KeyCode};
 
     // Command mode: route characters to the input buffer.
@@ -167,50 +276,50 @@ fn handle_key(
                     buf.pop();
                 }
             }
-            CommandInput::Submit(_s) => {
-                // Execution wired in Unit 3 — for now just clear input mode.
-                state.input_mode = InputMode::Normal;
+            CommandInput::Submit(s) => {
+                let prev = match state.panel.clone() {
+                    Panel::Results { prev, .. } => *prev,
+                    other => other,
+                };
+                state.start_command(prev);
+                return Ok(Some(s));
             }
             CommandInput::Cancel => {
                 state.input_mode = InputMode::Normal;
             }
             CommandInput::Ignored => {}
         }
-        return Ok(());
+        return Ok(None);
     }
 
     // Normal mode key routing.
-    let Event::Key(key) = ev else { return Ok(()); };
+    let Event::Key(key) = ev else { return Ok(None); };
 
     // Scroll results panel.
     if let Panel::Results { ref mut scroll, ref lines, .. } = state.panel {
         match key.code {
             KeyCode::Up => {
                 *scroll = scroll.saturating_sub(1);
-                return Ok(());
+                return Ok(None);
             }
             KeyCode::Down => {
                 let max = (lines.len() as u16).saturating_sub(1);
                 *scroll = (*scroll + 1).min(max);
-                return Ok(());
+                return Ok(None);
             }
             _ => {}
         }
     }
 
     // Enter command mode.
-    if let Event::Key(k) = ev {
-        if k.code == KeyCode::Char(':') {
-            let prev = state.panel.clone();
-            // Don't enter command mode if already in Results (use : to re-run).
-            let prev_non_results = match prev {
-                Panel::Results { prev: p, .. } => *p,
-                other => other,
-            };
-            state.input_mode = InputMode::Command { buf: String::new() };
-            let _ = prev_non_results; // prev_panel stored on Submit in Unit 3
-            return Ok(());
-        }
+    if key.code == KeyCode::Char(':') {
+        let prev_non_results = match state.panel.clone() {
+            Panel::Results { prev: p, .. } => *p,
+            other => other,
+        };
+        state.input_mode = InputMode::Command { buf: String::new() };
+        let _ = prev_non_results;
+        return Ok(None);
     }
 
     // Panel toggle / dismiss.
@@ -222,7 +331,7 @@ fn handle_key(
         }
     }
 
-    Ok(())
+    Ok(None)
 }
 
 /// Run the sync pipeline and live sync behind a full-screen ratatui TUI.
@@ -337,10 +446,32 @@ async fn run_with_tui<N: EthNetwork + 'static>(
                     match maybe_ev {
                         Some(Ok(ref ev)) if tui::is_quit_event(ev, &state.input_mode) => break,
                         Some(Ok(ref ev)) => {
-                            handle_key(ev, &mut state, &mut event_stream, &mut terminal)?;
+                            if let Some(cmd) = handle_key(ev, &mut state, &mut event_stream, &mut terminal)? {
+                                let db2 = db.clone();
+                                let dir2 = data_dir.clone();
+                                let (tx, rx) = oneshot::channel();
+                                tokio::spawn(async move {
+                                    let lines = execute_command(cmd, db2, dir2).await;
+                                    let _ = tx.send(lines);
+                                });
+                                state.cmd_result_rx = Some(rx);
+                            }
                         }
                         None => break,
                         _ => {}
+                    }
+                }
+
+                result = async {
+                    if let Some(ref mut rx) = state.cmd_result_rx {
+                        rx.await.ok()
+                    } else {
+                        std::future::pending().await
+                    }
+                } => {
+                    state.cmd_result_rx = None;
+                    if let Some(lines) = result {
+                        state.set_results(lines);
                     }
                 }
             }
