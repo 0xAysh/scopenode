@@ -122,7 +122,7 @@ async fn parity_topic0_filter() {
 async fn get_rpc_rows(db: &Db, topic0: Option<&str>) -> Vec<Row> {
     let (broadcast_tx, _) = broadcast::channel(8);
     let (headers_tx, _) = broadcast::channel(8);
-    let api = EthApiImpl::new(db.clone(), broadcast_tx, headers_tx);
+    let api = EthApiImpl::new(db.clone(), broadcast_tx, headers_tx, Default::default());
 
     let mut filter = Filter::new().address(ADDR);
     if let Some(t0) = topic0 {

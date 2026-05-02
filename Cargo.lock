@@ -7825,6 +7825,7 @@ dependencies = [
  "dirs 6.0.0",
  "indicatif",
  "ratatui",
+ "reqwest 0.13.2",
  "scopenode-core",
  "scopenode-rpc",
  "scopenode-storage",

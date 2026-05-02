@@ -1,10 +1,10 @@
 //! `doctor` command — check node health.
 //!
 //! Reports: DB size, pending retry queue length, event count, contract sync
-//! state, and beacon light-client status.
+//! state, beacon light-client status, and devp2p peer count (if node is running).
 
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use scopenode_core::beacon::{read_beacon_status, BeaconStatusFile};
@@ -35,9 +35,42 @@ pub async fn run(db: Db, data_dir: &Path) -> Result<()> {
         println!("  → Run `scopenode retry <config>` to re-fetch failed blocks.");
     }
 
+    println!("{}", format_peer_count(8545).await);
     println!("{}", format_beacon_status(data_dir));
 
     Ok(())
+}
+
+/// Try to fetch `net_peerCount` from the running node on `port`.
+/// Returns a one-line string suitable for the doctor output.
+async fn format_peer_count(port: u16) -> String {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "net_peerCount",
+        "params": []
+    });
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(500))
+        .build()
+        .unwrap_or_default();
+    let Ok(resp) = client
+        .post(format!("http://127.0.0.1:{port}"))
+        .json(&body)
+        .send()
+        .await
+    else {
+        return format!("peers:         unknown  (node not running on port {port})");
+    };
+    let Ok(json) = resp.json::<serde_json::Value>().await else {
+        return format!("peers:         unknown  (invalid response from port {port})");
+    };
+    if let Some(hex) = json["result"].as_str() {
+        let count = u64::from_str_radix(hex.trim_start_matches("0x"), 16).unwrap_or(0);
+        format!("peers:         {count} connected")
+    } else {
+        format!("peers:         unknown  (node on port {port} returned no result)")
+    }
 }
 
 fn format_beacon_status(data_dir: &Path) -> String {

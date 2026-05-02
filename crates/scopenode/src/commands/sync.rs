@@ -16,6 +16,7 @@
 //! 5. If any contract has no `to_block`, enter live sync mode
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -98,8 +99,9 @@ pub async fn run(
         if !dry_run {
             let (tx, _) = broadcast::channel::<StoredEvent>(1024);
             let (headers_tx, _) = broadcast::channel::<(u64, B256, u64)>(1024);
+            let peer_count_atom = Arc::new(AtomicUsize::new(network.peer_count().await));
             println!("\nSync complete. Starting servers on ports {port} (JSON-RPC) and {} (REST)...", port + 1);
-            let handle = start_server(port, db.clone(), tx.clone(), headers_tx.clone())
+            let handle = start_server(port, db.clone(), tx.clone(), headers_tx.clone(), Arc::clone(&peer_count_atom))
                 .await
                 .context("Failed to start JSON-RPC server")?;
             start_rest_server(port + 1, db.clone(), tx.clone())
@@ -157,6 +159,8 @@ async fn run_with_tui<N: EthNetwork + 'static>(
     let mut state = AppState::new(&config, beacon_rx);
     let (broadcast_tx, mut broadcast_rx) = broadcast::channel::<StoredEvent>(1024);
     let (headers_tx, _) = broadcast::channel::<(u64, B256, u64)>(1024);
+    // Shared peer count: updated on every tick, served via net_peerCount.
+    let peer_count_atom = Arc::new(AtomicUsize::new(0));
 
     // Set up the terminal before spawning anything so any early errors go to
     // the alternate screen rather than clobbering the spinner output.
@@ -195,6 +199,7 @@ async fn run_with_tui<N: EthNetwork + 'static>(
             tokio::select! {
                 _ = tick.tick() => {
                     let peers = network.peer_count().await;
+                    peer_count_atom.store(peers, Ordering::Relaxed);
                     state.refresh(&db, peers).await;
                 }
 
@@ -212,7 +217,7 @@ async fn run_with_tui<N: EthNetwork + 'static>(
 
                     state.push_log("Historical sync complete.".to_string());
 
-                    let handle = start_server(port, db.clone(), broadcast_tx.clone(), headers_tx.clone())
+                    let handle = start_server(port, db.clone(), broadcast_tx.clone(), headers_tx.clone(), Arc::clone(&peer_count_atom))
                         .await
                         .context("Failed to start JSON-RPC server")?;
                     start_rest_server(port + 1, db.clone(), broadcast_tx.clone())

@@ -129,20 +129,20 @@ Key bindings: `q` quit · `p` peer list · `r` recent events · `l` logs
 
 ## Definition of done
 
-- [ ] Live sync starts automatically when `to_block` not set in config
-- [ ] Live headers verified by Helios (BLS sync committee — not trusted from peer)
-- [ ] Multiple `consensus_rpc` must agree; disagreement halts live sync with clear error
-- [ ] Reorg detected (parent_hash mismatch): orphaned events marked `reorged = 1`
-- [ ] `eth_getLogs` excludes reorged events by default
-- [ ] ratatui TUI: mode, block, speed, peer count, per-contract event totals, recent events
+- [x] Live sync starts automatically when `to_block` not set in config
+- [x] Live headers verified by Helios (BLS sync committee — not trusted from peer)
+- [x] Multiple `consensus_rpc` must agree; disagreement halts live sync with clear error
+- [x] Reorg detected (parent_hash mismatch): orphaned events marked `reorged = 1`
+- [x] `eth_getLogs` excludes reorged events by default
+- [x] ratatui TUI: mode, block, speed, peer count, per-contract event totals, recent events
 - [x] TUI key bindings work: quit, peer list, logs
-- [ ] `scopenode snapshot` / `scopenode restore` work; restore auto-snaps before overwriting
-- [ ] `scopenode doctor` reports: peer count, beacon head, DB counts, pending_retry count
-- [ ] `scopenode retry` clears all `pending_retry` blocks on success
-- [ ] `from_block = "16M"` in config parses to `16_000_000`; `"16.5M"` → `16_500_000`
-- [ ] `scopenode sync --blocks 16M:+500` resolves to `from_block=16000000, to_block=16000500`
-- [ ] `reorg_buffer` config key respected; defaults to 64 when absent
-- [ ] Unit tests: reorg detection at depth 1/5/64, live syncer broadcast fan-out
+- [x] `scopenode snapshot` / `scopenode restore` work; restore auto-snaps before overwriting
+- [x] `scopenode doctor` reports: peer count, beacon head, DB counts, pending_retry count
+- [x] `scopenode retry` clears all `pending_retry` blocks on success
+- [x] `from_block = "16M"` in config parses to `16_000_000`; `"16.5M"` → `16_500_000`
+- [x] `scopenode sync --blocks 16M:+500` resolves to `from_block=16000000, to_block=16000500`
+- [x] `reorg_buffer` config key respected; defaults to 64 when absent
+- [x] Unit tests: reorg detection at depth 1/5/64, live syncer broadcast fan-out
 - [x] Integration test: live sync processes 10 real blocks after historical completes
 
 ## New dependencies

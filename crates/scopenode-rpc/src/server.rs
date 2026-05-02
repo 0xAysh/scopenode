@@ -13,7 +13,10 @@
 //! - `eth_chainId` — always `0x1` (Ethereum mainnet)
 //! - `eth_subscribe` — WebSocket push subscriptions: `"logs"` and `"newHeads"`
 //! - `eth_unsubscribe` — cancel a subscription (wired automatically by jsonrpsee)
+//! - `net_peerCount` — number of devp2p peers currently connected
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use alloy::rpc::types::{Filter, Log};
@@ -27,6 +30,16 @@ use scopenode_core::types::StoredEvent;
 use scopenode_storage::Db;
 use tokio::sync::broadcast;
 use tracing::warn;
+
+/// `net_peerCount` — number of devp2p peers currently connected.
+///
+/// Returns a hex-encoded integer matching the standard Ethereum `net_peerCount` response,
+/// so tools like `cast rpc net_peerCount` work without modification.
+#[rpc(server, namespace = "net")]
+pub trait NetApi {
+    #[method(name = "peerCount")]
+    async fn peer_count(&self) -> RpcResult<String>;
+}
 
 /// The subset of the Ethereum JSON-RPC API that scopenode serves.
 ///
@@ -65,10 +78,13 @@ pub trait EthApi {
 ///
 /// Holds a reference-counted `Db` handle (cheap to clone). All query methods
 /// delegate directly to `Db` without additional caching.
+#[derive(Clone)]
 pub struct EthApiImpl {
     db: Db,
     broadcast: broadcast::Sender<StoredEvent>,
     headers: broadcast::Sender<(u64, B256, u64)>,
+    /// Atomically updated by the sync loop — safe to read from any thread.
+    pub peer_count: Arc<AtomicUsize>,
 }
 
 impl EthApiImpl {
@@ -77,8 +93,17 @@ impl EthApiImpl {
         db: Db,
         broadcast: broadcast::Sender<StoredEvent>,
         headers: broadcast::Sender<(u64, B256, u64)>,
+        peer_count: Arc<AtomicUsize>,
     ) -> Self {
-        Self { db, broadcast, headers }
+        Self { db, broadcast, headers, peer_count }
+    }
+}
+
+#[async_trait]
+impl NetApiServer for EthApiImpl {
+    async fn peer_count(&self) -> RpcResult<String> {
+        let n = self.peer_count.load(Ordering::Relaxed);
+        Ok(format!("0x{n:x}"))
     }
 }
 
