@@ -309,7 +309,7 @@ impl DevP2PNetwork {
         // so polling at 1s intervals always sees zero. The HashMap only contains
         // peers that have completed the full ETH Status handshake and are ready
         // to serve data.
-        Self::wait_for_peers(&handle, &peers, 1, Duration::from_secs(180)).await?;
+        Self::wait_for_peers(&handle, &peers, 3, Duration::from_secs(180)).await?;
 
         let map_count = peers.read().await.len();
         let conn_count = handle.num_connected_peers();
@@ -319,10 +319,10 @@ impl DevP2PNetwork {
             "devp2p ready — connected to Ethereum mainnet peer(s)"
         );
 
-        // Give the network a moment to stabilise: the first peer often connects
-        // and disconnects within seconds. A 5s grace period lets additional peers
-        // come in so we have stable connections for the first header request.
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        // Grace period after the 3-peer threshold is reached. The first peer often
+        // connects and disconnects within seconds; 15s lets a second and third peer
+        // stabilise before the first header request goes out.
+        tokio::time::sleep(Duration::from_secs(15)).await;
 
         Ok(Self {
             handle,
