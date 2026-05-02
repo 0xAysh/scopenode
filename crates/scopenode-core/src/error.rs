@@ -72,6 +72,10 @@ pub enum NetworkError {
     /// A peer request failed (session error, disconnect, protocol violation).
     #[error("Peer request failed: {0}")]
     Peer(String),
+
+    /// Failed to read or write the persistent node key file.
+    #[error("Node key I/O error: {0}")]
+    KeyIo(String),
 }
 
 /// Errors from ABI fetching or decoding.

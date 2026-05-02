@@ -11,13 +11,14 @@ use scopenode_core::{
     pipeline::Pipeline,
 };
 use scopenode_storage::Db;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Run the `retry` command.
 ///
 /// Boots a fresh devp2p connection, runs only the receipt-fetch stage for all
 /// `pending_retry` blocks, and reports how many were cleared.
-pub async fn run(config: Config, db: Db) -> Result<()> {
+pub async fn run(config: Config, db: Db, data_dir: PathBuf) -> Result<()> {
     let pending = db.count_pending_retry().await.context("Failed to query retry queue")?;
     if pending == 0 {
         println!("No blocks pending retry.");
@@ -35,7 +36,7 @@ pub async fn run(config: Config, db: Db) -> Result<()> {
     spinner.set_message("Connecting to devp2p peers...");
     spinner.enable_steady_tick(std::time::Duration::from_millis(100));
 
-    let network = DevP2PNetwork::start()
+    let network = DevP2PNetwork::start(&data_dir)
         .await
         .context("Failed to start devp2p network")?;
     let network = Arc::new(network);

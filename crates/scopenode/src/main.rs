@@ -120,10 +120,12 @@ async fn main() -> Result<()> {
         Command::Retry { config } => {
             let cfg = Config::from_file(config).context("Failed to load config")?;
             let data_dir = resolve_data_dir(&cfg);
+            std::fs::create_dir_all(&data_dir)
+                .with_context(|| format!("Failed to create data dir: {}", data_dir.display()))?;
             let db = Db::open(data_dir.join("scopenode.db"))
                 .await
                 .context("Failed to open database")?;
-            commands::retry::run(cfg, db).await?;
+            commands::retry::run(cfg, db, data_dir).await?;
         }
 
         Command::Snapshot { label } => {

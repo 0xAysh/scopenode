@@ -37,6 +37,7 @@
 //! and survive re-runs (same inputs → same hash → `INSERT OR IGNORE` skips duplicates).
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -58,7 +59,7 @@ use reth_eth_wire::{
 };
 use alloy_primitives::U256;
 use reth_ethereum_forks::Head;
-use reth_network::{config::rng_secret_key, EthNetworkPrimitives, NetworkHandle, NetworkManager, PeersInfo};
+use reth_network::{config::{rng_secret_key, SecretKey}, EthNetworkPrimitives, NetworkHandle, NetworkManager, PeersInfo};
 use reth_network_api::{
     events::{NetworkEvent, PeerEvent},
     NetworkEventListenerProvider, PeerRequest, PeerRequestSender,
@@ -189,14 +190,16 @@ pub struct DevP2PNetwork {
 impl DevP2PNetwork {
     /// Boot the devp2p stack and wait for initial peer connections.
     ///
-    /// Generates an ephemeral node key, connects to Ethereum mainnet bootnodes
-    /// via discv4, and blocks until at least 3 peers are connected (or 30s timeout).
-    /// Spawns a `NetworkManager` tokio task that keeps running for the process lifetime.
-    /// Also spawns a background task that maintains the connected peer map.
-    pub async fn start() -> Result<Self, NetworkError> {
-        // Ephemeral key: we don't need a persistent identity.
-        // scopenode is a consumer-only node — we request data, never serve it.
-        let secret_key = rng_secret_key();
+    /// Loads or creates a persistent secp256k1 node key from `data_dir/node.key`.
+    /// A stable key lets the Kademlia DHT remember this node across restarts,
+    /// building up routing table entries over time and yielding more peers.
+    ///
+    /// Connects to Ethereum mainnet via discv4 + DNS discovery (DNS is on by default
+    /// in reth v1.11.3) and blocks until at least 3 peers complete the ETH Status
+    /// handshake, or 180s elapses. Spawns background tokio tasks for the lifetime
+    /// of the process.
+    pub async fn start(data_dir: &Path) -> Result<Self, NetworkError> {
+        let secret_key = load_or_create_node_key(&data_dir.join("node.key"))?;
 
         // Consumer-only provider: responds with empty data when peers request blocks
         // from us. Correct for a node that only downloads, never serves.
@@ -388,6 +391,82 @@ impl DevP2PNetwork {
     async fn blacklist_peer(&self, peer_id: reth_network_peers::PeerId) {
         self.blacklisted.write().await.insert(peer_id);
     }
+}
+
+// ── Node key persistence ──────────────────────────────────────────────────────
+
+/// Load a persistent secp256k1 node key from `path`, or generate and save one.
+///
+/// Format: 64-char lowercase hex string (matching reth/geth `nodekey` convention).
+/// Permissions: `0o600` on Unix (owner read/write only).
+///
+/// On corrupt or unreadable file: warns and regenerates — never hard-fails.
+fn load_or_create_node_key(path: &Path) -> Result<SecretKey, NetworkError> {
+    // If the file exists, try to load it.
+    if path.exists() {
+        match std::fs::read_to_string(path) {
+            Ok(contents) => match contents.trim().parse::<SecretKey>() {
+                Ok(sk) => {
+                    info!(?path, "loaded persistent devp2p node key");
+                    return Ok(sk);
+                }
+                Err(e) => warn!(?path, err = %e, "node.key parse failed — regenerating"),
+            },
+            Err(e) => warn!(?path, err = %e, "node.key read failed — regenerating"),
+        }
+        // File exists but is corrupt: overwrite it.
+        let sk = rng_secret_key();
+        write_node_key(path, &sk, /* overwrite */ true)
+            .map_err(|e| NetworkError::KeyIo(e.to_string()))?;
+        info!(?path, "regenerated devp2p node key");
+        return Ok(sk);
+    }
+
+    // File is absent: use create_new(true) for TOCTOU safety. If two processes
+    // race on first start, the loser gets AlreadyExists and reads the winner's file.
+    let sk = rng_secret_key();
+    match write_node_key(path, &sk, /* overwrite */ false) {
+        Ok(()) => {
+            info!(?path, "generated and saved new devp2p node key");
+            Ok(sk)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let contents = std::fs::read_to_string(path)
+                .map_err(|e| NetworkError::KeyIo(e.to_string()))?;
+            contents.trim().parse::<SecretKey>()
+                .map_err(|e| NetworkError::KeyIo(e.to_string()))
+        }
+        Err(e) => Err(NetworkError::KeyIo(e.to_string())),
+    }
+}
+
+/// Write a secp256k1 key as a 64-char hex string to `path`.
+///
+/// `overwrite = true` truncates an existing file; `false` uses `create_new` for
+/// TOCTOU safety on first creation.
+fn write_node_key(path: &Path, sk: &SecretKey, overwrite: bool) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let hex = alloy_primitives::hex::encode(sk.secret_bytes());
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true);
+    if overwrite {
+        opts.create(true).truncate(true);
+    } else {
+        opts.create_new(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    f.write_all(hex.as_bytes())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 // ── EthNetwork impl ───────────────────────────────────────────────────────────
@@ -860,5 +939,71 @@ mod tests {
             .collect();
 
         assert_eq!(usable.len(), 2);
+    }
+
+    // ── load_or_create_node_key tests ─────────────────────────────────────────
+
+    #[test]
+    fn node_key_created_on_first_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node.key");
+
+        let sk1 = load_or_create_node_key(&path).unwrap();
+        assert!(path.exists(), "node.key should be created");
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents.len(), 64, "should be 64-char hex");
+
+        // Same key loaded on second call.
+        let sk2 = load_or_create_node_key(&path).unwrap();
+        assert_eq!(sk1.secret_bytes(), sk2.secret_bytes(), "key must be stable across calls");
+    }
+
+    #[test]
+    fn node_key_loaded_from_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node.key");
+
+        // Write a known key in hex format.
+        let original = rng_secret_key();
+        let hex = alloy_primitives::hex::encode(original.secret_bytes());
+        std::fs::write(&path, &hex).unwrap();
+
+        let loaded = load_or_create_node_key(&path).unwrap();
+        assert_eq!(original.secret_bytes(), loaded.secret_bytes());
+    }
+
+    #[test]
+    fn node_key_regenerated_on_corrupt_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node.key");
+        std::fs::write(&path, "not-valid-hex!!!").unwrap();
+
+        // Should warn and regenerate — not panic or error.
+        let sk = load_or_create_node_key(&path).unwrap();
+        assert_eq!(sk.secret_bytes().len(), 32);
+
+        // File should now contain a valid key.
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents.len(), 64);
+    }
+
+    #[test]
+    fn node_key_regenerated_on_wrong_length_hex() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node.key");
+        // Valid hex but only 16 bytes — too short for secp256k1.
+        std::fs::write(&path, "deadbeefdeadbeefdeadbeefdeadbeef").unwrap();
+
+        let sk = load_or_create_node_key(&path).unwrap();
+        assert_eq!(sk.secret_bytes().len(), 32);
+    }
+
+    #[test]
+    fn node_key_missing_parent_dir_propagates_error() {
+        let path = std::path::Path::new("/nonexistent/dir/node.key");
+        // data_dir is guaranteed to exist by the caller, but verify we get an error
+        // rather than a panic when the directory is missing.
+        let result = load_or_create_node_key(path);
+        assert!(result.is_err(), "should error when parent dir is missing");
     }
 }

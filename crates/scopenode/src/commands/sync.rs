@@ -70,7 +70,7 @@ pub async fn run(
     spinner.enable_steady_tick(Duration::from_millis(100));
 
     let network = Arc::new(
-        DevP2PNetwork::start()
+        DevP2PNetwork::start(&data_dir)
             .await
             .context("Failed to start devp2p network")?,
     );
