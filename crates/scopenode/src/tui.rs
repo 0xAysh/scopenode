@@ -47,7 +47,7 @@ use ratatui::{
 };
 use scopenode_core::{beacon::BeaconStatus, config::Config, types::StoredEvent};
 use scopenode_storage::Db;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
@@ -57,12 +57,30 @@ pub enum SyncMode {
     Live,
 }
 
+/// Controls where key events are routed — normal navigation vs. command input.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum InputMode {
+    #[default]
+    Normal,
+    #[allow(dead_code)] // wired in Unit 2
+    Command { buf: String },
+}
+
 /// Which view is shown in the activity section of the TUI body.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum Panel {
     #[default]
     Events,
     Logs,
+    /// Output from an inline command. Carries the result lines, a scroll
+    /// offset, and the panel that was active before the command ran so
+    /// `dismiss_results` can restore it exactly.
+    #[allow(dead_code)] // constructed in Unit 3
+    Results {
+        lines: Vec<String>,
+        scroll: u16,
+        prev: Box<Panel>,
+    },
 }
 
 pub struct ContractStat {
@@ -83,8 +101,14 @@ pub struct AppState {
     pub recent_events: VecDeque<StoredEvent>,
     /// Ring buffer of key log messages pushed from the sync loop.
     pub log_lines: VecDeque<String>,
-    /// Which view is shown in the right body panel.
+    /// Which view is shown in the body.
     pub panel: Panel,
+    /// Whether the user is typing a command or navigating normally.
+    pub input_mode: InputMode,
+    /// Pending command result — set when a command is dispatched, drained
+    /// by the event loop when the spawned task completes.
+    #[allow(dead_code)] // read in Unit 3 event loop
+    pub cmd_result_rx: Option<oneshot::Receiver<Vec<String>>>,
     /// Current beacon verification state; updated each refresh tick.
     pub beacon_status: BeaconStatus,
     beacon_status_rx: watch::Receiver<BeaconStatus>,
@@ -112,6 +136,8 @@ impl AppState {
             recent_events: VecDeque::with_capacity(20),
             log_lines: VecDeque::with_capacity(50),
             panel: Panel::Events,
+            input_mode: InputMode::Normal,
+            cmd_result_rx: None,
             beacon_status: BeaconStatus::NotConfigured,
             beacon_status_rx,
             speed_sample: (Instant::now(), 0),
@@ -166,9 +192,49 @@ impl AppState {
         self.log_lines.push_back(line);
     }
 
-    /// Switch the right panel to a different view.
+    /// Switch the body panel.
     pub fn set_panel(&mut self, panel: Panel) {
         self.panel = panel;
+    }
+
+    #[allow(dead_code)] // called in Unit 2
+    /// Transition into Results state showing "running..." while a command executes.
+    /// Saves the current panel so `dismiss_results` can restore it.
+    pub fn start_command(&mut self, prev_panel: Panel) {
+        self.panel = Panel::Results {
+            lines: vec!["running...".to_string()],
+            scroll: 0,
+            prev: Box::new(prev_panel),
+        };
+        self.input_mode = InputMode::Normal;
+    }
+
+    #[allow(dead_code)] // called in Unit 3
+    /// Replace the result lines in the current Results panel.
+    /// If the panel is not Results (race condition), creates a new Results panel.
+    pub fn set_results(&mut self, lines: Vec<String>) {
+        if let Panel::Results { lines: ref mut l, scroll: ref mut s, .. } = self.panel {
+            *l = lines;
+            *s = 0;
+        } else {
+            self.panel = Panel::Results {
+                lines,
+                scroll: 0,
+                prev: Box::new(Panel::Events),
+            };
+        }
+    }
+
+    #[allow(dead_code)] // called in Unit 2
+    /// Close the Results panel and restore the panel that was active before.
+    /// No-op if the current panel is not Results.
+    pub fn dismiss_results(&mut self) {
+        if matches!(self.panel, Panel::Results { .. }) {
+            let current = std::mem::replace(&mut self.panel, Panel::Events);
+            if let Panel::Results { prev, .. } = current {
+                self.panel = *prev;
+            }
+        }
     }
 }
 
@@ -305,7 +371,12 @@ fn render_rule(f: &mut Frame, area: ratatui::layout::Rect, width: u16) {
 }
 
 fn render_body(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
-    f.render_widget(Paragraph::new(build_body_lines(state)), area);
+    let scroll = if let Panel::Results { scroll, .. } = &state.panel {
+        *scroll
+    } else {
+        0
+    };
+    f.render_widget(Paragraph::new(build_body_lines(state)).scroll((scroll, 0)), area);
 }
 
 /// Build all body lines in a single pass: contracts, then activity feed.
@@ -369,6 +440,22 @@ pub(crate) fn build_body_lines(state: &AppState) -> Vec<Line<'static>> {
                 }
             }
         }
+        (_, Panel::Results { lines: result_lines, .. }) => {
+            lines.push(Line::from(""));
+            for result_line in result_lines.iter() {
+                let color = if result_line.starts_with("error:") {
+                    Color::Red
+                } else if result_line.starts_with("─") || result_line.starts_with("running") {
+                    Color::DarkGray
+                } else {
+                    Color::White
+                };
+                lines.push(Line::from(Span::styled(
+                    format!("  {result_line}"),
+                    Style::default().fg(color),
+                )));
+            }
+        }
         _ => {}
     }
 
@@ -405,18 +492,22 @@ fn render_footer(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
 }
 
 fn render_hints(f: &mut Frame, area: ratatui::layout::Rect, state: &AppState) {
-    let text = if state.panel == Panel::Logs {
-        " q quit  ·  l logs  ·  r events"
-    } else {
-        " q quit  ·  l logs"
+    let line = match &state.input_mode {
+        InputMode::Command { buf } => Line::from(vec![
+            Span::styled(": ", Style::default().fg(Color::White)),
+            Span::styled(buf.clone(), Style::default().fg(Color::White)),
+            Span::styled("▌", Style::default().fg(Color::White)),
+        ]),
+        InputMode::Normal => {
+            let text = match &state.panel {
+                Panel::Logs => " q quit  ·  l logs  ·  r events",
+                Panel::Results { .. } => " esc dismiss  ·  r dismiss",
+                Panel::Events => " q quit  ·  l logs  ·  : command",
+            };
+            Line::from(Span::styled(text, Style::default().fg(Color::DarkGray)))
+        }
     };
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            text,
-            Style::default().fg(Color::DarkGray),
-        ))),
-        area,
-    );
+    f.render_widget(Paragraph::new(line), area);
 }
 
 fn sync_progress(state: &AppState, config: &Config) -> (f64, String) {
@@ -557,6 +648,8 @@ mod tests {
             recent_events: std::collections::VecDeque::new(),
             log_lines: std::collections::VecDeque::new(),
             panel,
+            input_mode: InputMode::Normal,
+            cmd_result_rx: None,
             beacon_status: BeaconStatus::NotConfigured,
             beacon_status_rx: rx,
             speed_sample: (std::time::Instant::now(), 0),
@@ -638,6 +731,73 @@ mod tests {
         assert_eq!(lines.len(), 6);
         let last_text: String = lines.last().unwrap().spans.iter().map(|s| s.content.as_ref()).collect::<Vec<_>>().join("");
         assert!(last_text.contains("no log entries yet"));
+    }
+
+    // ── Panel::Results and state transitions ─────────────────────────────────
+
+    #[test]
+    fn dismiss_results_restores_prev_panel() {
+        let mut state = make_state(SyncMode::Historical, Panel::Logs);
+        state.start_command(Panel::Logs);
+        state.dismiss_results();
+        assert_eq!(state.panel, Panel::Logs);
+    }
+
+    #[test]
+    fn dismiss_results_on_events_panel_is_noop() {
+        let mut state = make_state(SyncMode::Historical, Panel::Events);
+        state.dismiss_results();
+        assert_eq!(state.panel, Panel::Events);
+    }
+
+    #[test]
+    fn set_results_replaces_lines_and_resets_scroll() {
+        let mut state = make_state(SyncMode::Historical, Panel::Events);
+        state.start_command(Panel::Events);
+        // Manually bump scroll to confirm it resets
+        if let Panel::Results { ref mut scroll, .. } = state.panel {
+            *scroll = 5;
+        }
+        state.set_results(vec!["line1".to_string(), "line2".to_string()]);
+        if let Panel::Results { lines, scroll, .. } = &state.panel {
+            assert_eq!(lines, &["line1", "line2"]);
+            assert_eq!(*scroll, 0);
+        } else {
+            panic!("expected Panel::Results");
+        }
+    }
+
+    #[test]
+    fn dismiss_results_from_logs_prev_restores_logs() {
+        let mut state = make_state(SyncMode::Historical, Panel::Events);
+        state.start_command(Panel::Logs);
+        state.dismiss_results();
+        assert_eq!(state.panel, Panel::Logs);
+    }
+
+    #[test]
+    fn body_results_panel_renders_result_lines() {
+        let mut state = make_state(SyncMode::Historical, Panel::Events);
+        state.start_command(Panel::Events);
+        state.set_results(vec!["19,000,100  Swap".to_string()]);
+        let lines = build_body_lines(&state);
+        let all_text: String = lines.iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref().to_owned()))
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(all_text.contains("Swap"), "result line should appear in body");
+    }
+
+    #[test]
+    fn body_results_panel_renders_error_line() {
+        let mut state = make_state(SyncMode::Historical, Panel::Events);
+        state.start_command(Panel::Events);
+        state.set_results(vec!["error: unknown or unsafe command".to_string()]);
+        let lines = build_body_lines(&state);
+        let found_error = lines.iter().any(|l| {
+            l.spans.iter().any(|s| s.content.contains("error:"))
+        });
+        assert!(found_error, "error line should appear in body");
     }
 }
 
