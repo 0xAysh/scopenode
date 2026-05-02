@@ -205,24 +205,38 @@ impl DevP2PNetwork {
         // Build network config for Ethereum mainnet.
         // mainnet_nodes() returns the EF-maintained Ethereum mainnet bootnodes —
         // stable, well-known peers that seed the Kademlia DHT.
-        // Set head to a known post-Dencun block so the ETH Status handshake
-        // advertises the correct fork ID. Without this, the default is genesis
-        // (block 0), which produces an incompatible fork ID and causes all
-        // mainnet peers to reject our connection immediately.
         //
-        // Block 21_000_000 (~Sep 2024): safely after Dencun (19_426_589) and
-        // all prior forks. We use a zero hash — peers accept connections as
-        // long as chain_id + fork_id match; they don't validate the head hash.
+        // The fork_id sent in the ETH Status handshake is derived from the head
+        // we advertise here. It must include all mainnet forks active at runtime,
+        // otherwise peers reject the connection. Hardcoding a past block is fragile
+        // — a new fork makes it stale and breaks peer connections (0-1 peers).
+        //
+        // Instead we derive the head from SystemTime::now() so every mainnet fork
+        // that reth's chain spec knows about and whose activation time has passed
+        // will be included in our fork_id automatically. Peers don't validate the
+        // head hash — they only check chain_id + fork_id — so B256::ZERO is fine.
         // Post-merge: difficulty = 0, total_difficulty = terminal TD.
-        let head = Head {
-            number: 21_000_000,
-            hash: B256::ZERO,
-            difficulty: U256::ZERO,
-            total_difficulty: U256::from_str_radix(
-                "58750003716598352816469", 10,
-            )
-            .expect("static TTD"),
-            timestamp: 1_726_070_400, // ~2024-09-11 00:00:00 UTC
+        let head = {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            // Anchor: block 21M was mined at approximately 2024-09-11 00:00:00 UTC.
+            const BASE_BLOCK: u64 = 21_000_000;
+            const BASE_TS: u64 = 1_726_070_400;
+            let now_ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            // Post-merge Ethereum produces one block every ~12 seconds.
+            let elapsed_blocks = now_ts.saturating_sub(BASE_TS) / 12;
+            Head {
+                number: BASE_BLOCK + elapsed_blocks,
+                hash: B256::ZERO,
+                difficulty: U256::ZERO,
+                total_difficulty: U256::from_str_radix(
+                    "58750003716598352816469", 10,
+                )
+                .expect("static TTD"),
+                timestamp: now_ts,
+            }
         };
 
         let network_config =
