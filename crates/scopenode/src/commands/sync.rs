@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use crossterm::event::EventStream;
+use crossterm::event::{EventStream, KeyModifiers};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use alloy_primitives::B256;
 use scopenode_core::{
@@ -40,6 +40,16 @@ use tracing::info;
 
 use scopenode_core::beacon::{read_beacon_status, BeaconStatusFile};
 use crate::tui::{self, AppState, CommandInput, InputMode, Panel};
+
+/// What the key handler wants the event loop to do after processing a key.
+enum KeyAction {
+    /// No special action — event loop continues normally.
+    None,
+    /// Dispatch a subcommand string for async execution.
+    RunCommand(String),
+    /// Suspend the TUI, hand control to the shell, then resume.
+    ShellPause,
+}
 
 /// Run the `sync` command.
 pub async fn run(
@@ -250,15 +260,13 @@ async fn execute_doctor(db: &Db, data_dir: &PathBuf) -> Vec<String> {
 
 /// Process a single key event from the TUI event loop.
 ///
-/// Returns `Some(command_string)` when the user submits a command for execution;
-/// the caller is responsible for spawning the async task. Returns `Ok(None)`
-/// for all other key events. Ctrl+Z (shell pause) is handled in Unit 4.
+/// Returns a `KeyAction` telling the event loop what to do next.
 fn handle_key(
     ev: &crossterm::event::Event,
     state: &mut AppState,
     _event_stream: &mut EventStream,
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
-) -> Result<Option<String>> {
+) -> Result<KeyAction> {
     use crossterm::event::{Event, KeyCode};
 
     // Command mode: route characters to the input buffer.
@@ -282,30 +290,35 @@ fn handle_key(
                     other => other,
                 };
                 state.start_command(prev);
-                return Ok(Some(s));
+                return Ok(KeyAction::RunCommand(s));
             }
             CommandInput::Cancel => {
                 state.input_mode = InputMode::Normal;
             }
             CommandInput::Ignored => {}
         }
-        return Ok(None);
+        return Ok(KeyAction::None);
     }
 
     // Normal mode key routing.
-    let Event::Key(key) = ev else { return Ok(None); };
+    let Event::Key(key) = ev else { return Ok(KeyAction::None); };
+
+    // Shell pause — only in Normal mode, not while typing a command.
+    if key.code == KeyCode::Char('z') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return Ok(KeyAction::ShellPause);
+    }
 
     // Scroll results panel.
     if let Panel::Results { ref mut scroll, ref lines, .. } = state.panel {
         match key.code {
             KeyCode::Up => {
                 *scroll = scroll.saturating_sub(1);
-                return Ok(None);
+                return Ok(KeyAction::None);
             }
             KeyCode::Down => {
                 let max = (lines.len() as u16).saturating_sub(1);
                 *scroll = (*scroll + 1).min(max);
-                return Ok(None);
+                return Ok(KeyAction::None);
             }
             _ => {}
         }
@@ -319,7 +332,7 @@ fn handle_key(
         };
         state.input_mode = InputMode::Command { buf: String::new() };
         let _ = prev_non_results;
-        return Ok(None);
+        return Ok(KeyAction::None);
     }
 
     // Panel toggle / dismiss.
@@ -331,7 +344,72 @@ fn handle_key(
         }
     }
 
-    Ok(None)
+    Ok(KeyAction::None)
+}
+
+/// Temporarily suspend the TUI, give the user a real shell, and resume.
+///
+/// Sequence (Unix only):
+/// 1. Drop the EventStream so the crossterm background thread shuts down cleanly.
+/// 2. Save stderr fd and redirect to /dev/null so sync log output doesn't corrupt the shell.
+/// 3. Restore the terminal (leave alternate screen, disable raw mode).
+/// 4. Print a resume prompt.
+/// 5. Block on stdin.read_line via spawn_blocking (keeps tokio runtime alive for the pipeline).
+/// 6. Restore stderr.
+/// 7. Re-init the terminal and a fresh EventStream.
+#[cfg(unix)]
+fn do_shell_pause(
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    event_stream: &mut EventStream,
+) -> Result<()> {
+    use std::os::unix::io::RawFd;
+
+    // 1. Drop EventStream — its background OS thread shuts down on Drop.
+    let fresh_stream = {
+        // We temporarily replace the stream with a new one after resume.
+        // Drop the old one first by overwriting.
+        drop(std::mem::replace(event_stream, EventStream::new()));
+        EventStream::new()
+    };
+
+    // 2. Save + redirect stderr.
+    let saved_stderr: RawFd = unsafe { libc::dup(2) };
+    let devnull = std::fs::OpenOptions::new().write(true).open("/dev/null")
+        .map_err(|e| anyhow::anyhow!("open /dev/null: {e}"))?;
+    use std::os::unix::io::IntoRawFd;
+    unsafe { libc::dup2(devnull.into_raw_fd(), 2); }
+
+    // 3. Restore terminal.
+    tui::restore_terminal(terminal)
+        .map_err(|e| { unsafe { libc::dup2(saved_stderr, 2); libc::close(saved_stderr); } e })?;
+
+    // 4. Print prompt.
+    println!("\nscopenode syncing in background — press Enter to return to TUI");
+
+    // 5. Blocking stdin read (spawn_blocking so tokio threads stay free).
+    tokio::task::block_in_place(|| {
+        let mut s = String::new();
+        let _ = std::io::stdin().read_line(&mut s);
+    });
+
+    // 6. Restore stderr.
+    unsafe { libc::dup2(saved_stderr, 2); libc::close(saved_stderr); }
+
+    // 7. Re-init terminal and EventStream.
+    *terminal = tui::init_terminal()?;
+    *event_stream = fresh_stream;
+    terminal.clear()?;
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn do_shell_pause(
+    _terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    _event_stream: &mut EventStream,
+) -> Result<()> {
+    // Shell pause not supported on non-Unix platforms.
+    Ok(())
 }
 
 /// Run the sync pipeline and live sync behind a full-screen ratatui TUI.
@@ -446,15 +524,21 @@ async fn run_with_tui<N: EthNetwork + 'static>(
                     match maybe_ev {
                         Some(Ok(ref ev)) if tui::is_quit_event(ev, &state.input_mode) => break,
                         Some(Ok(ref ev)) => {
-                            if let Some(cmd) = handle_key(ev, &mut state, &mut event_stream, &mut terminal)? {
-                                let db2 = db.clone();
-                                let dir2 = data_dir.clone();
-                                let (tx, rx) = oneshot::channel();
-                                tokio::spawn(async move {
-                                    let lines = execute_command(cmd, db2, dir2).await;
-                                    let _ = tx.send(lines);
-                                });
-                                state.cmd_result_rx = Some(rx);
+                            match handle_key(ev, &mut state, &mut event_stream, &mut terminal)? {
+                                KeyAction::RunCommand(cmd) => {
+                                    let db2 = db.clone();
+                                    let dir2 = data_dir.clone();
+                                    let (tx, rx) = oneshot::channel();
+                                    tokio::spawn(async move {
+                                        let lines = execute_command(cmd, db2, dir2).await;
+                                        let _ = tx.send(lines);
+                                    });
+                                    state.cmd_result_rx = Some(rx);
+                                }
+                                KeyAction::ShellPause => {
+                                    do_shell_pause(&mut terminal, &mut event_stream)?;
+                                }
+                                KeyAction::None => {}
                             }
                         }
                         None => break,

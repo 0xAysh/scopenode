@@ -25,6 +25,7 @@ ratatui           = { workspace = true }
 crossterm         = { workspace = true }
 tokio-stream      = { workspace = true }
 reqwest           = { workspace = true }
+libc              = "0.2"
 
 [dev-dependencies]
 tempfile = { workspace = true }

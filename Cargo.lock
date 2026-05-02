@@ -7824,6 +7824,7 @@ dependencies = [
  "crossterm",
  "dirs 6.0.0",
  "indicatif",
+ "libc",
  "ratatui",
  "reqwest 0.13.2",
  "scopenode-core",
