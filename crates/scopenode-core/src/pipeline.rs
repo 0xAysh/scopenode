@@ -68,7 +68,9 @@ impl<N: EthNetwork + 'static> Pipeline<N> {
     /// only the bloom scan is run and an estimate is printed — no receipts are fetched.
     pub async fn run(&mut self, dry_run: bool, progress: &MultiProgress) -> Result<(), CoreError> {
         for contract in self.config.contracts.clone() {
-            self.sync_contract(&contract, dry_run, progress).await?;
+            if let Err(e) = self.sync_contract(&contract, dry_run, progress).await {
+                warn!(contract = %contract.address, err = %e, "Contract sync failed — skipping, continuing with remaining contracts");
+            }
         }
         Ok(())
     }
@@ -95,8 +97,16 @@ impl<N: EthNetwork + 'static> Pipeline<N> {
             if blocks.is_empty() {
                 continue;
             }
-            let events = self.abi_cache.get_or_fetch(&contract).await?;
-            self.fetch_and_store(&contract, &blocks, &events, progress).await?;
+            let events = match self.abi_cache.get_or_fetch(&contract).await {
+                Ok(e) => e,
+                Err(e) => {
+                    warn!(contract = %contract.address, err = %e, "ABI fetch failed during retry — skipping contract");
+                    continue;
+                }
+            };
+            if let Err(e) = self.fetch_and_store(&contract, &blocks, &events, progress).await {
+                warn!(contract = %contract.address, err = %e, "fetch_and_store failed during retry — skipping contract");
+            }
         }
 
         Ok(())
@@ -255,10 +265,21 @@ impl<N: EthNetwork + 'static> Pipeline<N> {
         let mut chunk_start = from;
         while chunk_start <= to {
             let chunk_end = (chunk_start + 63).min(to);
-            let headers = self.network.get_headers(chunk_start, chunk_end).await?;
+            let headers = match self.network.get_headers(chunk_start, chunk_end).await {
+                Ok(h) => h,
+                Err(e) => {
+                    warn!(
+                        from = chunk_start, to = chunk_end, err = %e,
+                        "Header chunk fetch failed — will retry from this point on next run"
+                    );
+                    break;
+                }
+            };
 
             for header in &headers {
-                self.db.insert_header(&scope_header_to_stored(header)).await?;
+                if let Err(e) = self.db.insert_header(&scope_header_to_stored(header)).await {
+                    warn!(block = header.number, err = %e, "Header DB insert failed — skipping block");
+                }
                 pb.inc(1);
             }
 
@@ -271,7 +292,9 @@ impl<N: EthNetwork + 'static> Pipeline<N> {
                 bloom_done_to: None,
                 receipts_done_to: None,
             };
-            self.db.upsert_sync_cursor(&cursor).await?;
+            if let Err(e) = self.db.upsert_sync_cursor(&cursor).await {
+                warn!(err = %e, "Cursor update failed — progress may not be saved");
+            }
 
             chunk_start = chunk_end + 1;
         }
@@ -448,8 +471,14 @@ impl<N: EthNetwork + 'static> Pipeline<N> {
                             stored_events.iter().map(core_to_storage_event).collect();
 
                         total_events += storage_events.len();
-                        self.db.insert_events(&storage_events).await?;
-                        self.db.mark_fetched(block_num, &addr_str).await?;
+                        if let Err(e) = self.db.insert_events(&storage_events).await {
+                            warn!(block = block_num, err = %e, "Event DB insert failed — block may be reprocessed");
+                            pb.inc(1);
+                            continue;
+                        }
+                        if let Err(e) = self.db.mark_fetched(block_num, &addr_str).await {
+                            warn!(block = block_num, err = %e, "mark_fetched failed — block may be reprocessed on retry");
+                        }
                         pb.inc(1);
                     }
                     ReceiptFetchResult::Failed { block_num } => {

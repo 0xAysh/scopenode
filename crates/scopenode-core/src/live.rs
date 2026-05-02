@@ -87,7 +87,13 @@ impl<N: EthNetwork + 'static> LiveSyncer<N> {
         // Preload ABIs and build bloom targets once.
         let mut contract_data: Vec<(ContractConfig, Vec<EventAbi>, Vec<BloomTarget>)> = Vec::new();
         for contract in self.config.contracts.iter().filter(|c| c.to_block.is_none()) {
-            let events = self.abi_cache.get_or_fetch(contract).await?;
+            let events = match self.abi_cache.get_or_fetch(contract).await {
+                Ok(e) => e,
+                Err(e) => {
+                    warn!(contract = %contract.address, err = %e, "ABI fetch failed — skipping contract in live sync");
+                    continue;
+                }
+            };
             let topic0s: Vec<B256> = events.iter().map(|e| e.topic0()).collect();
             let targets = BloomScanner::build_targets(&topic0s, contract.address);
             contract_data.push((contract.clone(), events, targets));
@@ -99,10 +105,22 @@ impl<N: EthNetwork + 'static> LiveSyncer<N> {
 
         // Seed reorg detector from the most recent stored headers so a restart
         // can still detect reorgs that started before we came back up.
-        let tip = self.db.latest_block_number().await?.unwrap_or(0);
+        let tip = match self.db.latest_block_number().await {
+            Ok(t) => t.unwrap_or(0),
+            Err(e) => {
+                warn!(err = %e, "DB latest_block_number failed — starting live sync from block 0");
+                0
+            }
+        };
         if tip > 0 {
             let seed_from = tip.saturating_sub(self.reorg_detector.capacity() as u64 - 1);
-            let headers = self.db.get_headers(seed_from, tip).await?;
+            let headers = match self.db.get_headers(seed_from, tip).await {
+                Ok(h) => h,
+                Err(e) => {
+                    warn!(err = %e, "DB get_headers for reorg seed failed — reorg detection may miss recent history");
+                    vec![]
+                }
+            };
             self.reorg_detector.seed(
                 headers.iter().filter_map(|h| {
                     match h.hash.parse::<B256>() {
@@ -141,13 +159,20 @@ impl<N: EthNetwork + 'static> LiveSyncer<N> {
             .build()
             .unwrap_or_default();
 
-        let mut helios: Option<HeliosGuard> = HeliosGuard::start(
+        let mut helios: Option<HeliosGuard> = match HeliosGuard::start(
             &self.config.node,
             &self.beacon_status_tx,
             self.data_dir.as_deref(),
             &reqwest_client,
         )
-        .await?;
+        .await
+        {
+            Ok(h) => h,
+            Err(e) => {
+                warn!(err = %e, "Helios beacon start failed — falling back to unverified mode");
+                None
+            }
+        };
 
         let mut our_tip = tip;
         let mut unverified_block_count: u64 = 0;
@@ -191,7 +216,7 @@ impl<N: EthNetwork + 'static> LiveSyncer<N> {
                     let peer_hash = header.hash;
                     let current_status = self.beacon_status_tx.borrow().clone();
 
-                    match guard
+                    let decision = match guard
                         .verify_block(
                             block_num,
                             peer_hash,
@@ -199,8 +224,15 @@ impl<N: EthNetwork + 'static> LiveSyncer<N> {
                             &self.beacon_status_tx,
                             self.data_dir.as_deref(),
                         )
-                        .await?
+                        .await
                     {
+                        Ok(d) => d,
+                        Err(e) => {
+                            warn!(block = block_num, err = %e, "Beacon verify error — retrying block next tick");
+                            break;
+                        }
+                    };
+                    match decision {
                         VerifyDecision::Accept => {
                             if let Err(e) =
                                 self.process_block(block_num, Some(header), &contract_data).await
@@ -258,20 +290,29 @@ impl<N: EthNetwork + 'static> LiveSyncer<N> {
             ))?
         };
 
-        self.db.insert_header(&scope_header_to_stored(&header)).await?;
+        if let Err(e) = self.db.insert_header(&scope_header_to_stored(&header)).await {
+            warn!(block = block_num, err = %e, "Header DB insert failed — continuing");
+        }
         let _ = self.headers_tx.send((header.number, header.hash, header.timestamp));
 
         if let Some(reorg) = self
             .reorg_detector
             .advance(header.number, header.hash, header.parent_hash)
         {
-            let count = self.db.mark_reorged_by_hash(&reorg.orphaned_hashes).await?;
-            warn!(
-                depth = reorg.orphaned_hashes.len(),
-                ancestor = reorg.common_ancestor,
-                reorged_events = count,
-                "Chain reorg detected"
-            );
+            match self.db.mark_reorged_by_hash(&reorg.orphaned_hashes).await {
+                Ok(count) => warn!(
+                    depth = reorg.orphaned_hashes.len(),
+                    ancestor = reorg.common_ancestor,
+                    reorged_events = count,
+                    "Chain reorg detected"
+                ),
+                Err(e) => warn!(
+                    depth = reorg.orphaned_hashes.len(),
+                    ancestor = reorg.common_ancestor,
+                    err = %e,
+                    "Chain reorg detected but DB update failed — orphaned events may still be visible"
+                ),
+            }
         }
 
         let any_match = contracts
@@ -306,7 +347,13 @@ impl<N: EthNetwork + 'static> LiveSyncer<N> {
                             continue;
                         }
 
-                        let decoder = EventDecoder::new(events, contract.address)?;
+                        let decoder = match EventDecoder::new(events, contract.address) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                warn!(block = block_num, contract = %contract.address, err = %e, "EventDecoder init failed — skipping contract for this block");
+                                continue;
+                            }
+                        };
                         let decoded = decoder.extract_and_decode(
                             &receipts,
                             block_num,
@@ -323,7 +370,9 @@ impl<N: EthNetwork + 'static> LiveSyncer<N> {
                                 count = storage.len(),
                                 "Live events"
                             );
-                            self.db.insert_events(&storage).await?;
+                            if let Err(e) = self.db.insert_events(&storage).await {
+                                warn!(block = block_num, contract = %contract.address, err = %e, "Event DB insert failed — events may be missing for this block");
+                            }
                         }
 
                         for event in decoded {
