@@ -309,7 +309,7 @@ impl DevP2PNetwork {
         // so polling at 1s intervals always sees zero. The HashMap only contains
         // peers that have completed the full ETH Status handshake and are ready
         // to serve data.
-        Self::wait_for_peers(&handle, &peers, 3, Duration::from_secs(180)).await?;
+        Self::wait_for_peers(&handle, &peers, 1, Duration::from_secs(180)).await?;
 
         let map_count = peers.read().await.len();
         let conn_count = handle.num_connected_peers();
