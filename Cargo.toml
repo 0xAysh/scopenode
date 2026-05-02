@@ -41,8 +41,6 @@ reth-ethereum-forks      = { git = "https://github.com/paradigmxyz/reth", tag = 
 tokio-stream             = "0.1"
 axum                     = { version = "0.7", features = ["tokio"] }
 tower-http               = { version = "0.5", features = ["cors"] }
-ratatui                  = "0.28"
-crossterm                = { version = "0.28", features = ["event-stream"] }
 scopenode-core    = { path = "crates/scopenode-core" }
 scopenode-storage = { path = "crates/scopenode-storage" }
 scopenode-rpc     = { path = "crates/scopenode-rpc" }
