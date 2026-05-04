@@ -263,16 +263,37 @@ impl<N: EthNetwork + 'static> Pipeline<N> {
         // Fetch headers in batches of 64. This batch size matches the ETH wire
         // protocol's GetBlockHeaders limit, keeping Phase 2 compatibility.
         let mut chunk_start = from;
-        while chunk_start <= to {
+        let mut interrupted = false;
+        'chunks: while chunk_start <= to {
             let chunk_end = (chunk_start + 63).min(to);
-            let headers = match self.network.get_headers(chunk_start, chunk_end).await {
-                Ok(h) => h,
-                Err(e) => {
-                    warn!(
-                        from = chunk_start, to = chunk_end, err = %e,
-                        "Header chunk fetch failed — will retry from this point on next run"
-                    );
-                    break;
+
+            // Retry failed chunks up to 5 times, waiting 15s between attempts.
+            // A peer that drops right after the Status handshake is the common case —
+            // waiting gives new peers time to connect and serve the request.
+            let headers = {
+                let mut result = None;
+                for attempt in 0..5u32 {
+                    match self.network.get_headers(chunk_start, chunk_end).await {
+                        Ok(h) => { result = Some(h); break; }
+                        Err(e) => {
+                            warn!(
+                                from = chunk_start, to = chunk_end, attempt = attempt + 1,
+                                err = %e, "Header chunk fetch failed — waiting 60s before retry"
+                            );
+                            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                        }
+                    }
+                }
+                match result {
+                    Some(h) => h,
+                    None => {
+                        warn!(
+                            from = chunk_start, to = chunk_end,
+                            "Header chunk failed after 5 attempts (90s each) — will resume from this block next run"
+                        );
+                        interrupted = true;
+                        break 'chunks;
+                    }
                 }
             };
 
@@ -299,7 +320,11 @@ impl<N: EthNetwork + 'static> Pipeline<N> {
             chunk_start = chunk_end + 1;
         }
 
-        pb.finish_with_message("done");
+        if interrupted {
+            pb.abandon_with_message(format!("interrupted at block {} — run sync again to resume", chunk_start));
+        } else {
+            pb.finish_with_message("done");
+        }
         Ok(())
     }
 

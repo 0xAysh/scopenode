@@ -319,11 +319,6 @@ impl DevP2PNetwork {
             "devp2p ready — connected to Ethereum mainnet peer(s)"
         );
 
-        // Grace period after the 3-peer threshold is reached. The first peer often
-        // connects and disconnects within seconds; 15s lets a second and third peer
-        // stabilise before the first header request goes out.
-        tokio::time::sleep(Duration::from_secs(15)).await;
-
         Ok(Self {
             handle,
             peers,
@@ -479,79 +474,75 @@ impl EthNetwork for DevP2PNetwork {
     /// channels — same mechanism as `get_receipts_for_blocks`. This bypasses
     /// `FetchClient` which can lose track of peers between `wait_for_peers` and
     /// first use, causing silent empty responses.
+    ///
+    /// Retries across peers and waits for new peers to arrive (up to 90s total)
+    /// because devp2p peers connect and disconnect frequently. If all current peers
+    /// fail or the pool is empty, we sleep 3s and try again until the deadline.
     async fn get_headers(&self, from: u64, to: u64) -> Result<Vec<ScopeHeader>, NetworkError> {
         let count = (to - from + 1).min(64);
+        let deadline = Instant::now() + Duration::from_secs(90);
 
-        // Wait up to 30s for at least one usable (non-blacklisted) peer.
-        let senders = {
-            let mut attempts = 0u32;
-            loop {
-                let s = self.usable_peer_senders().await;
-                if !s.is_empty() || attempts >= 30 {
-                    break s;
+        loop {
+            let senders = self.usable_peer_senders().await;
+
+            // Try every currently-connected peer before giving up on this round.
+            for (peer_id, sender) in &senders {
+                let (tx, rx) = oneshot::channel();
+                let req = PeerRequest::GetBlockHeaders {
+                    request: GetBlockHeaders {
+                        start_block: BlockHashOrNumber::Number(from),
+                        limit: count,
+                        skip: 0,
+                        direction: HeadersDirection::Rising,
+                    },
+                    response: tx,
+                };
+
+                if sender.to_session_tx.send(req).await.is_err() {
+                    debug!(%peer_id, "GetBlockHeaders send failed, trying next peer");
+                    continue;
                 }
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                attempts += 1;
-            }
-        };
 
-        if senders.is_empty() {
-            return Err(NetworkError::HeadersFailed(from, to));
-        }
+                match rx.await {
+                    Ok(Ok(BlockHeaders(headers))) => {
+                        if headers.is_empty() {
+                            debug!(%peer_id, from, to, "GetBlockHeaders returned empty, trying next peer");
+                            continue;
+                        }
 
-        // Try each peer until one returns headers.
-        for (peer_id, sender) in &senders {
-            let (tx, rx) = oneshot::channel();
-            let req = PeerRequest::GetBlockHeaders {
-                request: GetBlockHeaders {
-                    start_block: BlockHashOrNumber::Number(from),
-                    limit: count,
-                    skip: 0,
-                    direction: HeadersDirection::Rising,
-                },
-                response: tx,
-            };
-
-            if sender.to_session_tx.send(req).await.is_err() {
-                debug!(%peer_id, "GetBlockHeaders send failed, trying next peer");
-                continue;
-            }
-
-            match rx.await {
-                Ok(Ok(BlockHeaders(headers))) => {
-                    if headers.is_empty() {
-                        debug!(%peer_id, from, to, "GetBlockHeaders returned empty, trying next peer");
+                        // Convert alloy_consensus::Header → ScopeHeader.
+                        return Ok(headers
+                            .into_iter()
+                            .map(|h| ScopeHeader {
+                                number: h.number,
+                                // hash_slow() computes keccak256(rlp(header))
+                                hash: h.hash_slow(),
+                                parent_hash: h.parent_hash,
+                                timestamp: h.timestamp,
+                                receipts_root: h.receipts_root,
+                                logs_bloom: h.logs_bloom,
+                                gas_used: h.gas_used,
+                                base_fee_per_gas: h.base_fee_per_gas.map(|f| f as u128),
+                            })
+                            .collect());
+                    }
+                    Ok(Err(e)) => {
+                        debug!(%peer_id, err = ?e, "GetBlockHeaders peer error, trying next");
                         continue;
                     }
-
-                    // Convert alloy_consensus::Header → ScopeHeader.
-                    return Ok(headers
-                        .into_iter()
-                        .map(|h| ScopeHeader {
-                            number: h.number,
-                            // hash_slow() computes keccak256(rlp(header))
-                            hash: h.hash_slow(),
-                            parent_hash: h.parent_hash,
-                            timestamp: h.timestamp,
-                            receipts_root: h.receipts_root,
-                            logs_bloom: h.logs_bloom,
-                            gas_used: h.gas_used,
-                            base_fee_per_gas: h.base_fee_per_gas.map(|f| f as u128),
-                        })
-                        .collect());
-                }
-                Ok(Err(e)) => {
-                    debug!(%peer_id, err = ?e, "GetBlockHeaders peer error, trying next");
-                    continue;
-                }
-                Err(_) => {
-                    debug!(%peer_id, "GetBlockHeaders channel closed, trying next");
-                    continue;
+                    Err(_) => {
+                        debug!(%peer_id, "GetBlockHeaders channel closed, trying next");
+                        continue;
+                    }
                 }
             }
-        }
 
-        Err(NetworkError::HeadersFailed(from, to))
+            // No peers available or all peers failed — wait for new peers to connect.
+            if Instant::now() >= deadline {
+                return Err(NetworkError::HeadersFailed(from, to));
+            }
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
     }
 
     /// Fetch receipts for a batch of blocks (up to 16) via `GetReceipts`.
