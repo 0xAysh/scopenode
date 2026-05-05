@@ -7708,6 +7708,7 @@ dependencies = [
  "reth-network-p2p",
  "reth-network-peers",
  "reth-storage-api",
+ "reth-transaction-pool",
  "scopenode-storage",
  "serde",
  "serde_json",
