@@ -258,39 +258,7 @@ Database: `~/.scopenode/scopenode.db` (SQLite, WAL mode).
 | `sync_cursor` | Per-contract progress: headers_done_to, receipts_done_to |
 | `contracts` | Contract registry + cached ABI JSON from Sourcify |
 
----
 
-## Roadmap
-
-**Phase 1 — MVP (current)**
-- [x] devp2p networking (discv4 + RLPx + ETH wire)
-- [x] Header sync via `GetBlockHeaders` (direct peer request)
-- [x] Bloom scan (CPU-only, zero network)
-- [x] Receipt fetch via `GetReceipts` + Merkle verification
-- [x] Sourcify ABI fetch + `alloy-dyn-abi` decoding
-- [x] SQLite storage, WAL mode, resumable sync
-- [x] JSON-RPC server (`eth_getLogs`, `eth_blockNumber`, `eth_chainId`)
-- [x] `status` and `query` commands
-
-> **Known limitation:** Most modern Ethereum mainnet nodes use snap sync and do not
-> maintain a receipts database accessible via the `GetReceipts` devp2p wire message.
-> Blocks whose receipts cannot be fetched are marked `pending_retry=1` in SQLite.
-> **Workaround:** Connect scopenode to a network with archive peers, or wait for
-> Phase 2 ERA1 support. Tested: peer discovery, header sync, and bloom scan all
-> work correctly end-to-end.
-
-**Phase 2 — Trustless**
-- [ ] ERA1 archive file support (bypasses `GetReceipts` limitation)
-- [ ] Helios beacon light client for live header sync
-- [ ] Proxy contract detection (EIP-1967)
-- [ ] Multi-peer header agreement
-
-**Phase 3 — Production**
-- [ ] Live sync (watch new blocks)
-- [ ] Reorg detection and handling
-- [ ] REST API at `:8546`
-- [ ] Server-Sent Events (SSE) for live streaming
-- [ ] CSV/JSON export
 
 ---
 
