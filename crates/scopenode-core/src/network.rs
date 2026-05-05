@@ -65,6 +65,7 @@ use reth_network_api::{
     NetworkEventListenerProvider, PeerRequest, PeerRequestSender,
 };
 use reth_network_peers::mainnet_nodes;
+use reth_dns_discovery::DnsDiscoveryConfig;
 use reth_storage_api::noop::NoopProvider;
 use reth_network::transactions::{TransactionsManager, TransactionsManagerConfig};
 use reth_transaction_pool::{
@@ -262,10 +263,18 @@ impl DevP2PNetwork {
             }
         };
 
+        // Speed up DNS tree traversal: 10 req/s (default is 3) lets us get
+        // a full list of live peers in ~30s instead of ~100s.
+        let dns_config = DnsDiscoveryConfig {
+            max_requests_per_sec: std::num::NonZeroUsize::new(10).unwrap(),
+            ..Default::default()
+        };
+
         let network_config =
             reth_network::config::NetworkConfig::<_, EthNetworkPrimitives>::builder(secret_key)
                 .boot_nodes(mainnet_nodes())
                 .set_head(head)
+                .dns_discovery(dns_config)
                 .build(client);
 
         // Spawn NetworkManager — this task runs the full devp2p loop:
@@ -353,10 +362,11 @@ impl DevP2PNetwork {
             }
         });
 
-        // Wait for at least 1 connected peer. discv4 bootstrap + RLPx handshake
-        // can take 20–120s on a cold start depending on network conditions.
-        // We only need 1 to begin fetching; additional peers accumulate in the
-        // background and are picked up by the peer tracker as they connect.
+        // Wait for at least 1 connected peer — no timeout.
+        //
+        // DNS tree traversal + TCP + ECIES + ETH handshake can take many minutes
+        // on home networks with NAT or slow DNS. We wait indefinitely: reliability
+        // matters more than startup speed. A 30s info! log keeps the user informed.
         //
         // We watch the `peers` HashMap (populated by the background event listener)
         // rather than `handle.num_connected_peers()`. The latter counts all TCP
@@ -364,7 +374,7 @@ impl DevP2PNetwork {
         // so polling at 1s intervals always sees zero. The HashMap only contains
         // peers that have completed the full ETH Status handshake and are ready
         // to serve data.
-        Self::wait_for_peers(&handle, &peers, 1, Duration::from_secs(180)).await?;
+        Self::wait_for_peers(&handle, &peers, 1).await;
 
         let map_count = peers.read().await.len();
         let conn_count = handle.num_connected_peers();
@@ -382,7 +392,7 @@ impl DevP2PNetwork {
         })
     }
 
-    /// Poll until `min_peers` have completed the ETH handshake, or `timeout` elapses.
+    /// Poll until `min_peers` have completed the ETH handshake. Waits indefinitely.
     ///
     /// Primary signal: the `peers` HashMap (populated by background `NetworkEvent`
     /// listener) — only contains peers that completed the full ETH Status handshake.
@@ -391,23 +401,32 @@ impl DevP2PNetwork {
     /// event listener task has a race condition and misses some `ActivePeerSession`
     /// events. If `num_connected_peers() >= min_peers` we also consider it ready,
     /// since at least that many peers have active TCP sessions.
+    ///
+    /// Logs progress at `info!` every 30 seconds so the user can see the node is
+    /// working. Per-iteration noise is logged at `debug!` level.
     async fn wait_for_peers(
         handle: &NetworkHandle<EthNetworkPrimitives>,
         peers: &Arc<RwLock<HashMap<reth_network_peers::PeerId, PeerSession>>>,
         min_peers: usize,
-        timeout: Duration,
-    ) -> Result<(), NetworkError> {
+    ) {
         let start = Instant::now();
+        let mut last_log = start;
         loop {
             let map_n = peers.read().await.len();
             let conn_n = handle.num_connected_peers();
             // Use the higher of the two counts as evidence of connectivity.
             let n = map_n.max(conn_n);
             if n >= min_peers {
-                return Ok(());
+                return;
             }
-            if start.elapsed() > timeout {
-                return Err(NetworkError::NoPeers { wanted: min_peers, found: n });
+            if last_log.elapsed() >= Duration::from_secs(30) {
+                info!(
+                    map_peers = map_n,
+                    conn_peers = conn_n,
+                    elapsed_s = start.elapsed().as_secs(),
+                    "waiting for devp2p peers — DNS discovery + ETH handshake in progress"
+                );
+                last_log = Instant::now();
             }
             debug!(
                 map_peers = map_n,

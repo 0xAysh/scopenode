@@ -52,10 +52,13 @@ pub enum NetworkError {
     #[error("devp2p boot failed: {0}")]
     Boot(String),
 
-    /// Timed out waiting for enough peers to connect after boot.
+    /// No peers are currently connected.
     ///
-    /// Check internet connectivity and firewall (UDP port must be open for discv4).
-    #[error("devp2p found {found} peer(s) after timeout, need at least {wanted}")]
+    /// Returned by [`crate::network::EthNetwork::best_block_number`] when the
+    /// peer map is empty at the time of the call. The startup path no longer
+    /// produces this error — `wait_for_peers` loops indefinitely until a peer
+    /// completes the ETH Status handshake.
+    #[error("devp2p found {found} peer(s), need at least {wanted}")]
     NoPeers { wanted: usize, found: usize },
 
     /// All connected peers failed to return headers for this block range.
