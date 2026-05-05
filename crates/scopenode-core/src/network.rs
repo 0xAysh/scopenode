@@ -622,10 +622,16 @@ impl EthNetwork for DevP2PNetwork {
 
     /// Fetch receipts for a batch of blocks (up to 16) via `GetReceipts`.
     ///
-    /// Sends `PeerRequest::GetReceipts` directly to connected peers' session channels.
-    /// Tries each available peer in turn until one returns a valid response.
-    /// Most peers prune historical receipts — retrying across peers improves the
-    /// odds of hitting an archive node that has them.
+    /// Loops indefinitely until a peer with archive data returns valid receipts.
+    /// Tracks tried peers per-call in `tried: HashSet<PeerId>`. When no new
+    /// (untried, non-blacklisted) peers are available, sleeps 30s and retries —
+    /// new peers arriving from background discovery become visible each iteration.
+    ///
+    /// `ReceiptFetchResult::Failed` is never returned in normal operation. The
+    /// pipeline's `Failed` branch is retained as a safety valve.
+    ///
+    /// Most mainnet peers are snap-synced and cannot serve historical receipts.
+    /// Archive nodes are less common but do exist. Given enough time, one connects.
     ///
     /// The ETH wire protocol allows up to 16 block hashes per `GetReceipts` request.
     /// The pipeline already batches candidates in groups of 16 before calling here.
@@ -638,110 +644,109 @@ impl EthNetwork for DevP2PNetwork {
     ) -> Vec<ReceiptFetchResult> {
         let hashes: Vec<B256> = blocks.iter().map(|(_, h, _)| *h).collect();
 
-        // Wait up to 60s for at least 3 usable (non-blacklisted) peers.
-        // Archive nodes and full-sync nodes serve receipts; snap-sync nodes often don't.
-        let senders = {
-            let mut attempts = 0u32;
-            loop {
-                let s = self.usable_peer_senders().await;
-                let want = if attempts < 60 { 3 } else { 1 };
-                if s.len() >= want || attempts >= 90 {
-                    break s;
-                }
-                if attempts.is_multiple_of(10) {
-                    debug!(peers = s.len(), elapsed_s = attempts, "waiting for more peers before receipt fetch...");
-                }
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                attempts += 1;
-            }
-        };
+        // Per-call set of peers already attempted for this batch.
+        // Separate from the session-wide `blacklisted` set: snap-synced peers go
+        // here (not in the blacklist) and are eligible again on the next batch call.
+        // `usable_peer_senders()` already excludes blacklisted peers.
+        let mut tried: HashSet<reth_network_peers::PeerId> = HashSet::new();
+        let mut last_log = Instant::now();
 
-        if senders.is_empty() {
-            warn!("no usable peers for GetReceipts");
-            return blocks
-                .iter()
-                .map(|(n, _, _)| ReceiptFetchResult::Failed { block_num: *n })
+        loop {
+            // Fresh snapshot each iteration — sees peers that connected while we slept.
+            let all_senders = self.usable_peer_senders().await;
+            let all_count = all_senders.len();
+            let new_senders: Vec<_> = all_senders
+                .into_iter()
+                .filter(|(id, _)| !tried.contains(id))
                 .collect();
-        }
 
-        debug!(peers_available = senders.len(), blocks = blocks.len(), "trying GetReceipts");
-
-        // Try each peer in turn. On receipt, convert to alloy types and run MPT
-        // verification immediately. A peer whose data fails verification is
-        // blacklisted for the session and the next peer is tried for the whole batch.
-        for (peer_id, sender) in &senders {
-            let (tx, rx) = oneshot::channel();
-            let req = PeerRequest::GetReceipts {
-                request: GetReceipts(hashes.clone()),
-                response: tx,
-            };
-
-            if sender.to_session_tx.send(req).await.is_err() {
-                debug!(%peer_id, "GetReceipts send failed — peer disconnected, trying next");
+            if new_senders.is_empty() {
+                if last_log.elapsed() >= Duration::from_secs(30) {
+                    info!(
+                        peers_connected = all_count,
+                        peers_tried = tried.len(),
+                        "waiting for archive peers — snap-synced peers cannot serve historical receipts"
+                    );
+                    last_log = Instant::now();
+                }
+                tokio::time::sleep(Duration::from_secs(30)).await;
                 continue;
             }
 
-            match rx.await {
-                Ok(Ok(Receipts(receipt_batches))) => {
-                    let outer_len = receipt_batches.len();
-                    let inner_total: usize = receipt_batches.iter().map(|v| v.len()).sum();
-                    debug!(%peer_id, outer_len, inner_total, "GetReceipts response");
+            debug!(new_peers = new_senders.len(), tried = tried.len(), blocks = blocks.len(), "trying GetReceipts");
 
-                    // Snap-synced nodes return empty responses (no receipt DB).
-                    let has_data = receipt_batches.iter().any(|v| !v.is_empty());
-                    if !has_data {
-                        debug!(%peer_id, outer_len, "GetReceipts empty — peer lacks receipt data, trying next");
-                        continue;
-                    }
+            // Try each new (untried) peer. On success, return immediately.
+            // On snap-sync (empty) or error, add to `tried` and continue.
+            // On MPT failure, blacklist the peer (existing behaviour) and continue.
+            for (peer_id, sender) in &new_senders {
+                tried.insert(*peer_id);
 
-                    // Convert wire receipts → alloy types and verify MPT for every block.
-                    // If any block's root mismatches, this peer is sending bad data —
-                    // blacklist it immediately and try the next peer for the whole batch.
-                    let mut converted: Vec<ReceiptFetchResult> = Vec::with_capacity(blocks.len());
-                    let mut peer_bad = false;
+                let (tx, rx) = oneshot::channel();
+                let req = PeerRequest::GetReceipts {
+                    request: GetReceipts(hashes.clone()),
+                    response: tx,
+                };
 
-                    for (&(block_num, block_hash, receipts_root), wire_receipts) in
-                        blocks.iter().zip(receipt_batches)
-                    {
-                        let receipts = build_alloy_receipts(wire_receipts, block_num, block_hash);
+                if sender.to_session_tx.send(req).await.is_err() {
+                    debug!(%peer_id, "GetReceipts send failed — peer disconnected, trying next");
+                    continue;
+                }
 
-                        if let Err(e) = verify_receipts(&receipts, receipts_root, block_num) {
-                            warn!(
-                                %peer_id, block = block_num, err = %e,
-                                "MPT verification failed — blacklisting peer"
-                            );
-                            self.blacklist_peer(*peer_id).await;
-                            peer_bad = true;
-                            break;
+                match rx.await {
+                    Ok(Ok(Receipts(receipt_batches))) => {
+                        let outer_len = receipt_batches.len();
+                        let inner_total: usize = receipt_batches.iter().map(|v| v.len()).sum();
+                        debug!(%peer_id, outer_len, inner_total, "GetReceipts response");
+
+                        // Snap-synced nodes return empty responses (no receipt DB).
+                        let has_data = receipt_batches.iter().any(|v| !v.is_empty());
+                        if !has_data {
+                            debug!(%peer_id, outer_len, "GetReceipts empty — peer lacks receipt data, trying next");
+                            continue;
                         }
 
-                        converted.push(ReceiptFetchResult::Ok { block_num, block_hash, receipts });
-                    }
+                        // Convert wire receipts → alloy types and verify MPT for every block.
+                        // If any block's root mismatches, this peer is sending bad data —
+                        // blacklist it immediately and try the next peer for the whole batch.
+                        let mut converted: Vec<ReceiptFetchResult> = Vec::with_capacity(blocks.len());
+                        let mut peer_bad = false;
 
-                    if !peer_bad {
-                        return converted;
+                        for (&(block_num, block_hash, receipts_root), wire_receipts) in
+                            blocks.iter().zip(receipt_batches)
+                        {
+                            let receipts = build_alloy_receipts(wire_receipts, block_num, block_hash);
+
+                            if let Err(e) = verify_receipts(&receipts, receipts_root, block_num) {
+                                warn!(
+                                    %peer_id, block = block_num, err = %e,
+                                    "MPT verification failed — blacklisting peer"
+                                );
+                                self.blacklist_peer(*peer_id).await;
+                                peer_bad = true;
+                                break;
+                            }
+
+                            converted.push(ReceiptFetchResult::Ok { block_num, block_hash, receipts });
+                        }
+
+                        if !peer_bad {
+                            return converted;
+                        }
+                        // Peer blacklisted; fall through to the next peer.
                     }
-                    // Peer blacklisted; fall through to the next peer.
-                }
-                Ok(Err(e)) => {
-                    debug!(%peer_id, err = ?e, "GetReceipts peer error, trying next");
-                    continue;
-                }
-                Err(_) => {
-                    debug!(%peer_id, "GetReceipts channel closed, trying next");
-                    continue;
+                    Ok(Err(e)) => {
+                        debug!(%peer_id, err = ?e, "GetReceipts peer error, trying next");
+                        continue;
+                    }
+                    Err(_) => {
+                        debug!(%peer_id, "GetReceipts channel closed, trying next");
+                        continue;
+                    }
                 }
             }
+            // All new_senders tried this round — loop back for a fresh snapshot.
+            // New peers arriving from background discovery will appear next iteration.
         }
-
-        warn!(
-            peers_tried = senders.len(),
-            "GetReceipts: all peers failed or were blacklisted"
-        );
-        blocks
-            .iter()
-            .map(|(n, _, _)| ReceiptFetchResult::Failed { block_num: *n })
-            .collect()
     }
 
     /// Return the best block number from connected peers' Status messages.
