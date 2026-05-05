@@ -45,7 +45,7 @@ use alloy::consensus::{Eip658Value, Receipt, ReceiptEnvelope, ReceiptWithBloom};
 use alloy::rpc::types::{Log as RpcLog, TransactionReceipt};
 use alloy_primitives::{keccak256, Address, B256};
 use async_trait::async_trait;
-use tokio::sync::{oneshot, RwLock};
+use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio_stream::StreamExt as _;
 use tracing::{debug, info, warn};
 
@@ -66,6 +66,22 @@ use reth_network_api::{
 };
 use reth_network_peers::mainnet_nodes;
 use reth_storage_api::noop::NoopProvider;
+use reth_network::transactions::{TransactionsManager, TransactionsManagerConfig};
+use reth_transaction_pool::{
+    blobstore::NoopBlobStore,
+    noop::MockTransactionValidator,
+    CoinbaseTipOrdering, EthPooledTransaction, Pool, PoolConfig, SubPoolLimit,
+};
+
+/// Transaction pool type used for the mempool relay.
+///
+/// Accepts all transactions without validation (invalid ones are rejected by
+/// receiving peers). Bounded to ~5k transactions total across sub-pools.
+type RelayPool = Pool<
+    MockTransactionValidator<EthPooledTransaction>,
+    CoinbaseTipOrdering<EthPooledTransaction>,
+    NoopBlobStore,
+>;
 
 // ── Receipt fetch result ──────────────────────────────────────────────────────
 
@@ -185,6 +201,10 @@ pub struct DevP2PNetwork {
     /// reproduce the expected `receipts_root`. It stays blacklisted until the
     /// process restarts (ephemeral — blacklist is in-memory only).
     blacklisted: Arc<RwLock<HashSet<reth_network_peers::PeerId>>>,
+    /// Relay pool — held alive for the process lifetime so TransactionsManager
+    /// can clone it. Never queried directly by sync logic.
+    #[allow(dead_code)]
+    pool: RelayPool,
 }
 
 impl DevP2PNetwork {
@@ -252,9 +272,16 @@ impl DevP2PNetwork {
         //   discv4 UDP: peer discovery, ENR exchanges, Kademlia routing
         //   RLPx TCP: ECIES handshake, encrypted session management
         //   ETH wire: Status handshake, request routing
-        let manager = NetworkManager::new(network_config)
+        let mut manager = NetworkManager::new(network_config)
             .await
             .map_err(|e| NetworkError::Boot(e.to_string()))?;
+
+        // Wire the tx gossip channel BEFORE spawning NetworkManager.
+        // NetworkManager routes all incoming tx events (NewPooledTransactionHashes,
+        // GetPooledTransactions) to this channel. Without it, tx gossip is silently dropped
+        // and we appear as a non-participating node to peers.
+        let (tx_events_tx, tx_events_rx) = mpsc::unbounded_channel();
+        manager.set_transactions(tx_events_tx);
 
         let handle = manager.handle().clone();
 
@@ -265,6 +292,34 @@ impl DevP2PNetwork {
         // NetworkManager implements Future — spawn as a background tokio task.
         // It runs for the lifetime of the process.
         tokio::spawn(manager);
+
+        // Build relay pool: accepts all transactions without validation,
+        // tip-based ordering, no blob sidecar storage.
+        // Cap: ~2k pending + 1.5k basefee + 1.5k queued ≈ 5k total transactions.
+        let pool = Pool::new(
+            MockTransactionValidator::default(),
+            CoinbaseTipOrdering::default(),
+            NoopBlobStore::default(),
+            PoolConfig {
+                pending_limit: SubPoolLimit { max_txs: 2000, max_size: 20 * 1024 * 1024 },
+                basefee_limit: SubPoolLimit { max_txs: 1500, max_size: 15 * 1024 * 1024 },
+                queued_limit:  SubPoolLimit { max_txs: 1500, max_size: 15 * 1024 * 1024 },
+                ..PoolConfig::default()
+            },
+        );
+
+        // TransactionsManager owns all tx gossip protocol logic:
+        // - Receives NewPooledTransactionHashes from peers
+        // - Fetches full transactions via GetPooledTransactions
+        // - Stores in pool and announces to other peers
+        // Runs for the process lifetime alongside NetworkManager.
+        let tx_manager = TransactionsManager::new(
+            handle.clone(),
+            pool.clone(),
+            tx_events_rx,
+            TransactionsManagerConfig::default(),
+        );
+        tokio::spawn(tx_manager);
 
         // Spawn peer tracking task.
         // Listens to NetworkEvents and maintains the connected peer map so that
@@ -323,6 +378,7 @@ impl DevP2PNetwork {
             handle,
             peers,
             blacklisted: Arc::new(RwLock::new(HashSet::new())),
+            pool,
         })
     }
 
