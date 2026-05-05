@@ -7700,6 +7700,7 @@ dependencies = [
  "indicatif",
  "openssl",
  "reqwest 0.13.2",
+ "reth-dns-discovery",
  "reth-eth-wire",
  "reth-ethereum-forks",
  "reth-ethereum-primitives",

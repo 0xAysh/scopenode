@@ -39,6 +39,7 @@ reth-storage-api         = { git = "https://github.com/paradigmxyz/reth", tag = 
 reth-transaction-pool    = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3", default-features = false }
 reth-ethereum-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3", default-features = false }
 reth-ethereum-forks      = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3", default-features = false }
+reth-dns-discovery       = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3", default-features = false }
 tokio-stream             = "0.1"
 axum                     = { version = "0.7", features = ["tokio"] }
 tower-http               = { version = "0.5", features = ["cors"] }
