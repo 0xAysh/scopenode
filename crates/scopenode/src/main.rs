@@ -27,6 +27,18 @@ use tracing_subscriber::{fmt, EnvFilter};
 /// takes precedence over `-v` flags when set.
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Daemon child mode — detected BEFORE any CLI parsing or logging setup.
+    // The daemon installs its own tracing subscriber.
+    if std::env::var(scopenode_core::daemon::DAEMON_CHILD_ENV).is_ok() {
+        let data_dir = std::env::var("SCOPENODE_DAEMON_DATA_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| default_data_dir());
+        std::fs::create_dir_all(&data_dir)
+            .with_context(|| format!("daemon: failed to create data dir: {}", data_dir.display()))?;
+        scopenode_core::daemon::DaemonBoot::run(data_dir).await?;
+        return Ok(());
+    }
+
     let cli = Cli::parse();
 
     // Map verbosity flags to log levels:

@@ -669,6 +669,209 @@ pub async fn cleanup_stale_files(data_dir: &Path) {
     }
 }
 
+// ── DaemonBoot ────────────────────────────────────────────────────────────────
+
+/// The daemon's boot sequence and job runner loop.
+///
+/// Called by the daemon child process (detected via `SCOPENODE_DAEMON_CHILD` env var).
+pub struct DaemonBoot;
+
+impl DaemonBoot {
+    /// Run the full daemon lifecycle:
+    /// 1. Clean up stale socket/pid files
+    /// 2. Bind Unix socket (before peer discovery so clients can connect immediately)
+    /// 3. Acquire PID file
+    /// 4. Set up tracing with `DaemonLogLayer`
+    /// 5. Spawn accept loop
+    /// 6. Start `DevP2PNetwork` (blocks until first peer in background)
+    /// 7. Job runner loop
+    /// 8. Graceful shutdown
+    pub async fn run(data_dir: PathBuf) -> Result<()> {
+        cleanup_stale_files(&data_dir).await;
+
+        let sock_path = socket_path(&data_dir);
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = UnixListener::bind(&sock_path)
+            .with_context(|| format!("failed to bind daemon socket: {}", sock_path.display()))?;
+
+        let _pid_file = PidFile::acquire(pid_path(&data_dir))?;
+
+        let (job_tx, job_rx) = mpsc::channel::<SyncJobRequest>(32);
+        let (event_tx, _) = broadcast::channel::<DaemonResponse>(1024);
+        let ring_buf: Arc<RwLock<VecDeque<LogLine>>> = Arc::new(RwLock::new(VecDeque::new()));
+        let token = tokio_util::sync::CancellationToken::new();
+        let peer_count = Arc::new(AtomicU32::new(0));
+        let job_counter = Arc::new(AtomicU64::new(0));
+        let job_queue_len = Arc::new(AtomicU64::new(0));
+        let active_job = Arc::new(ActiveJobState::default());
+
+        // Install tracing subscriber with both fmt layer (→ daemon.log via stdio redirect)
+        // and DaemonLogLayer (→ ring buffer + broadcast for `sn logs`).
+        let log_layer = DaemonLogLayer::new(
+            Arc::clone(&ring_buf),
+            event_tx.clone(),
+            Some(&data_dir.join("daemon.log")),
+        );
+        use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
+        tracing_subscriber::registry()
+            .with(fmt::layer().with_target(false))
+            .with(log_layer)
+            .init();
+
+        tracing::info!("daemon starting — data_dir={}", data_dir.display());
+
+        let server = DaemonServer::new(
+            listener,
+            job_tx,
+            event_tx.clone(),
+            Arc::clone(&ring_buf),
+            token.clone(),
+            Arc::clone(&peer_count),
+            Arc::clone(&job_counter),
+            Arc::clone(&job_queue_len),
+            Arc::clone(&active_job),
+        );
+        let tracker = tokio_util::task::TaskTracker::new();
+        tracker.spawn(server.accept_loop());
+
+        // Start DevP2PNetwork in a background task — blocks until first peer.
+        let (net_tx, net_rx) = tokio::sync::oneshot::channel();
+        let data_dir_clone = data_dir.clone();
+        tokio::spawn(async move {
+            match crate::network::DevP2PNetwork::start(&data_dir_clone).await {
+                Ok(net) => {
+                    let _ = net_tx.send(Arc::new(net));
+                }
+                Err(e) => {
+                    tracing::error!("devp2p startup failed: {e:#}");
+                }
+            }
+        });
+
+        tracing::info!("daemon socket ready — waiting for devp2p peers...");
+
+        let network = net_rx
+            .await
+            .context("devp2p task exited without providing network")?;
+        {
+            use crate::network::EthNetwork;
+            peer_count.store(network.peer_count().await as u32, Ordering::Relaxed);
+        }
+        tracing::info!("daemon ready — {} peer(s) connected", peer_count.load(Ordering::Relaxed));
+
+        let db = scopenode_storage::Db::open(data_dir.join("scopenode.db"))
+            .await
+            .context("daemon: failed to open database")?;
+
+        Self::job_runner(
+            job_rx,
+            network,
+            db,
+            event_tx,
+            active_job,
+            job_queue_len,
+            token.clone(),
+        )
+        .await;
+
+        tracker.close();
+        tracker.wait().await;
+        let _ = std::fs::remove_file(&sock_path);
+        tracing::info!("daemon stopped");
+        Ok(())
+    }
+
+    async fn job_runner(
+        mut job_rx: mpsc::Receiver<SyncJobRequest>,
+        network: Arc<crate::network::DevP2PNetwork>,
+        db: scopenode_storage::Db,
+        event_tx: broadcast::Sender<DaemonResponse>,
+        active_job: Arc<ActiveJobState>,
+        job_queue_len: Arc<AtomicU64>,
+        token: tokio_util::sync::CancellationToken,
+    ) {
+        loop {
+            tokio::select! {
+                job = job_rx.recv() => {
+                    let Some(job) = job else { break };
+                    let _ = job_queue_len.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                        Some(v.saturating_sub(1))
+                    });
+                    active_job.active.store(true, Ordering::Relaxed);
+                    active_job.job_id.store(job.job_id, Ordering::Relaxed);
+                    active_job.stage.store(1, Ordering::Relaxed);
+                    active_job.pos.store(0, Ordering::Relaxed);
+                    active_job.total.store(0, Ordering::Relaxed);
+
+                    tracing::info!("daemon: starting job {} — config={}", job.job_id, job.config_path);
+                    let result = run_job(&job, &network, db.clone(), event_tx.clone(), Arc::clone(&active_job)).await;
+
+                    active_job.active.store(false, Ordering::Relaxed);
+
+                    if let Err(e) = result {
+                        let msg = format!("{e:#}");
+                        tracing::error!("daemon: job {} failed: {msg}", job.job_id);
+                        let _ = event_tx.send(DaemonResponse::Error { msg });
+                    }
+                }
+                _ = token.cancelled() => break,
+            }
+        }
+    }
+}
+
+async fn run_job(
+    job: &SyncJobRequest,
+    network: &Arc<crate::network::DevP2PNetwork>,
+    db: scopenode_storage::Db,
+    event_tx: broadcast::Sender<DaemonResponse>,
+    active_job: Arc<ActiveJobState>,
+) -> Result<()> {
+    use crate::config::{Config, parse_blocks_flag};
+    use crate::pipeline::Pipeline;
+    use indicatif::{MultiProgress, ProgressDrawTarget};
+
+    let mut config = Config::from_file(std::path::Path::new(&job.config_path))
+        .with_context(|| format!("failed to load config: {}", job.config_path))?;
+
+    if let Some(ref range) = job.blocks_override {
+        let (from, to) = parse_blocks_flag(range)
+            .map_err(|e| anyhow::anyhow!("invalid blocks override \"{range}\": {e}"))?;
+        for contract in &mut config.contracts {
+            contract.from_block = from;
+            contract.to_block = to;
+        }
+    }
+
+    let _ = event_tx.send(DaemonResponse::Progress {
+        job_id: job.job_id,
+        stage: 1,
+        pos: 0,
+        total: 1,
+        msg: "Starting sync pipeline...".into(),
+    });
+    active_job.stage.store(1, Ordering::Relaxed);
+
+    let progress = MultiProgress::new();
+    progress.set_draw_target(ProgressDrawTarget::hidden());
+
+    let mut pipeline = Pipeline::new(config.clone(), Arc::clone(network), db.clone());
+    pipeline.run(false, &progress).await.context("pipeline failed")?;
+
+    // Count events stored for this job's contracts.
+    let mut events_found: u64 = 0;
+    for contract in &config.contracts {
+        let addr = contract.address.to_checksum(None);
+        if let Ok(n) = db.count_events_for_contract(&addr).await {
+            events_found += n as u64;
+        }
+    }
+
+    let _ = event_tx.send(DaemonResponse::JobComplete { job_id: job.job_id, events_found });
+    tracing::info!("daemon: job {} complete — {events_found} events", job.job_id);
+    Ok(())
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

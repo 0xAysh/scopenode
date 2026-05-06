@@ -333,6 +333,30 @@ pub fn parse_block_shorthand(s: &str) -> Result<u64, String> {
     }
 }
 
+/// Parse a `--blocks` range string into `(from_block, to_block)`.
+///
+/// Formats: `"16M:17M"` or `"16M:+1000"` (relative offset).
+pub fn parse_blocks_flag(s: &str) -> Result<(u64, Option<u64>), String> {
+    let (left, right) = s.split_once(':').ok_or_else(|| {
+        format!("expected colon separator in \"{s}\" — use e.g. \"16M:17M\" or \"16M:+1000\"")
+    })?;
+    let from = parse_block_shorthand(left.trim())?;
+    let right = right.trim();
+    let to = if let Some(offset_str) = right.strip_prefix('+') {
+        let offset: u64 = offset_str
+            .parse()
+            .map_err(|_| format!("invalid relative offset \"+{offset_str}\""))?;
+        from.checked_add(offset)
+            .ok_or_else(|| format!("block range overflow: {from} + {offset}"))?
+    } else {
+        parse_block_shorthand(right)?
+    };
+    if to < from {
+        return Err(format!("to_block ({to}) must be >= from_block ({from})"));
+    }
+    Ok((from, Some(to)))
+}
+
 fn default_port() -> u16 {
     8545
 }
