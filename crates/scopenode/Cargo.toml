@@ -23,6 +23,8 @@ alloy-primitives  = { workspace = true }
 sqlx              = { workspace = true }
 tokio-stream      = { workspace = true }
 reqwest           = { workspace = true }
+tokio-util        = { workspace = true }
+libc              = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
