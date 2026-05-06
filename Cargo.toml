@@ -41,6 +41,9 @@ reth-ethereum-primitives = { git = "https://github.com/paradigmxyz/reth", tag = 
 reth-ethereum-forks      = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3", default-features = false }
 reth-dns-discovery       = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3", default-features = false }
 tokio-stream             = "0.1"
+tokio-util               = { version = "0.7", features = ["codec", "rt"] }
+libc                     = "0.2"
+notify-debouncer-full    = "0.7"
 axum                     = { version = "0.7", features = ["tokio"] }
 tower-http               = { version = "0.5", features = ["cors"] }
 scopenode-core    = { path = "crates/scopenode-core" }
