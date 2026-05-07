@@ -1,5 +1,13 @@
 # scopenode
 
+> **Project status: active refactor / product pivot**
+>
+> scopenode is currently undergoing a significant architectural refactor and
+> product direction review. The current implementation is experimental and is
+> not recommended for production use or critical workflows. Expect bugs,
+> incomplete behavior, and core functionality that may change substantially as
+> the project evolves.
+
 A custom Ethereum node that syncs exactly the contract events you care about — directly from mainnet peers, verified cryptographically, served locally at `localhost:8545`.
 
 No Infura. No Alchemy. No API keys. No rate limits.

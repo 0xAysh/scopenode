@@ -17,6 +17,7 @@
 
 pub mod abi;
 pub mod beacon;
+pub mod daemon;
 pub mod config;
 pub mod helios_client;
 pub mod error;

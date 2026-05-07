@@ -15,36 +15,48 @@
 //! 4. Start JSON-RPC server on the configured port
 //! 5. If any contract has no `to_block`, enter live sync mode
 
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
-use alloy_primitives::B256;
 use scopenode_core::{
-    beacon::BeaconStatus,
     config::Config,
-    live::LiveSyncer,
-    network::{DevP2PNetwork, EthNetwork},
+    daemon::{
+        connect_daemon, pid_path, read_live_pid, send_request, socket_path, spawn_daemon,
+        DaemonRequest, DaemonResponse,
+    },
+    network::DevP2PNetwork,
     pipeline::Pipeline,
-    types::StoredEvent,
 };
-use scopenode_rpc::{start_rest_server, start_server};
 use scopenode_storage::Db;
-use tokio::sync::{broadcast, watch};
+use tokio::net::UnixStream;
+use tokio_util::codec::{Framed, LinesCodec};
 use tracing::info;
 
 /// Run the `sync` command.
+///
+/// Non-dry-run mode connects to (or starts) the daemon and submits a SyncJob.
+/// Dry-run mode runs the bloom estimate in-process without the daemon.
 pub async fn run(
     mut config: Config,
-    db: Db,
+    _db: Db,
     dry_run: bool,
     quiet: bool,
     blocks_override: Option<String>,
     data_dir: PathBuf,
+    config_path: PathBuf,
 ) -> Result<()> {
+    // Non-dry-run → daemon mode.
+    if !dry_run {
+        let abs_config = config_path
+            .canonicalize()
+            .unwrap_or_else(|_| config_path.clone());
+        return run_daemon_mode(abs_config, blocks_override, &data_dir).await;
+    }
+
+    // Dry-run: bloom estimate only, in-process, no daemon.
     if let Some(ref range_str) = blocks_override {
         let (from, to) = parse_blocks_flag(range_str)
             .map_err(|e| anyhow::anyhow!("Invalid --blocks argument \"{range_str}\": {e}"))?;
@@ -55,7 +67,6 @@ pub async fn run(
         info!(?from, ?to, "--blocks override applied to all contracts");
     }
 
-    // Spinner during peer discovery (shown in all modes).
     let spinner_progress = MultiProgress::new();
     if quiet {
         spinner_progress.set_draw_target(ProgressDrawTarget::hidden());
@@ -74,178 +85,144 @@ pub async fn run(
             .await
             .context("Failed to start devp2p network")?,
     );
+    spinner.finish_with_message("Connected to Ethereum mainnet peers ✓");
 
-    let port = config.node.port;
-    let has_live = config.contracts.iter().any(|c| c.to_block.is_none());
-
-    if dry_run || quiet {
-        spinner.finish_with_message("Connected to Ethereum mainnet peers ✓");
-
-        let progress = MultiProgress::new();
-        if quiet {
-            progress.set_draw_target(ProgressDrawTarget::hidden());
-        }
-
-        let mut pipeline = Pipeline::new(config.clone(), Arc::clone(&network), db.clone());
-        pipeline
-            .run(dry_run, &progress)
-            .await
-            .context("Pipeline failed")?;
-
-        if !dry_run {
-            let (tx, _) = broadcast::channel::<StoredEvent>(1024);
-            let (headers_tx, _) = broadcast::channel::<(u64, B256, u64)>(1024);
-            let peer_count_atom = Arc::new(AtomicUsize::new(network.peer_count().await));
-            println!("\nSync complete. Starting servers on ports {port} (JSON-RPC) and {} (REST)...", port + 1);
-            let handle = start_server(port, db.clone(), tx.clone(), headers_tx.clone(), Arc::clone(&peer_count_atom))
-                .await
-                .context("Failed to start JSON-RPC server")?;
-            start_rest_server(port + 1, db.clone(), tx.clone())
-                .await
-                .context("Failed to start REST server")?;
-
-            if has_live {
-                println!("Entering live sync (Ctrl+C to stop)...");
-                let (beacon_tx, _beacon_rx) = watch::channel(BeaconStatus::NotConfigured);
-                let beacon_tx = Arc::new(beacon_tx);
-                let syncer =
-                    LiveSyncer::new(config, network, db, tx, headers_tx, beacon_tx, Some(data_dir.clone()));
-                tokio::select! {
-                    res = syncer.run() => {
-                        if let Err(e) = res { eprintln!("Live sync error: {e:#}"); }
-                    }
-                    _ = tokio::signal::ctrl_c() => {}
-                }
-            } else {
-                info!(port, "Historical sync done. Press Ctrl+C to stop.");
-                tokio::signal::ctrl_c()
-                    .await
-                    .context("Failed to listen for Ctrl+C")?;
-            }
-
-            println!("\nShutting down...");
-            handle.stop()?;
-        }
-    } else {
-        spinner.finish_with_message("Connected to Ethereum mainnet peers ✓");
-        run_plain(config, db, network, port, has_live, data_dir).await?;
+    let progress = MultiProgress::new();
+    if quiet {
+        progress.set_draw_target(ProgressDrawTarget::hidden());
     }
+    let mut pipeline = Pipeline::new(config, Arc::clone(&network), _db);
+    pipeline.run(true, &progress).await.context("Pipeline failed")?;
 
     Ok(())
 }
 
-/// Run the sync pipeline and live sync with plain terminal output.
-///
-/// Historical sync shows indicatif Stage 1/2/3 progress bars. After historical
-/// sync completes, prints the server addresses and enters live sync mode,
-/// printing one line per event. Ctrl+C exits cleanly.
-async fn run_plain<N: EthNetwork + 'static>(
-    config: Config,
-    db: Db,
-    network: Arc<N>,
-    port: u16,
-    has_live: bool,
-    data_dir: PathBuf,
+// ── Daemon-aware sync ─────────────────────────────────────────────────────────
+
+/// Connect to a running daemon or start one, then submit a SyncJob and stream
+/// Progress messages to indicatif bars. Detaches on Ctrl+C — job continues.
+async fn run_daemon_mode(
+    config_path: PathBuf,
+    blocks_override: Option<String>,
+    data_dir: &Path,
 ) -> Result<()> {
-    let contracts = config.contracts.len();
-    let peers = network.peer_count().await;
-    let config_name = "config.toml";
-    println!("scopenode  config: {config_name}  contracts: {contracts}  peers: {peers}  port: {port}");
+    let mut framed = connect_or_start_daemon(data_dir).await?;
 
-    // Historical sync — visible progress bars from the pipeline.
-    let progress = MultiProgress::new();
-    let mut pipeline = Pipeline::new(config.clone(), Arc::clone(&network), db.clone());
-    pipeline.run(false, &progress).await.context("Pipeline failed")?;
+    let req = DaemonRequest::SyncJob {
+        config_path: config_path.display().to_string(),
+        blocks_override,
+    };
+    send_request(&mut framed, &req).await?;
 
-    println!("\nHistorical sync complete.");
-    println!("JSON-RPC  → localhost:{port}");
-    println!("REST/SSE  → localhost:{}", port + 1);
+    use tokio_stream::StreamExt;
+    let mp = MultiProgress::new();
+    let mut bars: [Option<ProgressBar>; 3] = [None, None, None];
 
-    let (broadcast_tx, _) = broadcast::channel::<StoredEvent>(1024);
-    let (headers_tx, _) = broadcast::channel::<(u64, B256, u64)>(1024);
-    // peer_count_atom is set at startup; refreshed on a best-effort basis in the live loop.
-    let peer_count_atom = Arc::new(AtomicUsize::new(peers));
-
-    let handle = start_server(port, db.clone(), broadcast_tx.clone(), headers_tx.clone(), Arc::clone(&peer_count_atom))
-        .await
-        .context("Failed to start JSON-RPC server")?;
-    start_rest_server(port + 1, db.clone(), broadcast_tx.clone())
-        .await
-        .context("Failed to start REST server")?;
-
-    if has_live {
-        println!("\nLive sync started — Ctrl+C to stop\n");
-
-        // Subscribe before spawning LiveSyncer so no events are missed in the gap.
-        let mut broadcast_rx = broadcast_tx.subscribe();
-
-        let (beacon_tx, _beacon_rx) = watch::channel(BeaconStatus::NotConfigured);
-        let beacon_tx = Arc::new(beacon_tx);
-        let syncer = LiveSyncer::new(
-            config.clone(),
-            Arc::clone(&network),
-            db.clone(),
-            broadcast_tx.clone(),
-            headers_tx.clone(),
-            Arc::clone(&beacon_tx),
-            Some(data_dir.clone()),
-        );
-        tokio::spawn(async move {
-            if let Err(e) = syncer.run().await {
-                eprintln!("Live sync error: {e:#}");
+    loop {
+        tokio::select! {
+            msg = framed.next() => {
+                match msg {
+                    Some(Ok(line)) => {
+                        let resp: DaemonResponse = match serde_json::from_str(&line) {
+                            Ok(r) => r,
+                            Err(_) => continue,
+                        };
+                        match resp {
+                            DaemonResponse::JobAccepted { job_id, queue_position } => {
+                                if queue_position > 1 {
+                                    println!("queued at position {queue_position} — waiting for current job to finish...");
+                                } else {
+                                    println!("job {job_id} accepted — syncing...");
+                                }
+                            }
+                            DaemonResponse::JobStateSnapshot { stage, pos, total, .. } => {
+                                ensure_bar(&mp, &mut bars, stage, pos, total);
+                            }
+                            DaemonResponse::Progress { stage, pos, total, msg, .. } => {
+                                let bar = ensure_bar(&mp, &mut bars, stage, pos, total);
+                                bar.set_position(pos);
+                                if !msg.is_empty() {
+                                    bar.set_message(msg);
+                                }
+                            }
+                            DaemonResponse::JobComplete { events_found, .. } => {
+                                for bar in bars.iter().flatten() {
+                                    bar.finish_and_clear();
+                                }
+                                println!("done — {events_found} events");
+                                return Ok(());
+                            }
+                            DaemonResponse::Error { msg } => {
+                                anyhow::bail!("daemon error: {msg}");
+                            }
+                            _ => {}
+                        }
+                    }
+                    Some(Err(e)) => anyhow::bail!("connection error: {e}"),
+                    None => {
+                        println!("daemon disconnected");
+                        return Ok(());
+                    }
+                }
             }
-        });
-
-        let mut blocks_since_event: u64 = 0;
-        let mut tick = tokio::time::interval(Duration::from_secs(6));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        loop {
-            tokio::select! {
-                ev = broadcast_rx.recv() => {
-                    match ev {
-                        Ok(event) => {
-                            blocks_since_event = 0;
-                            let name = config.contracts.iter()
-                                .find(|c| c.address == event.contract)
-                                .and_then(|c| c.name.clone())
-                                .unwrap_or_else(|| event.contract.to_checksum(None));
-                            let tx_short = {
-                                let s = format!("{}", event.tx_hash);
-                                format!("{}...", &s[..s.len().min(12)])
-                            };
-                            println!("[{:>10}]  {:<24}  {:<20}  tx={tx_short}",
-                                event.block_number, name, event.event_name);
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            eprintln!("warn: live event receiver lagged, skipped {n} events");
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    }
-                }
-
-                _ = tick.tick() => {
-                    blocks_since_event += 1;
-                    if blocks_since_event > 0 && blocks_since_event % 100 == 0 {
-                        let p = network.peer_count().await;
-                        peer_count_atom.store(p, Ordering::Relaxed);
-                        println!("[          ]  live — {p} peers, no events in last 100 blocks");
-                    }
-                }
-
-                _ = tokio::signal::ctrl_c() => break,
+            _ = tokio::signal::ctrl_c() => {
+                println!("\ndetached — job continues in daemon");
+                return Ok(());
             }
         }
-    } else {
-        info!(port, "Historical sync done. Press Ctrl+C to stop.");
-        tokio::signal::ctrl_c()
-            .await
-            .context("Failed to listen for Ctrl+C")?;
+    }
+}
+
+fn ensure_bar<'a>(
+    mp: &MultiProgress,
+    bars: &'a mut [Option<ProgressBar>; 3],
+    stage: u8,
+    pos: u64,
+    total: u64,
+) -> &'a ProgressBar {
+    let idx = stage.saturating_sub(1) as usize;
+    let idx = idx.min(2);
+    if bars[idx].is_none() {
+        let label = match stage {
+            1 => "Stage 1/3 Header sync",
+            2 => "Stage 2/3 Bloom scan",
+            _ => "Stage 3/3 Receipt fetch",
+        };
+        let bar = mp.add(ProgressBar::new(total.max(1)));
+        bar.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.cyan} {msg} [{bar:40.green/blue}] {pos}/{len}")
+                .unwrap_or_else(|_| ProgressStyle::default_bar()),
+        );
+        bar.set_message(label);
+        bar.set_position(pos);
+        bars[idx] = Some(bar);
+    }
+    bars[idx].as_ref().unwrap()
+}
+
+/// Connect to a running daemon or spawn one and wait for the socket to appear.
+async fn connect_or_start_daemon(data_dir: &Path) -> Result<Framed<UnixStream, LinesCodec>> {
+    let pid_p = pid_path(data_dir);
+    let sock_p = socket_path(data_dir);
+
+    let daemon_running = read_live_pid(&pid_p).is_some() && sock_p.exists();
+
+    if !daemon_running {
+        spawn_daemon(data_dir)?;
+        // Retry connecting for up to 3s (30 × 100ms).
+        for _ in 0..30 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if let Ok(framed) = connect_daemon(data_dir).await {
+                return Ok(framed);
+            }
+        }
+        anyhow::bail!("daemon failed to start — check {}", data_dir.join("daemon.log").display());
     }
 
-    println!("\nscopenode stopped.");
-    handle.stop()?;
-    Ok(())
+    connect_daemon(data_dir)
+        .await
+        .context("failed to connect to running daemon")
 }
 
 // ── --blocks flag parsing ─────────────────────────────────────────────────────
