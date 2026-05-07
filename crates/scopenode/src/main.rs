@@ -158,6 +158,23 @@ async fn main() -> Result<()> {
             commands::doctor::run(db, &data_dir).await?;
         }
 
+        Command::Start => {
+            let data_dir = resolve_data_dir_no_config(&cli.data_dir);
+            std::fs::create_dir_all(&data_dir)
+                .with_context(|| format!("Failed to create data dir: {}", data_dir.display()))?;
+            commands::start::run(&data_dir).await?;
+        }
+
+        Command::Stop { force } => {
+            let data_dir = resolve_data_dir_no_config(&cli.data_dir);
+            commands::stop::run(&data_dir, *force).await?;
+        }
+
+        Command::Logs { lines } => {
+            let data_dir = resolve_data_dir_no_config(&cli.data_dir);
+            commands::logs::run(&data_dir, *lines).await?;
+        }
+
         Command::Export {
             contract,
             event,
