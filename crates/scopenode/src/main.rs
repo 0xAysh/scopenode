@@ -88,7 +88,7 @@ async fn main() -> Result<()> {
                 .await
                 .context("Failed to open database")?;
 
-            commands::status::run(db).await?;
+            commands::status::run(db, &data_dir).await?;
         }
 
         Command::Query {

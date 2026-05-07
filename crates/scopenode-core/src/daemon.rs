@@ -720,6 +720,7 @@ impl DaemonBoot {
 
         tracing::info!("daemon starting — data_dir={}", data_dir.display());
 
+        let job_tx_for_runner = job_tx.clone();
         let server = DaemonServer::new(
             listener,
             job_tx,
@@ -765,6 +766,8 @@ impl DaemonBoot {
 
         Self::job_runner(
             job_rx,
+            job_tx_for_runner,
+            job_counter,
             network,
             db,
             event_tx,
@@ -783,6 +786,8 @@ impl DaemonBoot {
 
     async fn job_runner(
         mut job_rx: mpsc::Receiver<SyncJobRequest>,
+        job_tx: mpsc::Sender<SyncJobRequest>,
+        job_counter: Arc<AtomicU64>,
         network: Arc<crate::network::DevP2PNetwork>,
         db: scopenode_storage::Db,
         event_tx: broadcast::Sender<DaemonResponse>,
@@ -802,6 +807,15 @@ impl DaemonBoot {
                     active_job.stage.store(1, Ordering::Relaxed);
                     active_job.pos.store(0, Ordering::Relaxed);
                     active_job.total.store(0, Ordering::Relaxed);
+
+                    // Start watching the config file for hot-reload.
+                    let _watcher = watch_config(
+                        std::path::Path::new(&job.config_path),
+                        job_tx.clone(),
+                        Arc::clone(&job_counter),
+                        Arc::clone(&job_queue_len),
+                        db.clone(),
+                    );
 
                     tracing::info!("daemon: starting job {} — config={}", job.job_id, job.config_path);
                     let result = run_job(&job, &network, db.clone(), event_tx.clone(), Arc::clone(&active_job)).await;
@@ -870,6 +884,137 @@ async fn run_job(
     let _ = event_tx.send(DaemonResponse::JobComplete { job_id: job.job_id, events_found });
     tracing::info!("daemon: job {} complete — {events_found} events", job.job_id);
     Ok(())
+}
+
+// ── Config hot-reload ─────────────────────────────────────────────────────────
+
+/// Watch a config file for changes and enqueue new historical contracts.
+///
+/// Uses `notify-debouncer-full` with a 200ms debounce. New contracts with
+/// `to_block = None` (live) are skipped with a warning.
+pub fn watch_config(
+    config_path: &std::path::Path,
+    job_tx: mpsc::Sender<SyncJobRequest>,
+    job_counter: Arc<AtomicU64>,
+    job_queue_len: Arc<AtomicU64>,
+    db: scopenode_storage::Db,
+) -> Result<notify_debouncer_full::Debouncer<notify_debouncer_full::notify::RecommendedWatcher, notify_debouncer_full::RecommendedCache>> {
+    use notify_debouncer_full::{new_debouncer, notify::RecursiveMode};
+
+    let config_path = config_path
+        .canonicalize()
+        .unwrap_or_else(|_| config_path.to_path_buf());
+    let config_path_str = config_path.display().to_string();
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let debounce = std::time::Duration::from_millis(200);
+
+    let mut debouncer = new_debouncer(debounce, None, tx)
+        .context("failed to create file watcher")?;
+    debouncer
+        .watch(&config_path, RecursiveMode::NonRecursive)
+        .context("failed to watch config path")?;
+
+    // Capture the tokio runtime handle before entering the sync thread.
+    let handle = tokio::runtime::Handle::current();
+
+    // Bridge the sync notify channel to the async job queue.
+    std::thread::spawn(move || {
+        for events in rx {
+            let events = match events {
+                Ok(e) => e,
+                Err(errs) => {
+                    for e in errs {
+                        warn!("hot-reload: watcher error: {e}");
+                    }
+                    continue;
+                }
+            };
+
+            // Check if any event is a delete/rename.
+            for ev in &events {
+                use notify_debouncer_full::notify::EventKind;
+                if matches!(ev.kind, EventKind::Remove(_)) {
+                    warn!("hot-reload: config file no longer accessible — watch cancelled");
+                    return;
+                }
+            }
+
+            let config = match crate::config::Config::from_file(std::path::Path::new(&config_path_str)) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("hot-reload: failed to parse {config_path_str}: {e}");
+                    continue;
+                }
+            };
+
+            let db_clone = db.clone();
+            let job_tx_clone = job_tx.clone();
+            let job_counter_clone = Arc::clone(&job_counter);
+            let job_queue_len_clone = Arc::clone(&job_queue_len);
+            let config_path_clone = config_path_str.clone();
+
+            handle.spawn(async move {
+                enqueue_new_contracts(
+                    &config,
+                    &config_path_clone,
+                    &db_clone,
+                    &job_tx_clone,
+                    &job_counter_clone,
+                    &job_queue_len_clone,
+                ).await;
+            });
+        }
+    });
+
+    Ok(debouncer)
+}
+
+async fn enqueue_new_contracts(
+    config: &crate::config::Config,
+    config_path: &str,
+    db: &scopenode_storage::Db,
+    job_tx: &mpsc::Sender<SyncJobRequest>,
+    job_counter: &AtomicU64,
+    job_queue_len: &AtomicU64,
+) {
+    for contract in &config.contracts {
+        if contract.to_block.is_none() {
+            warn!(
+                "hot-reload: live contract {} skipped — requires daemon restart",
+                contract.address
+            );
+            continue;
+        }
+
+        let addr_str = contract.address.to_checksum(None);
+        // Skip if already indexed.
+        match db.count_bloom_candidates(&addr_str).await {
+            Ok(n) if n > 0 => continue,
+            Ok(_) => {}
+            Err(e) => {
+                warn!("hot-reload: db error checking {addr_str}: {e}");
+                continue;
+            }
+        }
+
+        let job_id = job_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        let _ = job_queue_len.fetch_add(1, Ordering::Relaxed);
+
+        let job = SyncJobRequest {
+            job_id,
+            config_path: config_path.to_string(),
+            blocks_override: None,
+        };
+
+        if job_tx.send(job).await.is_ok() {
+            tracing::info!(
+                "hot-reload: enqueued {} {} (job {job_id})",
+                contract.name.as_deref().unwrap_or("(unnamed)"),
+                addr_str
+            );
+        }
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1114,5 +1259,115 @@ mod tests {
 
         let buf = ring_buf.read().await;
         assert_eq!(buf.len(), RING_BUF_CAP, "ring buffer should be capped at {RING_BUF_CAP}");
+    }
+
+    // ── Hot-reload ─────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn hot_reload_enqueues_new_contract() {
+        use std::time::Duration;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("test.toml");
+
+        // Write initial config with no contracts.
+        std::fs::write(&config_path, r#"
+[node]
+port = 8545
+
+[[contracts]]
+name = "TokenA"
+address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+events = ["Transfer"]
+from_block = 1000
+to_block = 2000
+"#).unwrap();
+
+        let (job_tx, mut job_rx) = mpsc::channel::<SyncJobRequest>(32);
+        let job_counter = Arc::new(AtomicU64::new(0));
+        let job_queue_len = Arc::new(AtomicU64::new(0));
+
+        // Use an in-memory DB for testing.
+        let db_path = dir.path().join("test.db");
+        let db = scopenode_storage::Db::open(db_path).await.unwrap();
+
+        let _watcher = watch_config(
+            &config_path,
+            job_tx,
+            Arc::clone(&job_counter),
+            Arc::clone(&job_queue_len),
+            db,
+        ).unwrap();
+
+        // Modify config to add a new contract — should trigger enqueue.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        std::fs::write(&config_path, r#"
+[node]
+port = 8545
+
+[[contracts]]
+name = "TokenA"
+address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+events = ["Transfer"]
+from_block = 1000
+to_block = 2000
+
+[[contracts]]
+name = "TokenB"
+address = "0xdAC17F958D2ee523a2206206994597C13D831ec7"
+events = ["Transfer"]
+from_block = 1000
+to_block = 2000
+"#).unwrap();
+
+        // Wait for debounce + async enqueue (up to 1s).
+        let job = timeout(Duration::from_secs(1), job_rx.recv()).await;
+        assert!(job.is_ok(), "expected a job to be enqueued within 1s after config change");
+    }
+
+    #[tokio::test]
+    async fn hot_reload_skips_live_contracts() {
+        use std::time::Duration;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("test.toml");
+
+        std::fs::write(&config_path, r#"
+[node]
+port = 8545
+"#).unwrap();
+
+        let (job_tx, mut job_rx) = mpsc::channel::<SyncJobRequest>(32);
+        let job_counter = Arc::new(AtomicU64::new(0));
+        let job_queue_len = Arc::new(AtomicU64::new(0));
+        let db_path = dir.path().join("test.db");
+        let db = scopenode_storage::Db::open(db_path).await.unwrap();
+
+        let _watcher = watch_config(
+            &config_path,
+            job_tx,
+            Arc::clone(&job_counter),
+            Arc::clone(&job_queue_len),
+            db,
+        ).unwrap();
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Write a config with only a live contract (no to_block).
+        std::fs::write(&config_path, r#"
+[node]
+port = 8545
+
+[[contracts]]
+name = "LiveContract"
+address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+events = ["Transfer"]
+from_block = 1000
+"#).unwrap();
+
+        // No job should be enqueued for live contracts.
+        let result = timeout(Duration::from_millis(600), job_rx.recv()).await;
+        assert!(result.is_err(), "live contract should not produce a job");
     }
 }
