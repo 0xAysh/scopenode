@@ -3,12 +3,14 @@
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 use thiserror::Error;
 
 pub const ERA1_BLOCKS_PER_FILE: u64 = 8192;
+const E2STORE_VERSION: [u8; 2] = [0x65, 0x32];
+const ERA1_BLOCK_INDEX: [u8; 2] = [0x66, 0x32];
 
 #[derive(Debug, Error)]
 pub enum SourceError {
@@ -26,6 +28,9 @@ pub enum SourceError {
 
     #[error("failed to read source file {path}: {source}")]
     ReadFile { path: PathBuf, source: io::Error },
+
+    #[error("invalid e2store source file {path}: {message}")]
+    InvalidE2Store { path: PathBuf, message: String },
 
     #[error("block range overflow for {path}")]
     RangeOverflow { path: PathBuf },
@@ -153,6 +158,7 @@ pub fn scan_era1_source(
         }
 
         let sha256 = sha256_file(&file_path)?;
+        let content_range = read_era1_block_index_range(&file_path)?;
         let filename = file_path
             .file_name()
             .and_then(|name| name.to_str())
@@ -164,6 +170,11 @@ pub fn scan_era1_source(
             .ok()
             .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
             .map(|duration| duration.as_secs() as i64);
+
+        let (from_block, to_block) = content_range
+            .as_ref()
+            .map(|range| (range.from_block, range.to_block))
+            .unwrap_or((parsed.from_block, parsed.to_block));
 
         files.push(SourceFileManifest {
             format: "era1".to_string(),
@@ -177,8 +188,8 @@ pub fn scan_era1_source(
             sha256,
             checksum_status,
             ranges: vec![SourceRangeManifest {
-                from_block: parsed.from_block,
-                to_block: parsed.to_block,
+                from_block,
+                to_block,
                 completeness: RangeCompleteness::Inferred,
             }],
         });
@@ -317,6 +328,139 @@ fn sha256_file(path: &Path) -> Result<String, SourceError> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+fn read_era1_block_index_range(path: &Path) -> Result<Option<SourceRangeManifest>, SourceError> {
+    let mut file = fs::File::open(path).map_err(|source| SourceError::ReadFile {
+        path: path.to_owned(),
+        source,
+    })?;
+    let mut offset = 0_u64;
+    let mut first = true;
+
+    while let Some(entry) = read_e2store_entry_header(&mut file, path)? {
+        let data_offset = offset
+            .checked_add(8)
+            .ok_or_else(|| SourceError::RangeOverflow {
+                path: path.to_owned(),
+            })?;
+        offset = data_offset
+            .checked_add(entry.length as u64)
+            .ok_or_else(|| SourceError::RangeOverflow {
+                path: path.to_owned(),
+            })?;
+
+        if first {
+            first = false;
+            if entry.entry_type != E2STORE_VERSION {
+                return Err(SourceError::InvalidE2Store {
+                    path: path.to_owned(),
+                    message: "first entry is not the e2store version record".to_string(),
+                });
+            }
+        }
+
+        if entry.entry_type == ERA1_BLOCK_INDEX {
+            let mut data = vec![0_u8; entry.length as usize];
+            file.read_exact(&mut data)
+                .map_err(|source| SourceError::ReadFile {
+                    path: path.to_owned(),
+                    source,
+                })?;
+            return parse_block_index_entry(path, &data).map(Some);
+        }
+
+        file.seek(SeekFrom::Current(entry.length as i64))
+            .map_err(|source| SourceError::ReadFile {
+                path: path.to_owned(),
+                source,
+            })?;
+    }
+
+    Ok(None)
+}
+
+#[derive(Debug)]
+struct E2StoreEntryHeader {
+    entry_type: [u8; 2],
+    length: u32,
+}
+
+fn read_e2store_entry_header(
+    reader: &mut fs::File,
+    path: &Path,
+) -> Result<Option<E2StoreEntryHeader>, SourceError> {
+    let mut header = [0_u8; 8];
+    match reader.read_exact(&mut header) {
+        Ok(()) => {}
+        Err(source) if source.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(source) => {
+            return Err(SourceError::ReadFile {
+                path: path.to_owned(),
+                source,
+            })
+        }
+    }
+
+    let reserved = u16::from_le_bytes([header[6], header[7]]);
+    if reserved != 0 {
+        return Err(SourceError::InvalidE2Store {
+            path: path.to_owned(),
+            message: "entry header reserved field is not zero".to_string(),
+        });
+    }
+
+    Ok(Some(E2StoreEntryHeader {
+        entry_type: [header[0], header[1]],
+        length: u32::from_le_bytes([header[2], header[3], header[4], header[5]]),
+    }))
+}
+
+fn parse_block_index_entry(path: &Path, data: &[u8]) -> Result<SourceRangeManifest, SourceError> {
+    if data.len() < 16 {
+        return Err(SourceError::InvalidE2Store {
+            path: path.to_owned(),
+            message: "block index entry is shorter than 16 bytes".to_string(),
+        });
+    }
+
+    let count = i64::from_le_bytes(data[data.len() - 8..].try_into().unwrap());
+    if count < 0 {
+        return Err(SourceError::InvalidE2Store {
+            path: path.to_owned(),
+            message: "block index count is negative".to_string(),
+        });
+    }
+    let count = count as usize;
+    if count == 0 {
+        return Err(SourceError::InvalidE2Store {
+            path: path.to_owned(),
+            message: "block index count is zero".to_string(),
+        });
+    }
+    let expected_len = 8 + count * 8 + 8;
+    if data.len() != expected_len {
+        return Err(SourceError::InvalidE2Store {
+            path: path.to_owned(),
+            message: format!(
+                "block index length mismatch: expected {expected_len}, got {}",
+                data.len()
+            ),
+        });
+    }
+
+    let starting_number = u64::from_le_bytes(data[0..8].try_into().unwrap());
+    let to_block = starting_number
+        .checked_add(count.saturating_sub(1) as u64)
+        .ok_or_else(|| SourceError::RangeOverflow {
+            path: path.to_owned(),
+        })?;
+
+    Ok(SourceRangeManifest {
+        from_block: starting_number,
+        to_block,
+        completeness: RangeCompleteness::Inferred,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,7 +491,7 @@ mod tests {
     fn ordered_checksum_marks_first_file_verified() {
         let dir = tempdir().unwrap();
         let era1 = dir.path().join("mainnet-00000-5ec1ffb8.era1");
-        fs::write(&era1, b"era1 bytes").unwrap();
+        fs::write(&era1, synthetic_era1_with_block_index(0, &[10])).unwrap();
         let hash = sha256_file(&era1).unwrap();
         fs::write(dir.path().join("checksums.txt"), format!("0x{hash}\n")).unwrap();
 
@@ -362,7 +506,7 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::write(
             dir.path().join("mainnet-00000-5ec1ffb8.era1"),
-            b"era1 bytes",
+            synthetic_era1_with_block_index(0, &[10]),
         )
         .unwrap();
         let wrong_hash = "00".repeat(32);
@@ -376,5 +520,60 @@ mod tests {
                 expected: wrong_hash
             }
         );
+    }
+
+    #[test]
+    fn block_index_overrides_filename_inferred_range() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("mainnet-00000-5ec1ffb8.era1"),
+            synthetic_era1_with_block_index(64, &[10, 20, 30]),
+        )
+        .unwrap();
+
+        let scan = scan_era1_source(dir.path(), None).unwrap();
+
+        assert_eq!(scan.files[0].ranges[0].from_block, 64);
+        assert_eq!(scan.files[0].ranges[0].to_block, 66);
+    }
+
+    #[test]
+    fn empty_block_index_errors() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("mainnet-00000-5ec1ffb8.era1"),
+            synthetic_era1_with_block_index(0, &[]),
+        )
+        .unwrap();
+
+        let err = scan_era1_source(dir.path(), None).unwrap_err();
+
+        assert!(
+            err.to_string().contains("block index count is zero"),
+            "unexpected error: {err}"
+        );
+    }
+
+    fn synthetic_era1_with_block_index(starting_number: u64, offsets: &[i64]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend(e2store_entry([0x65, 0x32], &[]));
+
+        let mut index = Vec::new();
+        index.extend_from_slice(&starting_number.to_le_bytes());
+        for offset in offsets {
+            index.extend_from_slice(&offset.to_le_bytes());
+        }
+        index.extend_from_slice(&(offsets.len() as i64).to_le_bytes());
+        bytes.extend(e2store_entry([0x66, 0x32], &index));
+        bytes
+    }
+
+    fn e2store_entry(entry_type: [u8; 2], data: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(8 + data.len());
+        bytes.extend_from_slice(&entry_type);
+        bytes.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(data);
+        bytes
     }
 }
