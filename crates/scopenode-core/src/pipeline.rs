@@ -666,6 +666,7 @@ mod tests {
                 consensus_checkpoint: None,
                 beacon_sync_timeout_secs: 300,
             },
+            source: None,
             contracts: vec![ContractConfig {
                 name: Some("test".into()),
                 address,

@@ -33,8 +33,9 @@ async fn main() -> Result<()> {
         let data_dir = std::env::var("SCOPENODE_DAEMON_DATA_DIR")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| default_data_dir());
-        std::fs::create_dir_all(&data_dir)
-            .with_context(|| format!("daemon: failed to create data dir: {}", data_dir.display()))?;
+        std::fs::create_dir_all(&data_dir).with_context(|| {
+            format!("daemon: failed to create data dir: {}", data_dir.display())
+        })?;
         scopenode_core::daemon::DaemonBoot::run(data_dir).await?;
         return Ok(());
     }
@@ -53,14 +54,34 @@ async fn main() -> Result<()> {
         _ => "trace",
     };
     // RUST_LOG env var overrides the -v flag when set.
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(log_level));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
     fmt().with_env_filter(filter).with_target(false).init();
 
     match &cli.command {
-        Command::Sync { config, dry_run, blocks } => {
-            let mut cfg =
-                Config::from_file(config).context("Failed to load config")?;
+        Command::Index { config } => {
+            let mut cfg = Config::from_file(config).context("Failed to load config")?;
+
+            if let Some(dir) = &cli.data_dir {
+                cfg.node.data_dir = Some(dir.clone());
+            }
+
+            let data_dir = resolve_data_dir(&cfg);
+            std::fs::create_dir_all(&data_dir)
+                .with_context(|| format!("Failed to create data dir: {}", data_dir.display()))?;
+
+            let db = Db::open(data_dir.join("scopenode.db"))
+                .await
+                .context("Failed to open database")?;
+
+            commands::index::run(cfg, db).await?;
+        }
+
+        Command::Sync {
+            config,
+            dry_run,
+            blocks,
+        } => {
+            let mut cfg = Config::from_file(config).context("Failed to load config")?;
 
             // CLI/env override takes precedence over the config file setting.
             // Order of precedence: --data-dir flag > SCOPENODE_DATA_DIR env > config file > default.
@@ -76,7 +97,16 @@ async fn main() -> Result<()> {
                 .await
                 .context("Failed to open database")?;
 
-            commands::sync::run(cfg, db, *dry_run, cli.quiet, blocks.clone(), data_dir, config.clone()).await?;
+            commands::sync::run(
+                cfg,
+                db,
+                *dry_run,
+                cli.quiet,
+                blocks.clone(),
+                data_dir,
+                config.clone(),
+            )
+            .await?;
         }
 
         Command::Status => {
