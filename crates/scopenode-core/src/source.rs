@@ -1,7 +1,7 @@
 //! Local historical source scanning.
 
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -10,6 +10,10 @@ use thiserror::Error;
 
 pub const ERA1_BLOCKS_PER_FILE: u64 = 8192;
 const E2STORE_VERSION: [u8; 2] = [0x65, 0x32];
+const ERA1_COMPRESSED_HEADER: [u8; 2] = [0x03, 0x00];
+const ERA1_COMPRESSED_BODY: [u8; 2] = [0x04, 0x00];
+const ERA1_COMPRESSED_RECEIPTS: [u8; 2] = [0x05, 0x00];
+const ERA1_TOTAL_DIFFICULTY: [u8; 2] = [0x06, 0x00];
 const ERA1_BLOCK_INDEX: [u8; 2] = [0x66, 0x32];
 
 #[derive(Debug, Error)]
@@ -64,6 +68,15 @@ pub struct SourceRangeManifest {
     pub from_block: u64,
     pub to_block: u64,
     pub completeness: RangeCompleteness,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Era1BlockTuple {
+    pub block_number: u64,
+    pub compressed_header: Vec<u8>,
+    pub compressed_body: Vec<u8>,
+    pub compressed_receipts: Vec<u8>,
+    pub total_difficulty: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,6 +224,62 @@ pub fn scan_era1_source(
         network,
         files,
     })
+}
+
+pub fn read_era1_block_tuple(
+    path: impl AsRef<Path>,
+    block_number: u64,
+) -> Result<Option<Era1BlockTuple>, SourceError> {
+    let path = path.as_ref();
+    let Some(range) = read_era1_block_index_range(path)? else {
+        return Ok(None);
+    };
+    if block_number < range.from_block || block_number > range.to_block {
+        return Ok(None);
+    }
+
+    let target_index = (block_number - range.from_block) as usize;
+    let mut file = fs::File::open(path).map_err(|source| SourceError::ReadFile {
+        path: path.to_owned(),
+        source,
+    })?;
+    let mut headers = VecDeque::new();
+    let mut bodies = VecDeque::new();
+    let mut receipts = VecDeque::new();
+    let mut difficulties = VecDeque::new();
+    let mut block_index = 0_usize;
+
+    while let Some(entry) = read_e2store_entry(&mut file, path)? {
+        match entry.entry_type {
+            E2STORE_VERSION => {}
+            ERA1_COMPRESSED_HEADER => headers.push_back(entry.data),
+            ERA1_COMPRESSED_BODY => bodies.push_back(entry.data),
+            ERA1_COMPRESSED_RECEIPTS => receipts.push_back(entry.data),
+            ERA1_TOTAL_DIFFICULTY => difficulties.push_back(entry.data),
+            ERA1_BLOCK_INDEX => break,
+            _ => {}
+        }
+
+        while !headers.is_empty()
+            && !bodies.is_empty()
+            && !receipts.is_empty()
+            && !difficulties.is_empty()
+        {
+            let tuple = Era1BlockTuple {
+                block_number: range.from_block + block_index as u64,
+                compressed_header: headers.pop_front().unwrap(),
+                compressed_body: bodies.pop_front().unwrap(),
+                compressed_receipts: receipts.pop_front().unwrap(),
+                total_difficulty: difficulties.pop_front().unwrap(),
+            };
+            if block_index == target_index {
+                return Ok(Some(tuple));
+            }
+            block_index += 1;
+        }
+    }
+
+    Ok(None)
 }
 
 fn parse_era1_filename(path: &Path, network_override: Option<&str>) -> Option<Era1FileName> {
@@ -420,6 +489,33 @@ fn read_e2store_entry_header(
     }))
 }
 
+#[derive(Debug)]
+struct E2StoreEntry {
+    entry_type: [u8; 2],
+    data: Vec<u8>,
+}
+
+fn read_e2store_entry(
+    reader: &mut fs::File,
+    path: &Path,
+) -> Result<Option<E2StoreEntry>, SourceError> {
+    let Some(header) = read_e2store_entry_header(reader, path)? else {
+        return Ok(None);
+    };
+    let mut data = vec![0_u8; header.length as usize];
+    reader
+        .read_exact(&mut data)
+        .map_err(|source| SourceError::ReadFile {
+            path: path.to_owned(),
+            source,
+        })?;
+
+    Ok(Some(E2StoreEntry {
+        entry_type: header.entry_type,
+        data,
+    }))
+}
+
 fn parse_block_index_entry(path: &Path, data: &[u8]) -> Result<SourceRangeManifest, SourceError> {
     if data.len() < 16 {
         return Err(SourceError::InvalidE2Store {
@@ -561,6 +657,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reads_raw_block_tuple_by_number() {
+        let dir = tempdir().unwrap();
+        let era1 = dir.path().join("mainnet-00000-5ec1ffb8.era1");
+        fs::write(
+            &era1,
+            synthetic_era1_with_blocks(
+                64,
+                &[("h64", "b64", "r64", "d64"), ("h65", "b65", "r65", "d65")],
+            ),
+        )
+        .unwrap();
+
+        let block = read_era1_block_tuple(&era1, 65).unwrap().unwrap();
+
+        assert_eq!(block.block_number, 65);
+        assert_eq!(block.compressed_header, b"h65");
+        assert_eq!(block.compressed_body, b"b65");
+        assert_eq!(block.compressed_receipts, b"r65");
+        assert_eq!(block.total_difficulty, b"d65");
+    }
+
     fn synthetic_era1_with_block_index(starting_number: u64, offsets: &[i64]) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend(e2store_entry([0x65, 0x32], &[]));
@@ -571,6 +689,32 @@ mod tests {
             index.extend_from_slice(&offset.to_le_bytes());
         }
         index.extend_from_slice(&(offsets.len() as i64).to_le_bytes());
+        bytes.extend(e2store_entry([0x66, 0x32], &index));
+        bytes
+    }
+
+    fn synthetic_era1_with_blocks(
+        starting_number: u64,
+        blocks: &[(&str, &str, &str, &str)],
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend(e2store_entry([0x65, 0x32], &[]));
+        for (header, body, receipts, difficulty) in blocks {
+            bytes.extend(e2store_entry([0x03, 0x00], header.as_bytes()));
+            bytes.extend(e2store_entry([0x04, 0x00], body.as_bytes()));
+            bytes.extend(e2store_entry([0x05, 0x00], receipts.as_bytes()));
+            bytes.extend(e2store_entry([0x06, 0x00], difficulty.as_bytes()));
+        }
+
+        let offsets = (0..blocks.len())
+            .map(|index| index as i64)
+            .collect::<Vec<_>>();
+        let mut index = Vec::new();
+        index.extend_from_slice(&starting_number.to_le_bytes());
+        for offset in offsets {
+            index.extend_from_slice(&offset.to_le_bytes());
+        }
+        index.extend_from_slice(&(blocks.len() as i64).to_le_bytes());
         bytes.extend(e2store_entry([0x66, 0x32], &index));
         bytes
     }
