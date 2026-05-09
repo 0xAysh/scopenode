@@ -5,8 +5,10 @@ edition = "2021"
 
 [dependencies]
 alloy             = { workspace = true }
+alloy-consensus   = { workspace = true }
 alloy-primitives  = { workspace = true }
 alloy-dyn-abi     = { workspace = true }
+alloy-rlp         = { workspace = true }
 alloy-trie        = { workspace = true }
 tokio             = { workspace = true }
 thiserror         = { workspace = true }
@@ -36,6 +38,7 @@ openssl                  = { workspace = true }
 futures                  = { workspace = true }
 hex                      = { workspace = true }
 sha2                     = { workspace = true }
+snap                     = { workspace = true }
 eyre                     = { workspace = true }
 tokio-util               = { workspace = true }
 libc                     = { workspace = true }

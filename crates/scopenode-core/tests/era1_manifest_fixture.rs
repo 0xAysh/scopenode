@@ -1,4 +1,6 @@
-use scopenode_core::source::{scan_era1_source, ChecksumStatus};
+use scopenode_core::source::{
+    decode_era1_header, read_era1_block_tuple, scan_era1_source, ChecksumStatus,
+};
 use std::path::PathBuf;
 
 #[test]
@@ -27,4 +29,30 @@ fn scans_downloaded_era1_fixture_when_present() {
     assert_eq!(file.ranges[0].from_block, 0);
     assert_eq!(file.ranges[0].to_block, 8191);
     assert_eq!(file.checksum_status, ChecksumStatus::Verified);
+}
+
+#[test]
+fn reads_first_block_tuple_from_downloaded_era1_fixture_when_present() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("fixtures/era1/mainnet");
+    let fixture = root.join("mainnet-00000-5ec1ffb8.era1");
+    if !fixture.exists() {
+        eprintln!(
+            "skipping ERA1 block tuple fixture test: {} is missing",
+            fixture.display()
+        );
+        return;
+    }
+
+    let block = read_era1_block_tuple(&fixture, 0).unwrap().unwrap();
+
+    assert_eq!(block.block_number, 0);
+    assert!(!block.compressed_header.is_empty());
+    assert!(!block.compressed_body.is_empty());
+    assert!(!block.compressed_receipts.is_empty());
+    assert!(!block.total_difficulty.is_empty());
+
+    let header = decode_era1_header(&block.compressed_header).unwrap();
+    assert_eq!(header.number, 0);
 }
