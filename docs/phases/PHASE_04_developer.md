@@ -1,101 +1,97 @@
-# Phase 4 — Developer APIs
+# Phase 4 - Developer APIs and Product Polish
 
 ## Goal
 
-Make scopenode useful beyond the terminal. A REST API and SSE stream let
-any app consume events in real time. `scopenode export` writes indexed data
-to CSV or JSON for use in analytics workflows.
-
-**Prerequisite:** Phase 3 — live sync broadcast channel must be running.
-
----
+Make scopenode useful as a local data product, not only a terminal indexing
+tool. Apps should be able to query indexed data through familiar Ethereum APIs,
+REST endpoints, streams, and export workflows while preserving strict coverage
+and verification semantics.
 
 ## What we build
 
-### REST API at `:8546`
+### JSON-RPC compatibility
 
-```
-GET  /events
-       ?contract=0x...
-       &event=Swap
-       &topic0=0xddf252ad...   ← raw topic0 filter (event signature hash)
-       &fromBlock=N  &toBlock=N
-       &limit=100    &offset=0
+scopenode serves Ethereum-compatible JSON-RPC at `localhost:8545`:
 
-GET  /status
-GET  /contracts
-GET  /abi/0x<address>
-GET  /stream/events?contract=0x...&event=Swap     ← SSE
+```text
+eth_getLogs
+eth_blockNumber
+eth_chainId
 ```
 
-CORS open by default. All query params optional and combinable.
-SSE subscribes to the Phase 3 broadcast channel — zero extra overhead.
+Rules:
 
-`topic0` accepts a raw 32-byte hex topic — useful for callers that have the
-event signature hash but not the human-readable name. Matches cryo's
-`--topic0` filter semantics.
+- `eth_getLogs` succeeds only for fully indexed in-scope ranges.
+- Queries outside configured coverage return explicit out-of-scope errors.
+- Queries inside a known incomplete range return explicit incomplete-range errors.
+- `eth_blockNumber` returns the highest fully indexed local block, not network head.
+- `eth_chainId` returns the configured chain id.
 
-### `eth_subscribe` over WebSocket
+### REST API
 
-scopenode already has a broadcast channel for live events (Phase 3). Exposing
-it as a standard Ethereum WebSocket subscription makes scopenode a drop-in for
-Viem/ethers.js `watchContractEvent` — no client changes needed.
+```text
+GET /events
+  ?contract=0x...
+  &event=Swap
+  &topic0=0xddf252ad...
+  &fromBlock=N
+  &toBlock=N
+  &limit=100
+  &offset=0
 
-```bash
-wscat -c ws://localhost:8545
-→ {"jsonrpc":"2.0","id":1,"method":"eth_subscribe","params":["logs",{"address":"0x8ad...","topics":["0xc42...swap topic0"]}]}
-← {"jsonrpc":"2.0","method":"eth_subscription","params":{"subscription":"0x1","result":{...log...}}}
+GET /status
+GET /sources
+GET /scopes
+GET /contracts
+GET /abi/0x<address>
 ```
 
-`jsonrpsee` has built-in WebSocket support — this is mostly wiring the
-broadcast receiver into a subscription response stream.
+REST responses should expose enough coverage metadata that applications can
+distinguish "no matching events" from "range was not indexed."
 
-Supported subscription types:
-- `"logs"` with optional `address` + `topics` filter (mirrors `eth_getLogs` params)
-- `"newHeads"` — emit each new block header as scopenode indexes it
+### Streaming APIs
 
-`eth_unsubscribe` cancels the subscription. Disconnecting a WebSocket client
-drops the receiver automatically (broadcast channel semantics).
+When Phase 3 live/recent indexing is enabled:
 
-### `--topic0` filter on `scopenode query`
-
-```bash
-scopenode query --contract 0xC02... --topic0 0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef
+```text
+GET /stream/events?contract=0x...&event=Swap
+eth_subscribe logs
+eth_subscribe newHeads
 ```
 
-Mirrors the REST `?topic0=` param. Useful for scripts that already hold the
-keccak hash of an event signature and want to avoid passing the ABI.
+Streaming is not required for static historical EraE indexing, but the API
+should be ready to fan out live indexed events when that mode is active.
 
-### `scopenode export`
+### Export
 
 ```bash
 scopenode export --event Swap --format csv  > swaps.csv
 scopenode export --event Swap --format json > swaps.json
 ```
 
-All filters from `/events` available as flags. Streams output — no full
-load into memory.
+Exports stream from SQLite and use the same coverage checks as JSON-RPC and
+REST. A successful export should mean the requested range was fully indexed.
 
----
+### Better local DX
+
+Add polish that makes the product self-explanatory:
+
+- Clear first-run errors for missing EraE source paths.
+- `status` output that shows source coverage and indexed scope coverage.
+- Human-readable progress for manifest scan, bloom scan, receipt verification,
+  decode, and store.
+- `--json` output for automation.
+- Documentation examples for common contract-event indexing workflows.
 
 ## Definition of done
 
-- [x] `GET /events` output matches `eth_getLogs` for same contract + block range
-- [x] `GET /stream/events` delivers live events via SSE within 1s of block processing
-- [x] `scopenode export --format csv/json` both produce valid output
-- [x] `scopenode query --topic0 0x...` returns the same rows as `?event=<name>` for the matching signature
-- [x] `GET /events?topic0=0x...` returns correct results; unknown topic0 returns empty list (not error)
-- [x] `eth_subscribe logs` delivers live events to a WebSocket client within 1s of indexing
-- [x] `eth_subscribe newHeads` emits each new block header as it's indexed
-- [x] `eth_unsubscribe` cancels a subscription; client disconnect auto-cleans the receiver
-- [x] Unit tests: SSE fan-out, export format correctness, topic0 filter, WebSocket filter + fan-out, parity
-
-## New dependencies
-
-```toml
-axum         = "0.7"
-tower-http   = { version = "0.5", features = ["cors"] }
-async-stream = "0.3"
-# eth_subscribe WebSocket — jsonrpsee already in workspace, just enable ws feature
-jsonrpsee    = { version = "0.26", features = ["server", "macros", "ws"] }
-```
+- [ ] `eth_getLogs` matches stored raw log fields for indexed scopes.
+- [ ] JSON-RPC errors distinguish out-of-scope, incomplete, and malformed queries.
+- [ ] `eth_blockNumber` returns the highest fully indexed local block.
+- [ ] REST `/events` supports contract, event, topic0, block range, limit, and offset filters.
+- [ ] REST `/status`, `/sources`, and `/scopes` expose coverage and verification status.
+- [ ] Export supports CSV and JSON without loading all rows into memory.
+- [ ] Streaming APIs work when live/recent indexing is enabled.
+- [ ] Query, REST, export, and JSON-RPC share the same coverage checks.
+- [ ] Docs include an end-to-end EraE indexing example.
+- [ ] Tests cover JSON-RPC parity, REST filtering, export formats, and coverage error behavior.

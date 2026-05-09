@@ -488,40 +488,44 @@ If user action is required, say exactly what command to run.
 
 ## What we build in (rough order)
 
-Phase 1 — MVP (RPC-backed, correct pipeline):
-1. Block header parsing — using `alloy` types and RLP support.
-2. Bloom filter scan — using `alloy`'s bloom filter from parsed headers.
-3. Parallel receipt fetching — `buffer_unordered(32)` + batch consecutive blocks.
-4. Merkle verification — verify `receiptsRoot` proofs using `alloy`'s trie utilities.
-5. ABI decoding — decode event logs using `alloy-sol-types` / `alloy-dyn-abi`.
-6. SQLite storage layer — store verified events with `reorged`, `source`, `block_hash` columns.
-7. JSON-RPC server — serve data at `localhost:8545`.
-8. Progress TUI — real numbers, ETA, pipeline stages.
-9. Resumable sync — store cursor in SQLite, resume on restart.
-10. `--dry-run` — bloom scan only, report estimate before committing to full sync.
-11. `scopenode status` — show what's indexed, sync state, DB size.
-12. `scopenode query` — query local data from terminal.
+Phase 1 - EraE-backed MVP:
+1. Local EraE source config - users point scopenode at historical execution data already on disk.
+2. Source coverage scan - build a manifest of files/chunks and covered block ranges.
+3. Loud incomplete-range failure - never silently index partial history by default.
+4. Header reading and continuity checks - store block number, hash, parent hash, bloom, roots, and timestamp.
+5. Bloom filter scan - find candidate blocks for configured contract address + event topic0 pairs.
+6. Receipt reading from EraE - read receipts only for candidate blocks.
+7. Merkle verification - rebuild receipt tries and compare against `receiptsRoot`.
+8. ABI decoding - decode matching logs using Sourcify or `abi_override`.
+9. SQLite storage layer - store verified raw log fields plus decoded JSON.
+10. Local serving - `eth_getLogs`, `eth_blockNumber`, `eth_chainId` over `localhost:8545`.
+11. Query safety - out-of-scope and incomplete ranges return explicit errors.
+12. New command language - `scopenode index`, `serve`, `status`, `query`, `validate`.
 
-Phase 2 — Trustless (no API keys required):
-13. Beacon light client (live sync only) — Helios, multiple consensus endpoints, required agreement before accepting headers.
-14. devp2p networking — `reth-network` + `reth-eth-wire` for `GetReceipts` from mainnet peers.
-15. ERA1 archive support — local flat-file fallback for historical blocks devp2p peers can't serve.
-16. Fallback RPC — optional last resort, still Merkle-verified.
-17. Proxy contract detector — EIP-1967 storage slot check, ABI redirect.
-18. `scopenode validate` — catch config errors before a long sync starts.
-19. `scopenode abi` — show available events for a contract.
+Phase 2 - Source hardening and tooling:
+13. Persistent source manifest - source identity, coverage, integrity status, and scan times.
+14. Stronger verification - source/chunk boundaries, header continuity, receipt roots, and transaction roots when bodies are read.
+15. Coverage-aware status - show exactly which sources, scopes, and ranges are complete.
+16. `scopenode validate` - check source path, coverage, ABI, events, and ranges before indexing.
+17. `scopenode abi` - show available events, signatures, and topic0 hashes.
+18. Proxy ergonomics - explicit implementation-address support first; automatic detection only when local data can support it.
+19. `scopenode doctor` - diagnose source, DB, ABI cache, failed blocks, and serving readiness.
+20. `scopenode retry` - reprocess failed verification/decode work after source or config fixes.
 
-Phase 3a — Reliability (production-grade core):
-20. Live sync — watch new blocks in real-time after historical sync completes.
-21. Reorg handler — detect chain splits, soft-invalidate affected events.
-22. `scopenode doctor` — diagnose peers, beacon health, DB integrity.
-23. `scopenode retry` — re-fetch all pending_retry blocks.
-24. Full progress TUI refinement — peer count, events found, speed.
+Phase 3 - Light client boundary and live/recent data:
+21. Beacon light client - provide finalized/safe/latest execution block identity.
+22. Head policy - reject indexing beyond `finalized`, `safe`, or `latest` according to config.
+23. Canonicality reporting - show indexed local head vs light-client head.
+24. Reorg handling - soft-invalidate orphaned events near the live/recent boundary.
+25. Optional recent/live source - devp2p, local execution node, Portal Network, or explicit RPC fallback as separate modes.
+26. Live subscriptions - stream indexed live events only when recent/live indexing is enabled.
 
-Phase 3b — Developer surface area (additive features):
-25. REST API at `:8546` — `GET /events`, `GET /status`, `GET /stream/events` (SSE).
-26. `eth_subscribe` WebSocket — live event subscriptions for Viem/ethers.js.
-27. `scopenode export` — CSV/JSON output.
+Phase 4 - Developer APIs and product polish:
+27. REST API at `:8546` - `/events`, `/status`, `/sources`, `/scopes`, `/contracts`, `/abi`.
+28. `eth_subscribe` WebSocket - live event and new-head subscriptions when live mode is active.
+29. `scopenode export` - stream verified indexed data to CSV or JSON.
+30. Shared coverage semantics - JSON-RPC, REST, query, and export all enforce the same indexed-range rules.
+31. Better first-run UX - clear errors, useful progress, `--json` automation output, and end-to-end docs.
 
 ---
 

@@ -1,154 +1,130 @@
-# Phase 3 — Live Sync + Reliability
+# Phase 3 - Light Client Boundary and Live/Recent Data
 
 ## Goal
 
-scopenode runs indefinitely. After historical sync completes it watches new
-blocks in real time, verified by the Helios beacon light client. Reorgs are
-detected and handled without data loss. The TUI is rebuilt in ratatui for a
-rich, real-time operator view.
+Add a light-client trust anchor and prepare scopenode to bridge local historical
+EraE data with recent/live chain data.
 
----
+The light client is not the historical data source. Its job is to tell
+scopenode what Ethereum considers canonical, finalized, safe, and current.
+EraE remains the historical execution-data source.
 
 ## What changes
 
-| | Phase 2 | Phase 3 |
+| Area | Phase 2 | Phase 3 |
 |---|---|---|
-| Live blocks | Not supported (`to_block` required) | Automatic after historical sync |
-| Header verification (live) | N/A | Helios beacon — BLS-verified by sync committee |
-| Reorgs | Not handled | Detected via `parent_hash`; events soft-deleted |
-| TUI | indicatif progress bars | ratatui — multi-panel, real-time |
-| Operations | Manual | `scopenode snapshot/restore/doctor/retry` |
+| Canonicality | Local source provenance + verification | Light-client finalized/safe head anchor |
+| Upper bound | Config range only | Reject ranges beyond policy boundary |
+| Recent data | Historical EraE only | Optional recent/live boundary |
+| Reorgs | Not relevant for finalized historical ranges | Detected and handled for live/recent data |
+| Serving | Static indexed DB | Can expose indexed head and live subscriptions |
 
----
+## What the light client does
 
-## What we build
+The light client provides:
 
-### Helios beacon light client
+- latest consensus head
+- finalized head
+- safe execution block boundary where available
+- execution block hash/number for consensus payloads
+- finality/canonicality signal
 
-Provides cryptographically verified headers for live sync. Helios uses the
-Altair light client protocol:
-- Bootstraps from a recent finalized checkpoint
-- Verifies each new header via BLS signature of 512-validator sync committee
-- 512 validators must collude to deceive us
+It does not provide:
 
-Multiple `consensus_rpc` endpoints configured — all must agree on sync
-committee updates before accepting. Disagreement halts live sync and alerts.
+- historical receipts
+- historical logs
+- full transaction bodies
+- contract storage history
+- historical `eth_call`
+- decoded events
+
+The intended model is:
+
+```text
+Light client
+  -> canonicality, finality, safe/latest execution head
+
+EraE files
+  -> historical headers, bodies, receipts
+
+scopenode
+  -> verify, scan, decode, index, serve
+```
+
+## Verification policy
+
+Phase 3 adds a configurable boundary policy:
 
 ```toml
-[node]
+[chain]
+id = 1
+
+[light_client]
+enabled = true
+checkpoint = "0x..."
 consensus_rpc = [
-    "https://www.lightclientdata.org",
-    "https://sync-mainnet.beaconcha.in",
+  "https://www.lightclientdata.org",
+  "https://sync-mainnet.beaconcha.in",
 ]
+
+[index_policy]
+max_head = "finalized" # finalized | safe | latest
+allow_unverified_head = false
 ```
 
-### Live sync
+If a scope asks for blocks beyond the selected safe boundary, indexing fails
+with a clear error unless the user explicitly opts into a looser policy.
 
-When `to_block` is absent from config: historical sync runs, then live sync
-starts automatically. Each new Helios-verified header goes through the same
-bloom → receipt fetch → MPT verify → decode → store pipeline as historical.
+## Reorg handling
 
-A `broadcast` channel fans live events to all consumers (REST SSE and
-`eth_subscribe` WebSocket in Phase 4).
+Reorg handling matters only near the live/recent boundary. For finalized
+historical EraE ranges, reorgs are outside the normal concern.
 
-### Block range shorthand
+For recent/live indexing:
 
-`from_block` and `to_block` in config (and `--blocks` on the CLI) accept
-human-readable shorthand inspired by cryo:
+1. Track the local indexed tip.
+2. Compare each new block parent against the local tip hash.
+3. On mismatch, walk back to the common ancestor.
+4. Mark orphaned events as `reorged = 1`.
+5. Re-index the winning chain blocks.
 
-```toml
-[node]
-from_block = "16M"       # 16_000_000
-to_block   = "16.5M"     # 16_500_000
-```
+scopenode should never hard-delete events by default.
 
-CLI usage:
+## Optional recent/live source
+
+Phase 3 can introduce a recent/live execution-data source, but this is separate
+from the historical EraE path. Possible sources:
+
+- devp2p for recent headers/receipts
+- a local execution node
+- Portal Network when mature enough
+- remote RPC only as an explicit opt-in fallback, never the default promise
+
+The product promise must stay clear: EraE is the historical source; the light
+client anchors canonicality; any live execution-data source is a separate mode.
+
+## Operator experience
+
+Commands should make the boundary visible:
 
 ```bash
-scopenode sync --blocks 16M:17M
-scopenode sync --blocks 16M:+1000   # from_block=16M, to_block=16M+1000
+scopenode doctor
+# light client: synced
+# finalized execution block: 19842301
+# indexed local block: 19842000
+# source coverage: 17000000-19842000 complete
+
+scopenode index config.toml
+# rejects ranges above finalized when policy=max_head="finalized"
 ```
-
-Supported suffixes: `K` (×1 000), `M` (×1 000 000). Relative offset `+N`
-is resolved against the left bound. Plain integers still accepted everywhere.
-
-### Configurable reorg buffer
-
-The depth of the rolling reorg-detection buffer is now a config option:
-
-```toml
-[node]
-reorg_buffer = 64   # default; post-Merge safe minimum
-```
-
-Operators running archive nodes or doing historical analysis may lower this.
-Defaults to 64 when absent — matching the post-Merge finality window.
-
-### Reorg handling
-
-Rolling buffer of last `reorg_buffer` block hashes. On each new block:
-1. Check `new_block.parent_hash == our_tip_hash`
-2. Mismatch → walk back via `parent_hash` to common ancestor
-3. Mark orphaned events `reorged = 1` — never hard-delete
-4. Re-process winning chain blocks through the pipeline
-
-Post-Merge finality: after ~64 blocks (~12.8 min), the beacon chain
-cryptographically finalizes the block. Reorgs beyond that depth are
-impossible without breaking PoS security.
-
-### ratatui TUI
-
-Replaces indicatif bars with a full-screen terminal UI:
-
-```
-┌─ scopenode ──────────────────────────────────────────────────────────┐
-│ Mode: LIVE  Block: 19,842,301  Speed: 142 blocks/s  Peers: 12       │
-├─────────────────────────────┬────────────────────────────────────────┤
-│ Contracts                   │ Recent Events                          │
-│                             │                                        │
-│ Uniswap V3 ETH/USDC         │ 19842301  Swap  -1.2 ETH / +3841 USDC │
-│   Swap          12,431 evts │ 19842298  Swap  +0.5 ETH / -1920 USDC │
-│   Mint             482 evts │ 19842291  Mint  tick -200..200         │
-│                             │ 19842280  Swap  -4.0 ETH / +12203 USDC│
-├─────────────────────────────┴────────────────────────────────────────┤
-│ Peers  ████████████░░░░░░░░  12/25    Reorgs: 0   Retries: 3        │
-│ Sync   ████████████████████  historical complete — live              │
-└──────────────────────────────────────────────────────────────────────┘
-```
-
-Key bindings: `q` quit · `p` peer list · `r` recent events · `l` logs
-
-### New commands
-
-- `scopenode snapshot [--label <name>]` — copy DB to `data_dir/snapshots/`
-- `scopenode restore [--label <name>]` — restore from snapshot (auto-snaps current first)
-- `scopenode doctor` — peers connected, beacon head, DB integrity, pending_retry count
-- `scopenode retry` — re-fetches all `pending_retry` blocks through the full pipeline
-
----
 
 ## Definition of done
 
-- [x] Live sync starts automatically when `to_block` not set in config
-- [x] Live headers verified by Helios (BLS sync committee — not trusted from peer)
-- [x] Multiple `consensus_rpc` must agree; disagreement halts live sync with clear error
-- [x] Reorg detected (parent_hash mismatch): orphaned events marked `reorged = 1`
-- [x] `eth_getLogs` excludes reorged events by default
-- [x] ratatui TUI: mode, block, speed, peer count, per-contract event totals, recent events
-- [x] TUI key bindings work: quit, peer list, logs
-- [x] `scopenode snapshot` / `scopenode restore` work; restore auto-snaps before overwriting
-- [x] `scopenode doctor` reports: peer count, beacon head, DB counts, pending_retry count
-- [x] `scopenode retry` clears all `pending_retry` blocks on success
-- [x] `from_block = "16M"` in config parses to `16_000_000`; `"16.5M"` → `16_500_000`
-- [x] `scopenode sync --blocks 16M:+500` resolves to `from_block=16000000, to_block=16000500`
-- [x] `reorg_buffer` config key respected; defaults to 64 when absent
-- [x] Unit tests: reorg detection at depth 1/5/64, live syncer broadcast fan-out
-- [x] Integration test: live sync processes 10 real blocks after historical completes
-
-## New dependencies
-
-```toml
-helios-client = { version = "=0.8", features = ["ethereum"] }
-ratatui       = "0.28"
-crossterm     = "0.28"    # ratatui backend
-```
+- [ ] Light client can report finalized/safe/latest execution block identity.
+- [ ] Config supports light-client endpoints, checkpoint, and head policy.
+- [ ] Indexing rejects requested ranges beyond the configured policy boundary.
+- [ ] `doctor` reports light-client status and indexed-vs-finalized boundary.
+- [ ] Reorg handling marks orphaned events instead of deleting them.
+- [ ] Live/recent indexing is explicitly separated from historical EraE indexing.
+- [ ] Any remote RPC fallback is opt-in and clearly labeled as outside the default trust story.
+- [ ] Tests cover boundary rejection, unverified opt-in behavior, and reorg marking.
