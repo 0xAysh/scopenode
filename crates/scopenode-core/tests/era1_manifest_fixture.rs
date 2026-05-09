@@ -1,4 +1,6 @@
-use scopenode_core::source::{read_era1_block_tuple, scan_era1_source, ChecksumStatus};
+use scopenode_core::source::{
+    decode_era1_header, read_era1_block_tuple, scan_era1_source, ChecksumStatus,
+};
 use std::path::PathBuf;
 
 #[test]
@@ -50,4 +52,7 @@ fn reads_first_block_tuple_from_downloaded_era1_fixture_when_present() {
     assert!(!block.compressed_body.is_empty());
     assert!(!block.compressed_receipts.is_empty());
     assert!(!block.total_difficulty.is_empty());
+
+    let header = decode_era1_header(&block.compressed_header).unwrap();
+    assert_eq!(header.number, 0);
 }

@@ -7790,8 +7790,10 @@ name = "scopenode-core"
 version = "0.1.0"
 dependencies = [
  "alloy",
+ "alloy-consensus",
  "alloy-dyn-abi",
  "alloy-primitives",
+ "alloy-rlp",
  "alloy-trie",
  "anyhow",
  "async-trait",
@@ -7818,6 +7820,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "snap",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

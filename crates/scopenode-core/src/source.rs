@@ -1,6 +1,10 @@
 //! Local historical source scanning.
 
+use crate::types::ScopeHeader;
+use alloy_consensus::Header;
+use alloy_rlp::Decodable;
 use sha2::{Digest, Sha256};
+use snap::read::FrameDecoder;
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -35,6 +39,9 @@ pub enum SourceError {
 
     #[error("invalid e2store source file {path}: {message}")]
     InvalidE2Store { path: PathBuf, message: String },
+
+    #[error("invalid ERA1 header: {0}")]
+    InvalidEra1Header(String),
 
     #[error("block range overflow for {path}")]
     RangeOverflow { path: PathBuf },
@@ -280,6 +287,29 @@ pub fn read_era1_block_tuple(
     }
 
     Ok(None)
+}
+
+pub fn decode_era1_header(compressed_header: &[u8]) -> Result<ScopeHeader, SourceError> {
+    let mut decoder = FrameDecoder::new(compressed_header);
+    let mut rlp = Vec::new();
+    decoder
+        .read_to_end(&mut rlp)
+        .map_err(|source| SourceError::InvalidEra1Header(source.to_string()))?;
+
+    let mut slice = rlp.as_slice();
+    let header = Header::decode(&mut slice)
+        .map_err(|source| SourceError::InvalidEra1Header(source.to_string()))?;
+
+    Ok(ScopeHeader {
+        number: header.number,
+        hash: header.hash_slow(),
+        parent_hash: header.parent_hash,
+        timestamp: header.timestamp,
+        receipts_root: header.receipts_root,
+        logs_bloom: header.logs_bloom,
+        gas_used: header.gas_used,
+        base_fee_per_gas: header.base_fee_per_gas.map(|fee| fee as u128),
+    })
 }
 
 fn parse_era1_filename(path: &Path, network_override: Option<&str>) -> Option<Era1FileName> {
@@ -679,6 +709,30 @@ mod tests {
         assert_eq!(block.total_difficulty, b"d65");
     }
 
+    #[test]
+    fn decodes_compressed_header_to_scope_header() {
+        let header = alloy_consensus::Header {
+            number: 64,
+            parent_hash: alloy_primitives::B256::repeat_byte(0x11),
+            receipts_root: alloy_primitives::B256::repeat_byte(0x22),
+            timestamp: 12_345,
+            gas_used: 21_000,
+            base_fee_per_gas: Some(1_000),
+            ..Default::default()
+        };
+        let compressed = snappy_rlp(&header);
+
+        let decoded = decode_era1_header(&compressed).unwrap();
+
+        assert_eq!(decoded.number, header.number);
+        assert_eq!(decoded.hash, header.hash_slow());
+        assert_eq!(decoded.parent_hash, header.parent_hash);
+        assert_eq!(decoded.receipts_root, header.receipts_root);
+        assert_eq!(decoded.timestamp, header.timestamp);
+        assert_eq!(decoded.gas_used, header.gas_used);
+        assert_eq!(decoded.base_fee_per_gas, Some(1_000));
+    }
+
     fn synthetic_era1_with_block_index(starting_number: u64, offsets: &[i64]) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend(e2store_entry([0x65, 0x32], &[]));
@@ -726,5 +780,20 @@ mod tests {
         bytes.extend_from_slice(&0u16.to_le_bytes());
         bytes.extend_from_slice(data);
         bytes
+    }
+
+    fn snappy_rlp(header: &alloy_consensus::Header) -> Vec<u8> {
+        use alloy_rlp::Encodable;
+        use std::io::Write;
+
+        let mut rlp = Vec::new();
+        header.encode(&mut rlp);
+        let mut compressed = Vec::new();
+        {
+            let mut encoder = snap::write::FrameEncoder::new(&mut compressed);
+            encoder.write_all(&rlp).unwrap();
+            encoder.flush().unwrap();
+        }
+        compressed
     }
 }
