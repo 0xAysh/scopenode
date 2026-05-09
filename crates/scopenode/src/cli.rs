@@ -2,7 +2,11 @@ use clap::{ArgAction, Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(name = "scopenode", version, about = "Scoped Ethereum node — sync and serve specific contract events")]
+#[command(
+    name = "scopenode",
+    version,
+    about = "Scoped Ethereum node — sync and serve specific contract events"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -22,6 +26,11 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Scan local historical source files and record available coverage
+    Index {
+        /// Path to config file
+        config: PathBuf,
+    },
     /// Start sync (resumes if interrupted)
     Sync {
         /// Path to config file

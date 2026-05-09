@@ -12,7 +12,9 @@
 //! duplicating data.
 
 use crate::error::DbError;
-use crate::models::{ContractRow, StoredEvent, StoredHeader};
+use crate::models::{
+    ContractRow, NewSourceFile, SourceFileRow, SourceRangeRow, SourceRow, StoredEvent, StoredHeader,
+};
 use alloy_primitives::{Bloom, B256};
 use sqlx::SqlitePool;
 use std::collections::HashSet;
@@ -41,14 +43,11 @@ impl Db {
         use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
         use std::str::FromStr;
 
-        let options = SqliteConnectOptions::from_str(&format!(
-            "sqlite://{}",
-            path.display()
-        ))
-        .map_err(|e| DbError::Open(e.to_string()))?
-        .create_if_missing(true)
-        // WAL mode: writers don't block readers and readers don't block writers.
-        .journal_mode(SqliteJournalMode::Wal);
+        let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))
+            .map_err(|e| DbError::Open(e.to_string()))?
+            .create_if_missing(true)
+            // WAL mode: writers don't block readers and readers don't block writers.
+            .journal_mode(SqliteJournalMode::Wal);
 
         let pool = SqlitePool::connect_with(options)
             .await
@@ -433,11 +432,7 @@ impl Db {
     /// Count events for a specific contract + event name combination.
     ///
     /// Only counts non-reorged events (`reorged = 0`). Used internally.
-    pub async fn count_events(
-        &self,
-        contract: &str,
-        event_name: &str,
-    ) -> Result<i64, DbError> {
+    pub async fn count_events(&self, contract: &str, event_name: &str) -> Result<i64, DbError> {
         #[derive(sqlx::FromRow)]
         struct Row {
             count: i64,
@@ -585,13 +580,11 @@ impl Db {
         struct Row {
             abi_json: Option<String>,
         }
-        let row = sqlx::query_as::<_, Row>(
-            r#"SELECT abi_json FROM contracts WHERE address = ?"#,
-        )
-        .bind(address)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| DbError::Query(e.to_string()))?;
+        let row = sqlx::query_as::<_, Row>(r#"SELECT abi_json FROM contracts WHERE address = ?"#)
+            .bind(address)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| DbError::Query(e.to_string()))?;
         Ok(row.and_then(|r| r.abi_json))
     }
 
@@ -637,7 +630,11 @@ impl Db {
             .into_iter()
             .map(|r| {
                 (
-                    ContractRow { address: r.address, name: r.name, abi_json: r.abi_json },
+                    ContractRow {
+                        address: r.address,
+                        name: r.name,
+                        abi_json: r.abi_json,
+                    },
                     r.event_count,
                 )
             })
@@ -650,7 +647,9 @@ impl Db {
     /// (avoids fetching `abi_json` blobs).
     pub async fn count_contracts(&self) -> Result<i64, DbError> {
         #[derive(sqlx::FromRow)]
-        struct Row { count: i64 }
+        struct Row {
+            count: i64,
+        }
         let row = sqlx::query_as::<_, Row>("SELECT COUNT(*) as count FROM contracts")
             .fetch_one(&self.pool)
             .await
@@ -696,6 +695,167 @@ impl Db {
         Ok(row.count)
     }
 
+    // ─── Source Manifest ─────────────────────────────────────────────────────
+
+    /// Insert or update a local historical source and return its row id.
+    pub async fn upsert_source(
+        &self,
+        kind: &str,
+        network: Option<&str>,
+        path: &str,
+    ) -> Result<i64, DbError> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            id: i64,
+        }
+
+        let row = sqlx::query_as::<_, Row>(
+            r#"INSERT INTO sources (kind, network, path, last_scanned_at)
+               VALUES (?, ?, ?, unixepoch())
+               ON CONFLICT(kind, path) DO UPDATE SET
+                 network = excluded.network,
+                 last_scanned_at = unixepoch()
+               RETURNING id"#,
+        )
+        .bind(kind)
+        .bind(network)
+        .bind(path)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| DbError::Query(e.to_string()))?;
+
+        Ok(row.id)
+    }
+
+    /// Insert or update one source file manifest row and return its row id.
+    pub async fn upsert_source_file(
+        &self,
+        source_id: i64,
+        file: &NewSourceFile,
+    ) -> Result<i64, DbError> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            id: i64,
+        }
+
+        let row = sqlx::query_as::<_, Row>(
+            r#"INSERT INTO source_files
+               (source_id, format, path, filename, network, epoch, file_hash,
+                size_bytes, modified_at, sha256, checksum_status, expected_sha256,
+                last_seen_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
+               ON CONFLICT(source_id, path) DO UPDATE SET
+                 format = excluded.format,
+                 filename = excluded.filename,
+                 network = excluded.network,
+                 epoch = excluded.epoch,
+                 file_hash = excluded.file_hash,
+                 size_bytes = excluded.size_bytes,
+                 modified_at = excluded.modified_at,
+                 sha256 = excluded.sha256,
+                 checksum_status = excluded.checksum_status,
+                 expected_sha256 = excluded.expected_sha256,
+                 last_seen_at = unixepoch()
+               RETURNING id"#,
+        )
+        .bind(source_id)
+        .bind(&file.format)
+        .bind(&file.path)
+        .bind(&file.filename)
+        .bind(&file.network)
+        .bind(file.epoch)
+        .bind(&file.file_hash)
+        .bind(file.size_bytes)
+        .bind(file.modified_at)
+        .bind(&file.sha256)
+        .bind(&file.checksum_status)
+        .bind(&file.expected_sha256)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| DbError::Query(e.to_string()))?;
+
+        Ok(row.id)
+    }
+
+    /// Replace all inferred ranges for a source file.
+    pub async fn replace_source_file_ranges(
+        &self,
+        source_file_id: i64,
+        ranges: &[(u64, u64, &str)],
+    ) -> Result<(), DbError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| DbError::Query(e.to_string()))?;
+
+        sqlx::query("DELETE FROM source_ranges WHERE source_file_id = ?")
+            .bind(source_file_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| DbError::Query(e.to_string()))?;
+
+        for (from_block, to_block, completeness) in ranges {
+            sqlx::query(
+                r#"INSERT INTO source_ranges
+                   (source_file_id, from_block, to_block, completeness)
+                   VALUES (?, ?, ?, ?)"#,
+            )
+            .bind(source_file_id)
+            .bind(*from_block as i64)
+            .bind(*to_block as i64)
+            .bind(*completeness)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| DbError::Query(e.to_string()))?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| DbError::Query(e.to_string()))?;
+        Ok(())
+    }
+
+    /// List source rows for diagnostics and tests.
+    pub async fn list_sources(&self) -> Result<Vec<SourceRow>, DbError> {
+        sqlx::query_as::<_, SourceRow>(
+            r#"SELECT id, kind, network, path, first_seen_at, last_scanned_at
+               FROM sources ORDER BY id ASC"#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DbError::Query(e.to_string()))
+    }
+
+    /// List files attached to one source.
+    pub async fn list_source_files(&self, source_id: i64) -> Result<Vec<SourceFileRow>, DbError> {
+        sqlx::query_as::<_, SourceFileRow>(
+            r#"SELECT id, source_id, format, path, filename, network, epoch, file_hash,
+                      size_bytes, modified_at, sha256, checksum_status, expected_sha256,
+                      last_seen_at
+               FROM source_files WHERE source_id = ? ORDER BY path ASC"#,
+        )
+        .bind(source_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DbError::Query(e.to_string()))
+    }
+
+    /// List inferred ranges attached to one source file.
+    pub async fn list_source_ranges(
+        &self,
+        source_file_id: i64,
+    ) -> Result<Vec<SourceRangeRow>, DbError> {
+        sqlx::query_as::<_, SourceRangeRow>(
+            r#"SELECT id, source_file_id, from_block, to_block, completeness
+               FROM source_ranges WHERE source_file_id = ? ORDER BY from_block ASC"#,
+        )
+        .bind(source_file_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DbError::Query(e.to_string()))
+    }
+
     /// Return the on-disk size of the database in bytes.
     ///
     /// Uses SQLite `PRAGMA page_count` and `PRAGMA page_size` to compute the
@@ -729,7 +889,11 @@ impl Db {
         if block_hashes.is_empty() {
             return Ok(0);
         }
-        let placeholders = block_hashes.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let placeholders = block_hashes
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(", ");
         let sql = format!(
             "UPDATE events SET reorged = 1 WHERE block_hash IN ({placeholders}) AND reorged = 0"
         );
@@ -773,10 +937,10 @@ impl Db {
                     .block_hash
                     .parse()
                     .map_err(|_| DbError::Query(format!("invalid block_hash: {}", r.block_hash)))?;
-                let receipts_root: alloy_primitives::B256 = r
-                    .receipts_root
-                    .parse()
-                    .map_err(|_| DbError::Query(format!("invalid receipts_root: {}", r.receipts_root)))?;
+                let receipts_root: alloy_primitives::B256 =
+                    r.receipts_root.parse().map_err(|_| {
+                        DbError::Query(format!("invalid receipts_root: {}", r.receipts_root))
+                    })?;
                 Ok((r.block_number as u64, block_hash, receipts_root, r.contract))
             })
             .collect()
@@ -807,9 +971,15 @@ impl Db {
 
         // Build WHERE clauses dynamically — only include filters that are Some.
         let mut conditions = vec!["reorged = 0"];
-        if contract.is_some()   { conditions.push("contract = ?"); }
-        if event_name.is_some() { conditions.push("event_name = ?"); }
-        if topic0.is_some()     { conditions.push("topic0 = ?"); }
+        if contract.is_some() {
+            conditions.push("contract = ?");
+        }
+        if event_name.is_some() {
+            conditions.push("event_name = ?");
+        }
+        if topic0.is_some() {
+            conditions.push("topic0 = ?");
+        }
         conditions.extend(["block_number >= ?", "block_number <= ?"]);
 
         let sql = format!(
@@ -821,9 +991,15 @@ impl Db {
         );
 
         let mut q = sqlx::query_as::<_, StoredEvent>(&sql);
-        if let Some(c) = contract   { q = q.bind(c); }
-        if let Some(e) = event_name { q = q.bind(e); }
-        if let Some(t) = topic0     { q = q.bind(t); }
+        if let Some(c) = contract {
+            q = q.bind(c);
+        }
+        if let Some(e) = event_name {
+            q = q.bind(e);
+        }
+        if let Some(t) = topic0 {
+            q = q.bind(t);
+        }
         q = q.bind(from).bind(to).bind(limit as i64).bind(offset as i64);
 
         q.fetch_all(&self.pool)
@@ -857,9 +1033,15 @@ impl Db {
 
         // Build WHERE clauses dynamically — only include filters that are Some.
         let mut conditions = vec!["reorged = 0"];
-        if contract.is_some()   { conditions.push("contract = ?"); }
-        if event_name.is_some() { conditions.push("event_name = ?"); }
-        if topic0.is_some()     { conditions.push("topic0 = ?"); }
+        if contract.is_some() {
+            conditions.push("contract = ?");
+        }
+        if event_name.is_some() {
+            conditions.push("event_name = ?");
+        }
+        if topic0.is_some() {
+            conditions.push("topic0 = ?");
+        }
         conditions.extend(["block_number >= ?", "block_number <= ?"]);
 
         let sql = format!(
@@ -875,9 +1057,15 @@ impl Db {
         // leaks only a few hundred bytes — acceptable for a batch API.
         let sql: &'static str = Box::leak(sql.into_boxed_str());
         let mut q = sqlx::query_as::<_, StoredEvent>(sql);
-        if let Some(c) = contract   { q = q.bind(c); }
-        if let Some(e) = event_name { q = q.bind(e); }
-        if let Some(t) = topic0     { q = q.bind(t); }
+        if let Some(c) = contract {
+            q = q.bind(c);
+        }
+        if let Some(e) = event_name {
+            q = q.bind(e);
+        }
+        if let Some(t) = topic0 {
+            q = q.bind(t);
+        }
         q = q.bind(from).bind(to);
 
         // sqlx::fetch returns a BoxStream (Pin<Box<dyn Stream<Item = sqlx::Result<T>>>>) —
@@ -890,13 +1078,14 @@ impl Db {
     /// Used by the REST `/status` endpoint.
     pub async fn count_all_events(&self) -> Result<i64, DbError> {
         #[derive(sqlx::FromRow)]
-        struct Row { count: i64 }
-        let row = sqlx::query_as::<_, Row>(
-            "SELECT COUNT(*) as count FROM events WHERE reorged = 0",
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| DbError::Query(e.to_string()))?;
+        struct Row {
+            count: i64,
+        }
+        let row =
+            sqlx::query_as::<_, Row>("SELECT COUNT(*) as count FROM events WHERE reorged = 0")
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| DbError::Query(e.to_string()))?;
         Ok(row.count)
     }
 }
@@ -969,9 +1158,10 @@ impl<T> futures_core::Stream for DbStream<'_, T> {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        self.inner.as_mut().poll_next(cx).map(|opt| {
-            opt.map(|r| r.map_err(|e| DbError::Query(e.to_string())))
-        })
+        self.inner
+            .as_mut()
+            .poll_next(cx)
+            .map(|opt| opt.map(|r| r.map_err(|e| DbError::Query(e.to_string()))))
     }
 }
 
@@ -1011,21 +1201,9 @@ fn build_query_events_sql<'a>(
             true,
             true,
         ),
-        (Some(_), None) => (
-            format!("{base} AND contract = ? {tail}"),
-            true,
-            false,
-        ),
-        (None, Some(_)) => (
-            format!("{base} AND event_name = ? {tail}"),
-            false,
-            true,
-        ),
-        (None, None) => (
-            format!("{base} {tail}"),
-            false,
-            false,
-        ),
+        (Some(_), None) => (format!("{base} AND contract = ? {tail}"), true, false),
+        (None, Some(_)) => (format!("{base} AND event_name = ? {tail}"), false, true),
+        (None, None) => (format!("{base} {tail}"), false, false),
     };
 
     (
@@ -1056,21 +1234,121 @@ mod tests {
         (db, path)
     }
 
-    fn make_event(contract: &str, block_number: i64, block_hash: &str, tx_hash: &str, log_index: i64) -> StoredEvent {
+    fn make_event(
+        contract: &str,
+        block_number: i64,
+        block_hash: &str,
+        tx_hash: &str,
+        log_index: i64,
+    ) -> StoredEvent {
         StoredEvent {
             contract: contract.to_string(),
             event_name: "Transfer".to_string(),
-            topic0: "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef".to_string(),
+            topic0: "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+                .to_string(),
             block_number,
             block_hash: block_hash.to_string(),
             tx_hash: tx_hash.to_string(),
             tx_index: 0,
             log_index,
-            raw_topics: "[\"0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef\"]".to_string(),
+            raw_topics: "[\"0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef\"]"
+                .to_string(),
             raw_data: "00".to_string(),
             decoded: "{}".to_string(),
             source: "devp2p".to_string(),
         }
+    }
+
+    fn make_source_file(path: &str, size_bytes: i64) -> NewSourceFile {
+        NewSourceFile {
+            format: "era1".to_string(),
+            path: path.to_string(),
+            filename: "mainnet-00000-5ec1ffb8.era1".to_string(),
+            network: "mainnet".to_string(),
+            epoch: Some(0),
+            file_hash: Some("5ec1ffb8".to_string()),
+            size_bytes,
+            modified_at: Some(1),
+            sha256: "ab".repeat(32),
+            checksum_status: "verified".to_string(),
+            expected_sha256: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn source_manifest_upserts_source_idempotently() {
+        let (db, _guard) = open_test_db().await;
+
+        let first = db
+            .upsert_source("era1", Some("mainnet"), "/tmp/era1")
+            .await
+            .unwrap();
+        let second = db
+            .upsert_source("era1", Some("mainnet"), "/tmp/era1")
+            .await
+            .unwrap();
+
+        assert_eq!(first, second);
+        let sources = db.list_sources().await.unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].kind, "era1");
+    }
+
+    #[tokio::test]
+    async fn source_manifest_upserts_file_idempotently() {
+        let (db, _guard) = open_test_db().await;
+        let source_id = db
+            .upsert_source("era1", Some("mainnet"), "/tmp/era1")
+            .await
+            .unwrap();
+
+        let first = db
+            .upsert_source_file(
+                source_id,
+                &make_source_file("/tmp/era1/mainnet-00000-5ec1ffb8.era1", 10),
+            )
+            .await
+            .unwrap();
+        let second = db
+            .upsert_source_file(
+                source_id,
+                &make_source_file("/tmp/era1/mainnet-00000-5ec1ffb8.era1", 20),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(first, second);
+        let files = db.list_source_files(source_id).await.unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].size_bytes, 20);
+    }
+
+    #[tokio::test]
+    async fn source_manifest_replaces_file_ranges() {
+        let (db, _guard) = open_test_db().await;
+        let source_id = db
+            .upsert_source("era1", Some("mainnet"), "/tmp/era1")
+            .await
+            .unwrap();
+        let file_id = db
+            .upsert_source_file(
+                source_id,
+                &make_source_file("/tmp/era1/mainnet-00000-5ec1ffb8.era1", 10),
+            )
+            .await
+            .unwrap();
+
+        db.replace_source_file_ranges(file_id, &[(0, 8191, "inferred")])
+            .await
+            .unwrap();
+        db.replace_source_file_ranges(file_id, &[(8192, 16_383, "inferred")])
+            .await
+            .unwrap();
+
+        let ranges = db.list_source_ranges(file_id).await.unwrap();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].from_block, 8192);
+        assert_eq!(ranges[0].to_block, 16_383);
     }
 
     #[tokio::test]
@@ -1079,11 +1357,11 @@ mod tests {
 
         let contract = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
         let canonical_hash = "0x1111111111111111111111111111111111111111111111111111111111111111";
-        let orphan_hash   = "0x2222222222222222222222222222222222222222222222222222222222222222";
+        let orphan_hash = "0x2222222222222222222222222222222222222222222222222222222222222222";
 
         // Insert one canonical event and one orphaned (reorged) event.
         let canonical = make_event(contract, 100, canonical_hash, "0xaaaa", 0);
-        let orphaned  = make_event(contract, 101, orphan_hash,   "0xbbbb", 0);
+        let orphaned = make_event(contract, 101, orphan_hash, "0xbbbb", 0);
 
         db.insert_events(&[canonical, orphaned]).await.unwrap();
 
@@ -1106,9 +1384,7 @@ mod tests {
         stream: impl futures_core::Stream<Item = Result<T, E>>,
     ) -> Result<Vec<T>, E> {
         use futures_util::StreamExt;
-        stream.collect::<Vec<_>>().await
-            .into_iter()
-            .collect()
+        stream.collect::<Vec<_>>().await.into_iter().collect()
     }
 
     #[tokio::test]
@@ -1178,10 +1454,10 @@ mod tests {
 
         let contract = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
         let canonical_hash = "0x1111111111111111111111111111111111111111111111111111111111111111";
-        let orphan_hash    = "0x2222222222222222222222222222222222222222222222222222222222222222";
+        let orphan_hash = "0x2222222222222222222222222222222222222222222222222222222222222222";
 
         let canonical = make_event(contract, 100, canonical_hash, "0xaaaa", 0);
-        let orphaned  = make_event(contract, 101, orphan_hash,   "0xbbbb", 0);
+        let orphaned = make_event(contract, 101, orphan_hash, "0xbbbb", 0);
         db.insert_events(&[canonical, orphaned]).await.unwrap();
 
         // Mark the second event as reorged.
@@ -1228,6 +1504,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(rows.is_empty(), "unknown topic0 must return empty list, not error");
+        assert!(
+            rows.is_empty(),
+            "unknown topic0 must return empty list, not error"
+        );
     }
 }

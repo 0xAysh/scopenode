@@ -34,8 +34,41 @@ pub struct Config {
     /// Node-level settings (port, data directory, consensus RPCs, reorg buffer).
     pub node: NodeConfig,
 
+    /// Optional local historical source used by `scopenode index`.
+    #[serde(default)]
+    pub source: Option<SourceConfig>,
+
     /// List of contracts and events to sync. At least one contract is required.
     pub contracts: Vec<ContractConfig>,
+}
+
+/// Local historical source configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceConfig {
+    /// Source adapter kind. The first supported source is ERA1.
+    pub kind: SourceKind,
+
+    /// Local path to a source directory.
+    pub path: PathBuf,
+
+    /// Optional network override used when source filenames do not carry one.
+    pub network: Option<String>,
+}
+
+/// Supported historical source adapters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceKind {
+    Era1,
+}
+
+impl SourceKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Era1 => "era1",
+        }
+    }
 }
 
 /// Settings that apply to the whole node instance.
@@ -152,14 +185,13 @@ pub struct ContractConfig {
 
     /// Implementation address for proxy contracts (EIP-1967 or any proxy pattern).
     pub impl_address: Option<Address>,
-
 }
 
 impl Config {
     /// Load and validate a config from a TOML file.
     pub fn from_file(path: &std::path::Path) -> Result<Self, ConfigError> {
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| ConfigError::Io(path.to_owned(), e))?;
+        let content =
+            std::fs::read_to_string(path).map_err(|e| ConfigError::Io(path.to_owned(), e))?;
         let config: Self = toml::from_str(&content).map_err(ConfigError::Parse)?;
         config.validate()?;
         Ok(config)
@@ -216,9 +248,7 @@ fn deser_block_number<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::
 }
 
 /// Deserialize an optional block number (absent field = `None`).
-fn deser_opt_block_number<'de, D: serde::Deserializer<'de>>(
-    d: D,
-) -> Result<Option<u64>, D::Error> {
+fn deser_opt_block_number<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
     d.deserialize_any(OptBlockVisitor)
 }
 
@@ -271,10 +301,7 @@ impl<'de> serde::de::Visitor<'de> for OptBlockVisitor {
         Ok(None)
     }
 
-    fn visit_some<D2: serde::Deserializer<'de>>(
-        self,
-        d2: D2,
-    ) -> Result<Option<u64>, D2::Error> {
+    fn visit_some<D2: serde::Deserializer<'de>>(self, d2: D2) -> Result<Option<u64>, D2::Error> {
         deser_block_number(d2).map(Some)
     }
 
@@ -479,10 +506,7 @@ mod tests {
 
     #[test]
     fn beacon_sync_timeout_default() {
-        let toml = format!(
-            "[node]\n[[contracts]]\n{}",
-            minimal_contract_toml()
-        );
+        let toml = format!("[node]\n[[contracts]]\n{}", minimal_contract_toml());
         let cfg: Config = toml::from_str(&toml).unwrap();
         assert_eq!(cfg.node.beacon_sync_timeout_secs, 300);
     }
@@ -579,4 +603,32 @@ execution_rpc = "https://eth-mainnet.example.com"
         cfg.validate().unwrap();
     }
 
+    #[test]
+    fn source_is_optional_for_existing_configs() {
+        let toml = format!("[node]\n[[contracts]]\n{}", minimal_contract_toml());
+        let cfg: Config = toml::from_str(&toml).unwrap();
+        assert!(cfg.source.is_none());
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn source_config_deserializes() {
+        let toml = format!(
+            r#"[node]
+
+[source]
+kind = "era1"
+path = "fixtures/era1/mainnet"
+network = "mainnet"
+
+[[contracts]]
+{}"#,
+            minimal_contract_toml()
+        );
+        let cfg: Config = toml::from_str(&toml).unwrap();
+        let source = cfg.source.unwrap();
+        assert_eq!(source.kind, SourceKind::Era1);
+        assert_eq!(source.path, PathBuf::from("fixtures/era1/mainnet"));
+        assert_eq!(source.network.as_deref(), Some("mainnet"));
+    }
 }

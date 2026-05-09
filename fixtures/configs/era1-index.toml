@@ -1,0 +1,15 @@
+[node]
+port = 8545
+data_dir = ".scopenode-era1-fixture"
+
+[source]
+kind = "era1"
+path = "fixtures/era1/mainnet"
+network = "mainnet"
+
+[[contracts]]
+name = "ERA1 fixture smoke scope"
+address = "0x0000000000000000000000000000000000000001"
+events = ["Transfer"]
+from_block = 0
+to_block = 100

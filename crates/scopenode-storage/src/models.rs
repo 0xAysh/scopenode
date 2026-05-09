@@ -150,3 +150,59 @@ pub struct SyncCursorRow {
     /// Receipt stage can only start after bloom scan is complete.
     pub receipts_done_to: Option<i64>,
 }
+
+/// Source manifest row.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct SourceRow {
+    pub id: i64,
+    pub kind: String,
+    pub network: Option<String>,
+    pub path: String,
+    pub first_seen_at: i64,
+    pub last_scanned_at: i64,
+}
+
+/// Historical source file row.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct SourceFileRow {
+    pub id: i64,
+    pub source_id: i64,
+    pub format: String,
+    pub path: String,
+    pub filename: String,
+    pub network: String,
+    pub epoch: Option<i64>,
+    pub file_hash: Option<String>,
+    pub size_bytes: i64,
+    pub modified_at: Option<i64>,
+    pub sha256: String,
+    pub checksum_status: String,
+    pub expected_sha256: Option<String>,
+    pub last_seen_at: i64,
+}
+
+/// Inferred block range for a source file.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct SourceRangeRow {
+    pub id: i64,
+    pub source_file_id: i64,
+    pub from_block: i64,
+    pub to_block: i64,
+    pub completeness: String,
+}
+
+/// Input for upserting a source file manifest.
+#[derive(Debug, Clone)]
+pub struct NewSourceFile {
+    pub format: String,
+    pub path: String,
+    pub filename: String,
+    pub network: String,
+    pub epoch: Option<i64>,
+    pub file_hash: Option<String>,
+    pub size_bytes: i64,
+    pub modified_at: Option<i64>,
+    pub sha256: String,
+    pub checksum_status: String,
+    pub expected_sha256: Option<String>,
+}

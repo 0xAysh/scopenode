@@ -35,6 +35,7 @@ helios-ethereum          = { workspace = true }
 openssl                  = { workspace = true }
 futures                  = { workspace = true }
 hex                      = { workspace = true }
+sha2                     = { workspace = true }
 eyre                     = { workspace = true }
 tokio-util               = { workspace = true }
 libc                     = { workspace = true }

@@ -1,6 +1,7 @@
 pub mod abi;
 pub mod doctor;
 pub mod export;
+pub mod index;
 pub mod logs;
 pub mod query;
 pub mod restore;
