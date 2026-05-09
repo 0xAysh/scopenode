@@ -69,12 +69,14 @@ pub struct SourceRangeManifest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RangeCompleteness {
     Inferred,
+    FileIndex,
 }
 
 impl RangeCompleteness {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Inferred => "inferred",
+            Self::FileIndex => "file-index",
         }
     }
 }
@@ -171,10 +173,14 @@ pub fn scan_era1_source(
             .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
             .map(|duration| duration.as_secs() as i64);
 
-        let (from_block, to_block) = content_range
+        let (from_block, to_block, completeness) = content_range
             .as_ref()
-            .map(|range| (range.from_block, range.to_block))
-            .unwrap_or((parsed.from_block, parsed.to_block));
+            .map(|range| (range.from_block, range.to_block, range.completeness))
+            .unwrap_or((
+                parsed.from_block,
+                parsed.to_block,
+                RangeCompleteness::Inferred,
+            ));
 
         files.push(SourceFileManifest {
             format: "era1".to_string(),
@@ -190,7 +196,7 @@ pub fn scan_era1_source(
             ranges: vec![SourceRangeManifest {
                 from_block,
                 to_block,
-                completeness: RangeCompleteness::Inferred,
+                completeness,
             }],
         });
     }
@@ -457,7 +463,7 @@ fn parse_block_index_entry(path: &Path, data: &[u8]) -> Result<SourceRangeManife
     Ok(SourceRangeManifest {
         from_block: starting_number,
         to_block,
-        completeness: RangeCompleteness::Inferred,
+        completeness: RangeCompleteness::FileIndex,
     })
 }
 
@@ -535,6 +541,7 @@ mod tests {
 
         assert_eq!(scan.files[0].ranges[0].from_block, 64);
         assert_eq!(scan.files[0].ranges[0].to_block, 66);
+        assert_eq!(scan.files[0].ranges[0].completeness.as_str(), "file-index");
     }
 
     #[test]

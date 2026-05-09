@@ -211,7 +211,7 @@ fn print_report(scan: &SourceScan, scopes: &[ScopeReport]) {
         let ranges = file
             .ranges
             .iter()
-            .map(|range| format!("{}..{}", range.from_block, range.to_block))
+            .map(format_source_range)
             .collect::<Vec<_>>()
             .join(", ");
         println!(
@@ -264,11 +264,21 @@ fn format_missing_range(range: &BlockRange) -> String {
     }
 }
 
+fn format_source_range(range: &scopenode_core::source::SourceRangeManifest) -> String {
+    format!(
+        "{}..{} ({})",
+        range.from_block,
+        range.to_block,
+        range.completeness.as_str()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloy_primitives::address;
     use scopenode_core::config::{ContractConfig, NodeConfig};
+    use scopenode_core::source::{RangeCompleteness, SourceRangeManifest};
 
     #[test]
     fn missing_ranges_reports_gap_after_available_range() {
@@ -332,5 +342,16 @@ mod tests {
                 to: u64::MAX
             }
         );
+    }
+
+    #[test]
+    fn format_source_range_includes_completeness_label() {
+        let range = SourceRangeManifest {
+            from_block: 64,
+            to_block: 66,
+            completeness: RangeCompleteness::FileIndex,
+        };
+
+        assert_eq!(format_source_range(&range), "64..66 (file-index)");
     }
 }
