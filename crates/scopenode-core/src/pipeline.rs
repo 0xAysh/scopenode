@@ -757,7 +757,7 @@ pub(crate) fn scope_header_to_stored(h: &crate::types::ScopeHeader) -> scopenode
 /// SQLite stores hashes as `0x`-prefixed hex strings and block numbers as i64.
 /// Topics are stored as a JSON array of hex strings. Raw data is stored as a hex string.
 /// U256 values in `decoded` are already stringified by the ABI decoder (JS precision safe).
-pub(crate) fn core_to_storage_event(e: &CoreEvent) -> scopenode_storage::models::StoredEvent {
+pub fn core_to_storage_event(e: &CoreEvent) -> scopenode_storage::models::StoredEvent {
     scopenode_storage::models::StoredEvent {
         contract: e.contract.to_checksum(None),
         event_name: e.event_name.clone(),

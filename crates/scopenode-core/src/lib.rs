@@ -24,6 +24,7 @@ pub mod error;
 pub mod headers;
 pub mod live;
 pub mod network;
+pub mod era_pipeline;
 pub mod pipeline;
 pub mod receipts;
 pub mod reorg;
