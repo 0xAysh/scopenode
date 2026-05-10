@@ -19,8 +19,10 @@
 //! the computed root to the expected one.
 
 use crate::error::VerifyError;
+use alloy::eips::eip2718::Encodable2718;
 use alloy::rpc::types::TransactionReceipt;
-use alloy_primitives::B256;
+use alloy_consensus::ReceiptEnvelope;
+use alloy_primitives::{Log as PrimitiveLog, B256};
 use alloy_trie::HashBuilder;
 use alloy_trie::Nibbles;
 
@@ -82,6 +84,64 @@ pub fn verify_receipts(
 
     let computed = hb.root();
 
+    if computed == expected_root {
+        Ok(())
+    } else {
+        Err(VerifyError::RootMismatch {
+            block_num,
+            expected: expected_root,
+            computed,
+        })
+    }
+}
+
+/// Verify that a set of ERA1-sourced consensus receipts matches the `receipts_root`
+/// in the block header.
+///
+/// Unlike [`verify_receipts`], this function takes [`ReceiptEnvelope<PrimitiveLog>`]
+/// directly — the consensus type already implements `Encodable2718`, so no RPC
+/// type conversion is required.
+///
+/// # Algorithm
+/// Same as [`verify_receipts`]: RLP-encode indices as keys, EIP-2718 encode receipts
+/// as values, sort, feed into `HashBuilder`, compare root.
+pub fn verify_era1_receipts(
+    receipts: &[ReceiptEnvelope<PrimitiveLog>],
+    expected_root: B256,
+    block_num: u64,
+) -> Result<(), VerifyError> {
+    if receipts.is_empty() {
+        let empty_root = alloy_trie::EMPTY_ROOT_HASH;
+        return if expected_root == empty_root {
+            Ok(())
+        } else {
+            Err(VerifyError::RootMismatch {
+                block_num,
+                expected: expected_root,
+                computed: empty_root,
+            })
+        };
+    }
+
+    let mut items: Vec<(Vec<u8>, Vec<u8>)> = receipts
+        .iter()
+        .enumerate()
+        .map(|(i, receipt)| {
+            let key = rlp_encode_index(i);
+            let mut value = Vec::new();
+            receipt.encode_2718(&mut value);
+            (key, value)
+        })
+        .collect();
+
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut hb = HashBuilder::default();
+    for (key, value) in &items {
+        hb.add_leaf(Nibbles::unpack(key), value);
+    }
+
+    let computed = hb.root();
     if computed == expected_root {
         Ok(())
     } else {
@@ -212,5 +272,60 @@ mod tests {
             verify_receipts(&[receipt_b], root_a, 1).is_err(),
             "tampered receipt should fail against root_a"
         );
+    }
+
+    // --- ERA1 receipt verification tests ---
+
+    #[test]
+    fn verify_era1_empty_block_passes() {
+        use alloy_trie::EMPTY_ROOT_HASH;
+        assert!(verify_era1_receipts(&[], EMPTY_ROOT_HASH, 0).is_ok());
+    }
+
+    #[test]
+    fn verify_era1_single_legacy_receipt_correct_root() {
+        use alloy::eips::eip2718::Encodable2718;
+        use alloy_consensus::{Eip658Value, Receipt, ReceiptEnvelope, ReceiptWithBloom};
+        use alloy_primitives::{Bloom, Log as PrimitiveLog};
+        use alloy_trie::{HashBuilder, Nibbles};
+
+        let with_bloom = ReceiptWithBloom::<Receipt<PrimitiveLog>> {
+            receipt: Receipt {
+                status: Eip658Value::Eip658(true),
+                cumulative_gas_used: 21_000,
+                logs: vec![],
+            },
+            logs_bloom: Bloom::default(),
+        };
+        let envelope = ReceiptEnvelope::Legacy(with_bloom);
+
+        // Compute expected root the same way the function does
+        let key = vec![0x80u8]; // rlp_encode_index(0) for index 0
+        let mut value = Vec::new();
+        envelope.encode_2718(&mut value);
+        let mut hb = HashBuilder::default();
+        hb.add_leaf(Nibbles::unpack(&key), &value);
+        let expected_root = hb.root();
+
+        assert!(verify_era1_receipts(&[envelope], expected_root, 1).is_ok());
+    }
+
+    #[test]
+    fn verify_era1_wrong_root_fails() {
+        use alloy_consensus::{Eip658Value, Receipt, ReceiptEnvelope, ReceiptWithBloom};
+        use alloy_primitives::{Bloom, Log as PrimitiveLog, B256};
+
+        let with_bloom = ReceiptWithBloom::<Receipt<PrimitiveLog>> {
+            receipt: Receipt {
+                status: Eip658Value::Eip658(true),
+                cumulative_gas_used: 21_000,
+                logs: vec![],
+            },
+            logs_bloom: Bloom::default(),
+        };
+        let envelope = ReceiptEnvelope::Legacy(with_bloom);
+        let wrong_root = B256::from([0xABu8; 32]);
+
+        assert!(verify_era1_receipts(&[envelope], wrong_root, 1).is_err());
     }
 }
