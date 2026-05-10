@@ -289,6 +289,109 @@ pub fn read_era1_block_tuple(
     Ok(None)
 }
 
+/// A sequential iterator over every [`Era1BlockTuple`] in an ERA1 file.
+///
+/// Reads the file in a single O(N) pass. Construct via [`iter_era1_block_tuples`].
+pub struct Era1BlockIter {
+    file: fs::File,
+    path: PathBuf,
+    from_block: u64,
+    headers: VecDeque<Vec<u8>>,
+    bodies: VecDeque<Vec<u8>>,
+    receipts: VecDeque<Vec<u8>>,
+    difficulties: VecDeque<Vec<u8>>,
+    block_index: usize,
+    done: bool,
+}
+
+impl Iterator for Era1BlockIter {
+    type Item = Result<Era1BlockTuple, SourceError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+
+        loop {
+            // If all four queues have at least one entry, yield a tuple.
+            if !self.headers.is_empty()
+                && !self.bodies.is_empty()
+                && !self.receipts.is_empty()
+                && !self.difficulties.is_empty()
+            {
+                let tuple = Era1BlockTuple {
+                    block_number: self.from_block + self.block_index as u64,
+                    compressed_header: self.headers.pop_front().unwrap(),
+                    compressed_body: self.bodies.pop_front().unwrap(),
+                    compressed_receipts: self.receipts.pop_front().unwrap(),
+                    total_difficulty: self.difficulties.pop_front().unwrap(),
+                };
+                self.block_index += 1;
+                return Some(Ok(tuple));
+            }
+
+            // Need to read more entries to complete the next tuple.
+            let entry = match read_e2store_entry(&mut self.file, &self.path) {
+                Ok(Some(e)) => e,
+                Ok(None) => {
+                    self.done = true;
+                    return None;
+                }
+                Err(e) => {
+                    self.done = true;
+                    return Some(Err(e));
+                }
+            };
+
+            match entry.entry_type {
+                E2STORE_VERSION => {}
+                ERA1_COMPRESSED_HEADER => self.headers.push_back(entry.data),
+                ERA1_COMPRESSED_BODY => self.bodies.push_back(entry.data),
+                ERA1_COMPRESSED_RECEIPTS => self.receipts.push_back(entry.data),
+                ERA1_TOTAL_DIFFICULTY => self.difficulties.push_back(entry.data),
+                ERA1_BLOCK_INDEX => {
+                    // Block index signals end of block data; stop iterating.
+                    self.done = true;
+                    return None;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Open an ERA1 file and return an iterator that yields every block tuple in order.
+///
+/// The block index at the end of the file is read first to determine `from_block`,
+/// then the file is rewound to the beginning for the sequential one-pass read.
+pub fn iter_era1_block_tuples(path: impl AsRef<Path>) -> Result<Era1BlockIter, SourceError> {
+    let path = path.as_ref();
+    let range = read_era1_block_index_range(path)?;
+    let from_block = range.map(|r| r.from_block).unwrap_or(0);
+
+    let mut file = fs::File::open(path).map_err(|source| SourceError::ReadFile {
+        path: path.to_owned(),
+        source,
+    })?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|source| SourceError::ReadFile {
+            path: path.to_owned(),
+            source,
+        })?;
+
+    Ok(Era1BlockIter {
+        file,
+        path: path.to_owned(),
+        from_block,
+        headers: VecDeque::new(),
+        bodies: VecDeque::new(),
+        receipts: VecDeque::new(),
+        difficulties: VecDeque::new(),
+        block_index: 0,
+        done: false,
+    })
+}
+
 pub fn decode_era1_header(compressed_header: &[u8]) -> Result<ScopeHeader, SourceError> {
     let mut decoder = FrameDecoder::new(compressed_header);
     let mut rlp = Vec::new();
@@ -707,6 +810,36 @@ mod tests {
         assert_eq!(block.compressed_body, b"b65");
         assert_eq!(block.compressed_receipts, b"r65");
         assert_eq!(block.total_difficulty, b"d65");
+    }
+
+    #[test]
+    fn iterates_all_block_tuples_in_order() {
+        let dir = tempdir().unwrap();
+        let era1 = dir.path().join("mainnet-00000-5ec1ffb8.era1");
+        fs::write(
+            &era1,
+            synthetic_era1_with_blocks(
+                10,
+                &[
+                    ("h10", "b10", "r10", "d10"),
+                    ("h11", "b11", "r11", "d11"),
+                    ("h12", "b12", "r12", "d12"),
+                ],
+            ),
+        )
+        .unwrap();
+
+        let tuples: Vec<_> = iter_era1_block_tuples(&era1)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(tuples.len(), 3);
+        assert_eq!(tuples[0].block_number, 10);
+        assert_eq!(tuples[0].compressed_header, b"h10");
+        assert_eq!(tuples[1].block_number, 11);
+        assert_eq!(tuples[2].block_number, 12);
+        assert_eq!(tuples[2].compressed_receipts, b"r12");
     }
 
     #[test]
