@@ -1,7 +1,8 @@
 //! Local historical source scanning.
 
 use crate::types::ScopeHeader;
-use alloy_consensus::Header;
+use alloy_consensus::{Header, Receipt, ReceiptEnvelope, ReceiptWithBloom};
+use alloy_primitives::Log as PrimitiveLog;
 use alloy_rlp::Decodable;
 use sha2::{Digest, Sha256};
 use snap::read::FrameDecoder;
@@ -411,6 +412,82 @@ pub fn decode_era1_header(compressed_header: &[u8]) -> Result<ScopeHeader, Sourc
         gas_used: header.gas_used,
         base_fee_per_gas: header.base_fee_per_gas.map(|fee| fee as u128),
     })
+}
+
+pub fn decode_era1_receipts(
+    compressed: &[u8],
+) -> Result<Vec<ReceiptEnvelope<PrimitiveLog>>, SourceError> {
+    let mut raw = Vec::new();
+    FrameDecoder::new(compressed)
+        .read_to_end(&mut raw)
+        .map_err(|e| SourceError::InvalidEra1Header(e.to_string()))?;
+
+    let mut slice = raw.as_slice();
+
+    let list_header = alloy_rlp::Header::decode(&mut slice)
+        .map_err(|e| SourceError::InvalidEra1Header(e.to_string()))?;
+    if !list_header.list {
+        return Err(SourceError::InvalidEra1Header(
+            "receipts block is not an RLP list".into(),
+        ));
+    }
+
+    let mut payload = &slice[..list_header.payload_length];
+    let mut receipts = Vec::new();
+
+    while !payload.is_empty() {
+        let first = *payload.first().unwrap();
+
+        if first >= 0xc0 {
+            // RLP list → legacy receipt
+            let with_bloom = ReceiptWithBloom::<Receipt<PrimitiveLog>>::decode(&mut payload)
+                .map_err(|e| SourceError::InvalidEra1Header(e.to_string()))?;
+            receipts.push(ReceiptEnvelope::Legacy(with_bloom));
+        } else if first >= 0x80 {
+            // RLP byte string → typed receipt bytes
+            let item_header = alloy_rlp::Header::decode(&mut payload)
+                .map_err(|e| SourceError::InvalidEra1Header(e.to_string()))?;
+            let item = &payload[..item_header.payload_length];
+            payload = &payload[item_header.payload_length..];
+
+            let receipt_type = *item.first().ok_or_else(|| {
+                SourceError::InvalidEra1Header("typed receipt byte string is empty".into())
+            })?;
+            let mut body = &item[1..];
+            let with_bloom = ReceiptWithBloom::<Receipt<PrimitiveLog>>::decode(&mut body)
+                .map_err(|e| SourceError::InvalidEra1Header(e.to_string()))?;
+            receipts.push(match receipt_type {
+                1 => ReceiptEnvelope::Eip2930(with_bloom),
+                2 => ReceiptEnvelope::Eip1559(with_bloom),
+                3 => ReceiptEnvelope::Eip4844(with_bloom),
+                4 => ReceiptEnvelope::Eip7702(with_bloom),
+                t => {
+                    return Err(SourceError::InvalidEra1Header(format!(
+                        "unknown receipt type: {t}"
+                    )))
+                }
+            });
+        } else {
+            // Direct type prefix byte
+            let receipt_type = first;
+            payload = &payload[1..];
+            let with_bloom = ReceiptWithBloom::<Receipt<PrimitiveLog>>::decode(&mut payload)
+                .map_err(|e| SourceError::InvalidEra1Header(e.to_string()))?;
+            receipts.push(match receipt_type {
+                1 => ReceiptEnvelope::Eip2930(with_bloom),
+                2 => ReceiptEnvelope::Eip1559(with_bloom),
+                3 => ReceiptEnvelope::Eip4844(with_bloom),
+                4 => ReceiptEnvelope::Eip7702(with_bloom),
+                t => {
+                    return Err(SourceError::InvalidEra1Header(format!(
+                        "unknown receipt type: {t}"
+                    )))
+                }
+            });
+        }
+    }
+
+    Ok(receipts)
 }
 
 fn parse_era1_filename(path: &Path, network_override: Option<&str>) -> Option<Era1FileName> {
@@ -911,6 +988,63 @@ mod tests {
         bytes.extend_from_slice(&0u16.to_le_bytes());
         bytes.extend_from_slice(data);
         bytes
+    }
+
+    #[test]
+    fn decodes_empty_receipt_list() {
+        use std::io::Write;
+
+        // RLP of an empty list: 0xC0
+        let rlp_empty_list = vec![0xC0u8];
+        let mut compressed = Vec::new();
+        {
+            let mut enc = snap::write::FrameEncoder::new(&mut compressed);
+            enc.write_all(&rlp_empty_list).unwrap();
+            enc.flush().unwrap();
+        }
+
+        let receipts = decode_era1_receipts(&compressed).unwrap();
+        assert!(receipts.is_empty());
+    }
+
+    #[test]
+    fn decodes_single_legacy_receipt() {
+        use alloy_consensus::{Eip658Value, Receipt, ReceiptWithBloom};
+        use alloy_primitives::{Bloom, Log as PrimitiveLog};
+        use alloy_rlp::{Encodable, Header as RlpHeader};
+        use std::io::Write;
+
+        let receipt = ReceiptWithBloom::<Receipt<PrimitiveLog>> {
+            receipt: Receipt {
+                status: Eip658Value::Eip658(true),
+                cumulative_gas_used: 21_000,
+                logs: vec![],
+            },
+            logs_bloom: Bloom::default(),
+        };
+
+        let mut item_buf = Vec::new();
+        receipt.encode(&mut item_buf);
+
+        let outer_header = RlpHeader {
+            list: true,
+            payload_length: item_buf.len(),
+        };
+        let mut list_buf = Vec::new();
+        outer_header.encode(&mut list_buf);
+        list_buf.extend_from_slice(&item_buf);
+
+        let mut compressed = Vec::new();
+        {
+            let mut enc = snap::write::FrameEncoder::new(&mut compressed);
+            enc.write_all(&list_buf).unwrap();
+            enc.flush().unwrap();
+        }
+
+        let receipts = decode_era1_receipts(&compressed).unwrap();
+        assert_eq!(receipts.len(), 1);
+        let inner = receipts[0].as_receipt_with_bloom().unwrap();
+        assert_eq!(inner.receipt.cumulative_gas_used, 21_000);
     }
 
     fn snappy_rlp(header: &alloy_consensus::Header) -> Vec<u8> {
