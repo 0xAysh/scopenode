@@ -23,8 +23,9 @@ use crate::config::ContractConfig;
 use crate::error::AbiError;
 use crate::types::StoredEvent;
 use alloy::rpc::types::TransactionReceipt;
+use alloy_consensus::ReceiptEnvelope;
 use alloy_dyn_abi::{DynSolType, DynSolValue};
-use alloy_primitives::{keccak256, Address, Bytes, B256};
+use alloy_primitives::{keccak256, Address, Bytes, Log as PrimitiveLog, B256};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -508,6 +509,66 @@ impl EventDecoder {
         results
     }
 
+    /// ERA1 variant of `extract_and_decode`.
+    ///
+    /// Takes consensus `ReceiptEnvelope<PrimitiveLog>` directly and a parallel `tx_hashes`
+    /// slice (from the block body). Tracks cumulative log index in-process.
+    /// Returns decoded `StoredEvent` values with `source = "era1"`.
+    pub fn extract_and_decode_era1(
+        &self,
+        receipts: &[ReceiptEnvelope<PrimitiveLog>],
+        tx_hashes: &[B256],
+        block_num: u64,
+        block_hash: B256,
+        timestamp: u64,
+    ) -> Vec<StoredEvent> {
+        let mut results = Vec::new();
+        let mut cumulative_log_index: u64 = 0;
+
+        for (tx_idx, receipt) in receipts.iter().enumerate() {
+            let tx_hash = tx_hashes.get(tx_idx).copied().unwrap_or_default();
+
+            for log in receipt.logs() {
+                let log_index = cumulative_log_index;
+                cumulative_log_index += 1;
+
+                if log.address != self.contract {
+                    continue;
+                }
+                let topics = log.topics();
+                let topic0 = match topics.first() {
+                    Some(t) => *t,
+                    None => continue,
+                };
+                let event_abi = match self.events.get(&topic0) {
+                    Some(e) => e,
+                    None => continue,
+                };
+
+                let raw_data = log.data.data.clone();
+                let decoded = self.decode_log(event_abi, topics, raw_data.as_ref());
+
+                results.push(StoredEvent {
+                    contract: self.contract,
+                    event_name: event_abi.name.clone(),
+                    topic0,
+                    block_number: block_num,
+                    block_hash,
+                    tx_hash,
+                    tx_index: tx_idx as u64,
+                    log_index,
+                    raw_topics: topics.to_vec(),
+                    raw_data: Bytes::from(raw_data.to_vec()),
+                    decoded,
+                    source: "era1".to_string(),
+                    timestamp,
+                });
+            }
+        }
+
+        results
+    }
+
     /// Decode a single log's topics and data into a JSON object of named fields.
     ///
     /// Indexed params come from `topics[1..]`; non-indexed params are ABI-decoded
@@ -659,6 +720,65 @@ fn dyn_sol_value_to_json(value: &DynSolValue) -> Value {
             Value::Array(items.iter().map(dyn_sol_value_to_json).collect())
         }
         _ => Value::String("[unknown]".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod era1_tests {
+    use super::*;
+    use alloy_consensus::{Eip658Value, Receipt, ReceiptEnvelope, ReceiptWithBloom};
+    use alloy_primitives::{address, keccak256, Bloom, Bytes, Log as PrimitiveLog, LogData, B256};
+
+    #[test]
+    fn extract_and_decode_era1_finds_matching_log() {
+        let contract = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let topic0 = keccak256(b"Transfer(address,address,uint256)");
+
+        let log = PrimitiveLog {
+            address: contract,
+            data: LogData::new_unchecked(
+                vec![topic0, B256::ZERO, B256::ZERO],
+                Bytes::from(vec![0u8; 32]),
+            ),
+        };
+
+        let receipt = ReceiptWithBloom::<Receipt<PrimitiveLog>> {
+            receipt: Receipt {
+                status: Eip658Value::Eip658(true),
+                cumulative_gas_used: 21_000,
+                logs: vec![log],
+            },
+            logs_bloom: Bloom::default(),
+        };
+        let receipts = vec![ReceiptEnvelope::Legacy(receipt)];
+
+        let tx_hash = B256::from([0x42u8; 32]);
+        let tx_hashes = vec![tx_hash];
+
+        let events = vec![EventAbi {
+            name: "Transfer".into(),
+            inputs: vec![
+                EventInput { name: "from".into(), ty: "address".into(), indexed: true, components: vec![] },
+                EventInput { name: "to".into(), ty: "address".into(), indexed: true, components: vec![] },
+                EventInput { name: "value".into(), ty: "uint256".into(), indexed: false, components: vec![] },
+            ],
+        }];
+
+        let decoder = EventDecoder::new(&events, contract).unwrap();
+        let stored = decoder.extract_and_decode_era1(
+            &receipts,
+            &tx_hashes,
+            100,
+            B256::ZERO,
+            1_000_000,
+        );
+
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].event_name, "Transfer");
+        assert_eq!(stored[0].tx_hash, tx_hash);
+        assert_eq!(stored[0].tx_index, 0);
+        assert_eq!(stored[0].log_index, 0);
+        assert_eq!(stored[0].source, "era1");
     }
 }
 
