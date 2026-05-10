@@ -2,7 +2,7 @@
 
 use crate::types::ScopeHeader;
 use alloy_consensus::{Header, Receipt, ReceiptEnvelope, ReceiptWithBloom};
-use alloy_primitives::Log as PrimitiveLog;
+use alloy_primitives::{keccak256, Log as PrimitiveLog};
 use alloy_rlp::Decodable;
 use sha2::{Digest, Sha256};
 use snap::read::FrameDecoder;
@@ -488,6 +488,88 @@ pub fn decode_era1_receipts(
     }
 
     Ok(receipts)
+}
+
+pub fn decode_era1_tx_hashes(compressed: &[u8]) -> Result<Vec<alloy_primitives::B256>, SourceError> {
+    let mut raw = Vec::new();
+    FrameDecoder::new(compressed)
+        .read_to_end(&mut raw)
+        .map_err(|e| SourceError::InvalidEra1Header(e.to_string()))?;
+
+    let mut slice = raw.as_slice();
+
+    // Outer body list: [transactions, uncles]
+    let body_header = alloy_rlp::Header::decode(&mut slice)
+        .map_err(|e| SourceError::InvalidEra1Header(e.to_string()))?;
+    if !body_header.list {
+        return Err(SourceError::InvalidEra1Header("body is not an RLP list".into()));
+    }
+
+    // Transactions list header
+    let tx_list_header = alloy_rlp::Header::decode(&mut slice)
+        .map_err(|e| SourceError::InvalidEra1Header(e.to_string()))?;
+    if !tx_list_header.list {
+        return Err(SourceError::InvalidEra1Header(
+            "body transactions is not an RLP list".into(),
+        ));
+    }
+
+    let mut tx_payload = &slice[..tx_list_header.payload_length];
+    let mut hashes = Vec::new();
+
+    while !tx_payload.is_empty() {
+        let first = *tx_payload.first().unwrap();
+
+        let raw_tx: Vec<u8> = if first >= 0xc0 {
+            // Legacy tx: the RLP list item (header + content)
+            let start = tx_payload;
+            let h = match alloy_rlp::Header::decode(&mut tx_payload) {
+                Ok(h) => h,
+                Err(_) => {
+                    hashes.push(alloy_primitives::B256::ZERO);
+                    break;
+                }
+            };
+            let consumed = start.len() - tx_payload.len();
+            let item = start[..consumed + h.payload_length].to_vec();
+            tx_payload = &tx_payload[h.payload_length..];
+            item
+        } else if first >= 0x80 {
+            // Typed tx in RLP byte string: content = type_byte || RLP(body)
+            let h = match alloy_rlp::Header::decode(&mut tx_payload) {
+                Ok(h) => h,
+                Err(_) => {
+                    hashes.push(alloy_primitives::B256::ZERO);
+                    break;
+                }
+            };
+            let bytes = tx_payload[..h.payload_length].to_vec();
+            tx_payload = &tx_payload[h.payload_length..];
+            bytes
+        } else {
+            // Direct type prefix
+            let type_byte = first;
+            tx_payload = &tx_payload[1..];
+            let start = tx_payload;
+            let h = match alloy_rlp::Header::decode(&mut tx_payload) {
+                Ok(h) => h,
+                Err(_) => {
+                    hashes.push(alloy_primitives::B256::ZERO);
+                    break;
+                }
+            };
+            let consumed = start.len() - tx_payload.len();
+            let body_len = consumed + h.payload_length;
+            let mut bytes = vec![type_byte];
+            bytes.extend_from_slice(&start[..body_len]);
+            tx_payload = &tx_payload[h.payload_length..];
+            bytes
+        };
+
+        hashes.push(keccak256(&raw_tx));
+    }
+
+    Ok(hashes)
 }
 
 fn parse_era1_filename(path: &Path, network_override: Option<&str>) -> Option<Era1FileName> {
@@ -1045,6 +1127,35 @@ mod tests {
         assert_eq!(receipts.len(), 1);
         let inner = receipts[0].as_receipt_with_bloom().unwrap();
         assert_eq!(inner.receipt.cumulative_gas_used, 21_000);
+    }
+
+    #[test]
+    fn decodes_empty_body_as_no_tx_hashes() {
+        use alloy_rlp::Header as RlpHeader;
+        use std::io::Write;
+
+        // RLP of [[],[]] — empty transactions list and empty uncles list
+        let empty = RlpHeader { list: true, payload_length: 0 };
+        let mut txs = Vec::new();
+        empty.encode(&mut txs);
+        let mut uncles = Vec::new();
+        empty.encode(&mut uncles);
+        let body_payload = txs.len() + uncles.len();
+        let body_h = RlpHeader { list: true, payload_length: body_payload };
+        let mut body_buf = Vec::new();
+        body_h.encode(&mut body_buf);
+        body_buf.extend_from_slice(&txs);
+        body_buf.extend_from_slice(&uncles);
+
+        let mut compressed = Vec::new();
+        {
+            let mut enc = snap::write::FrameEncoder::new(&mut compressed);
+            enc.write_all(&body_buf).unwrap();
+            enc.flush().unwrap();
+        }
+
+        let hashes = decode_era1_tx_hashes(&compressed).unwrap();
+        assert!(hashes.is_empty());
     }
 
     fn snappy_rlp(header: &alloy_consensus::Header) -> Vec<u8> {
