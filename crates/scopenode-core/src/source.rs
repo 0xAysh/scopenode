@@ -296,10 +296,10 @@ pub struct Era1BlockIter {
     file: fs::File,
     path: PathBuf,
     from_block: u64,
-    headers: VecDeque<Vec<u8>>,
-    bodies: VecDeque<Vec<u8>>,
-    receipts: VecDeque<Vec<u8>>,
-    difficulties: VecDeque<Vec<u8>>,
+    pending_header: Option<Vec<u8>>,
+    pending_body: Option<Vec<u8>>,
+    pending_receipts: Option<Vec<u8>>,
+    pending_difficulty: Option<Vec<u8>>,
     block_index: usize,
     done: bool,
 }
@@ -313,18 +313,18 @@ impl Iterator for Era1BlockIter {
         }
 
         loop {
-            // If all four queues have at least one entry, yield a tuple.
-            if !self.headers.is_empty()
-                && !self.bodies.is_empty()
-                && !self.receipts.is_empty()
-                && !self.difficulties.is_empty()
+            // If all four slots are filled, yield a tuple.
+            if self.pending_header.is_some()
+                && self.pending_body.is_some()
+                && self.pending_receipts.is_some()
+                && self.pending_difficulty.is_some()
             {
                 let tuple = Era1BlockTuple {
                     block_number: self.from_block + self.block_index as u64,
-                    compressed_header: self.headers.pop_front().unwrap(),
-                    compressed_body: self.bodies.pop_front().unwrap(),
-                    compressed_receipts: self.receipts.pop_front().unwrap(),
-                    total_difficulty: self.difficulties.pop_front().unwrap(),
+                    compressed_header: self.pending_header.take().unwrap(),
+                    compressed_body: self.pending_body.take().unwrap(),
+                    compressed_receipts: self.pending_receipts.take().unwrap(),
+                    total_difficulty: self.pending_difficulty.take().unwrap(),
                 };
                 self.block_index += 1;
                 return Some(Ok(tuple));
@@ -345,10 +345,10 @@ impl Iterator for Era1BlockIter {
 
             match entry.entry_type {
                 E2STORE_VERSION => {}
-                ERA1_COMPRESSED_HEADER => self.headers.push_back(entry.data),
-                ERA1_COMPRESSED_BODY => self.bodies.push_back(entry.data),
-                ERA1_COMPRESSED_RECEIPTS => self.receipts.push_back(entry.data),
-                ERA1_TOTAL_DIFFICULTY => self.difficulties.push_back(entry.data),
+                ERA1_COMPRESSED_HEADER => self.pending_header = Some(entry.data),
+                ERA1_COMPRESSED_BODY => self.pending_body = Some(entry.data),
+                ERA1_COMPRESSED_RECEIPTS => self.pending_receipts = Some(entry.data),
+                ERA1_TOTAL_DIFFICULTY => self.pending_difficulty = Some(entry.data),
                 ERA1_BLOCK_INDEX => {
                     // Block index signals end of block data; stop iterating.
                     self.done = true;
@@ -366,27 +366,25 @@ impl Iterator for Era1BlockIter {
 /// then the file is rewound to the beginning for the sequential one-pass read.
 pub fn iter_era1_block_tuples(path: impl AsRef<Path>) -> Result<Era1BlockIter, SourceError> {
     let path = path.as_ref();
-    let range = read_era1_block_index_range(path)?;
-    let from_block = range.map(|r| r.from_block).unwrap_or(0);
+    let range = read_era1_block_index_range(path)?.ok_or_else(|| SourceError::InvalidE2Store {
+        path: path.to_owned(),
+        message: "no block index found in ERA1 file".into(),
+    })?;
+    let from_block = range.from_block;
 
-    let mut file = fs::File::open(path).map_err(|source| SourceError::ReadFile {
+    let file = fs::File::open(path).map_err(|source| SourceError::ReadFile {
         path: path.to_owned(),
         source,
     })?;
-    file.seek(SeekFrom::Start(0))
-        .map_err(|source| SourceError::ReadFile {
-            path: path.to_owned(),
-            source,
-        })?;
 
     Ok(Era1BlockIter {
         file,
         path: path.to_owned(),
         from_block,
-        headers: VecDeque::new(),
-        bodies: VecDeque::new(),
-        receipts: VecDeque::new(),
-        difficulties: VecDeque::new(),
+        pending_header: None,
+        pending_body: None,
+        pending_receipts: None,
+        pending_difficulty: None,
         block_index: 0,
         done: false,
     })
