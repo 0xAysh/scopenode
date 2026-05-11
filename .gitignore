@@ -1,5 +1,7 @@
 /target
 *.db
+*.db-wal
+*.db-shm
 *.db.snap
 config.test.toml
 .env
@@ -10,3 +12,14 @@ config.test.toml
 /docs/brainstorms
 /docs/superpowers
 .context
+
+# ERA1/era data files
+*.era1
+*.era
+
+# Export / data files
+*.csv
+*.json.export
+
+# Local data directories
+.scopenode*/

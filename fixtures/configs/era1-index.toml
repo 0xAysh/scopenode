@@ -7,9 +7,12 @@ kind = "era1"
 path = "fixtures/era1/mainnet"
 network = "mainnet"
 
+# Uniswap V3 ETH/USDC pool — first full epoch of trading activity
+# Epoch 01510 covers blocks 12369920 → 12378111 (day 1-2 after launch)
+# Download: curl -L https://era1.ethportal.net/mainnet-01510-87aec91b.era1 -o fixtures/era1/mainnet/mainnet-01510-87aec91b.era1
 [[contracts]]
-name = "ERA1 fixture smoke scope"
-address = "0x0000000000000000000000000000000000000001"
-events = ["Transfer"]
-from_block = 0
-to_block = 100
+name = "Uniswap V3 ETH/USDC"
+address = "0x8ad599c3A0ff1De082011EFDDc58f1908eb6e6D8"
+events = ["Swap", "Mint", "Burn"]
+from_block = 12369920
+to_block = 12378111
