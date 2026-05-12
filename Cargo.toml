@@ -28,37 +28,16 @@ sqlx              = { version = "0.8", features = ["sqlite", "runtime-tokio", "m
 indicatif         = "0.18"
 async-trait       = "0.1"
 dirs              = "6"
-url               = { version = "2", features = ["serde"] }
 jsonrpsee         = { version = "0.26", features = ["server", "macros"] }
-# devp2p stack — reth provides production-grade Ethereum P2P networking
-# Use git ref because crates.io publishes all reth crates at 0.0.0 (internal workspace versions)
-reth-network             = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3", default-features = false }
-reth-network-api         = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3", default-features = false }
-reth-network-peers       = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3", default-features = false }
-reth-network-p2p         = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3", default-features = false }
-reth-eth-wire            = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3", default-features = false }
-reth-storage-api         = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3", default-features = false }
-reth-transaction-pool    = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3", default-features = false }
-reth-ethereum-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3", default-features = false }
-reth-ethereum-forks      = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3", default-features = false }
-reth-dns-discovery       = { git = "https://github.com/paradigmxyz/reth", tag = "v1.11.3", default-features = false }
 tokio-stream             = "0.1"
-tokio-util               = { version = "0.7", features = ["codec", "rt"] }
-libc                     = "0.2"
-notify-debouncer-full    = "0.7"
 axum                     = { version = "0.7", features = ["tokio"] }
 tower-http               = { version = "0.5", features = ["cors"] }
 scopenode-core    = { path = "crates/scopenode-core" }
 scopenode-storage = { path = "crates/scopenode-storage" }
 scopenode-rpc     = { path = "crates/scopenode-rpc" }
-# beacon light client — git-only, unrelated to the "helios" geometry crate on crates.io
-helios-ethereum   = { git = "https://github.com/a16z/helios", tag = "0.11.1" }
-# openssl vendored: required by helios for non-WASM builds (needs cc + make on CI)
-openssl           = { version = "0.10", features = ["vendored"] }
 wiremock          = "0.6"
 futures           = "0.3"
 tempfile          = "3"
 hex               = "0.4"
-eyre              = "0.6"
 sha2              = "0.10"
 snap              = "1"
