@@ -1,7 +1,11 @@
 # scopenode
 
+> [!IMPORTANT]
+> Some parts of this project are work in progress and not ready for production use.
+
+
 > **Project status: active refactor / product pivot**
->
+> 
 > scopenode is currently undergoing a significant architectural refactor and
 > product direction review. The current implementation is experimental and is
 > not recommended for production use or critical workflows. Expect bugs,
