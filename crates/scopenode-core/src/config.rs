@@ -7,11 +7,6 @@
 //! ```toml
 //! [node]
 //! port = 8545
-//! consensus_rpc = [
-//!     "https://www.lightclientdata.org",
-//!     "https://sync-mainnet.beaconcha.in",
-//! ]
-//! reorg_buffer = 64
 //!
 //! [[contracts]]
 //! name = "Uniswap V3 USDC/ETH"
@@ -25,7 +20,6 @@ use alloy_primitives::Address;
 use serde::Deserialize;
 use std::fmt;
 use std::path::PathBuf;
-use url::Url;
 
 /// Root configuration loaded from `config.toml`.
 #[derive(Debug, Clone, Deserialize)]
@@ -75,7 +69,7 @@ impl SourceKind {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeConfig {
-    /// JSON-RPC server port. Default: 8545 (the standard Ethereum RPC port).
+    /// JSON-RPC server port. Default: 8545.
     #[serde(default = "default_port")]
     pub port: u16,
 
@@ -83,72 +77,6 @@ pub struct NodeConfig {
     ///
     /// Defaults to `~/.scopenode`. Tilde expansion is performed.
     pub data_dir: Option<PathBuf>,
-
-    /// Beacon chain consensus RPC endpoints for Helios live sync.
-    ///
-    /// Multiple endpoints are used for Byzantine fault tolerance — all must
-    /// agree on the latest execution block hash before live sync proceeds.
-    /// Disagreement halts live sync and logs an error. Only used when at least
-    /// one contract has `to_block` absent (live sync mode).
-    ///
-    /// Example public endpoints:
-    /// - `https://www.lightclientdata.org`
-    /// - `https://sync-mainnet.beaconcha.in`
-    #[serde(default)]
-    pub consensus_rpc: Vec<Url>,
-
-    /// Depth of the rolling reorg-detection buffer (number of block hashes to keep).
-    ///
-    /// Post-Merge finality: after ~64 blocks (~12.8 min) the beacon chain
-    /// cryptographically finalizes a block. Reorgs beyond this depth are
-    /// impossible without breaking PoS security. Decrease only if you understand
-    /// the trade-off — shallower buffers miss deep reorgs.
-    ///
-    /// Default: 64 (matches the post-Merge finality window).
-    #[serde(default = "default_reorg_buffer")]
-    pub reorg_buffer: u64,
-
-    /// Execution-layer RPC URL required when `consensus_rpc` is non-empty.
-    ///
-    /// Helios uses it for bootstrap block lookups only — it is not used for
-    /// indexing or event queries. Any public Ethereum RPC endpoint works.
-    /// Must use `https://` unless `allow_http_consensus_rpc = true`.
-    pub execution_rpc: Option<Url>,
-
-    /// Suppress the startup warning when no `consensus_rpc` is configured.
-    ///
-    /// Live headers will be trusted from devp2p peers without beacon verification.
-    /// Set this only after explicitly accepting the reduced security guarantee.
-    #[serde(default)]
-    pub beacon_unverified_ack: bool,
-
-    /// Fall back to unverified mode if Helios does not sync within the timeout.
-    ///
-    /// By default, live sync halts on bootstrap timeout. Set this to allow
-    /// processing to continue without beacon verification when the timeout expires.
-    #[serde(default)]
-    pub beacon_fallback_unverified: bool,
-
-    /// Allow `http://` scheme for `consensus_rpc` and `execution_rpc` URLs.
-    ///
-    /// HTTP endpoints allow MITM of sync committee data. Only enable for local
-    /// testing (e.g. a localhost Lodestar node). Logs a warning when active.
-    #[serde(default)]
-    pub allow_http_consensus_rpc: bool,
-
-    /// Hex-encoded finalized beacon checkpoint to anchor the BLS trust chain.
-    ///
-    /// Overrides the compiled-in default checkpoint. Must be a 0x-prefixed 32-byte
-    /// hex string (the finalized block hash from `eth_getBlockByNumber("finalized")`).
-    /// Leave unset to use the release default, which is updated each release.
-    pub consensus_checkpoint: Option<String>,
-
-    /// Seconds to wait for Helios to reach synced state before timing out.
-    ///
-    /// Default: 300. Recommended minimum: 120. On mainnet with a recent
-    /// checkpoint this typically takes 15–60 seconds; cold starts may take longer.
-    #[serde(default = "default_beacon_sync_timeout_secs")]
-    pub beacon_sync_timeout_secs: u64,
 }
 
 /// Configuration for a single contract to sync.
@@ -212,24 +140,6 @@ impl Config {
                 return Err(ConfigError::NoEvents(c.address));
             }
         }
-
-        let n = &self.node;
-        if !n.consensus_rpc.is_empty() && n.execution_rpc.is_none() {
-            return Err(ConfigError::MissingExecutionRpc);
-        }
-        if !n.allow_http_consensus_rpc {
-            for url in &n.consensus_rpc {
-                if url.scheme() == "http" {
-                    return Err(ConfigError::InsecureRpcUrl { url: url.clone() });
-                }
-            }
-            if let Some(url) = &n.execution_rpc {
-                if url.scheme() == "http" {
-                    return Err(ConfigError::InsecureRpcUrl { url: url.clone() });
-                }
-            }
-        }
-
         Ok(())
     }
 }
@@ -388,14 +298,6 @@ fn default_port() -> u16 {
     8545
 }
 
-fn default_reorg_buffer() -> u64 {
-    64
-}
-
-fn default_beacon_sync_timeout_secs() -> u64 {
-    300
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -469,138 +371,12 @@ mod tests {
         assert_eq!(cfg.contracts[0].from_block, 16_500_000);
     }
 
-    #[test]
-    fn toml_reorg_buffer_default() {
-        let toml = r#"
-            [node]
-            [[contracts]]
-            address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
-            events = ["Transfer"]
-            from_block = 1
-        "#;
-        let cfg: Config = toml::from_str(toml).unwrap();
-        assert_eq!(cfg.node.reorg_buffer, 64);
-    }
-
-    #[test]
-    fn toml_reorg_buffer_custom() {
-        let toml = r#"
-            [node]
-            reorg_buffer = 32
-            [[contracts]]
-            address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
-            events = ["Transfer"]
-            from_block = 1
-        "#;
-        let cfg: Config = toml::from_str(toml).unwrap();
-        assert_eq!(cfg.node.reorg_buffer, 32);
-    }
-
     fn minimal_contract_toml() -> &'static str {
         r#"
             address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
             events = ["Transfer"]
             from_block = 1
         "#
-    }
-
-    #[test]
-    fn beacon_sync_timeout_default() {
-        let toml = format!("[node]\n[[contracts]]\n{}", minimal_contract_toml());
-        let cfg: Config = toml::from_str(&toml).unwrap();
-        assert_eq!(cfg.node.beacon_sync_timeout_secs, 300);
-    }
-
-    #[test]
-    fn beacon_sync_timeout_custom() {
-        let toml = format!(
-            "[node]\nbeacon_sync_timeout_secs = 120\n[[contracts]]\n{}",
-            minimal_contract_toml()
-        );
-        let cfg: Config = toml::from_str(&toml).unwrap();
-        assert_eq!(cfg.node.beacon_sync_timeout_secs, 120);
-    }
-
-    #[test]
-    fn consensus_rpc_without_execution_rpc_errors() {
-        let toml = format!(
-            r#"[node]
-consensus_rpc = ["https://www.lightclientdata.org"]
-[[contracts]]
-{}"#,
-            minimal_contract_toml()
-        );
-        let cfg: Config = toml::from_str(&toml).unwrap();
-        let err = cfg.validate().unwrap_err();
-        assert!(
-            matches!(err, ConfigError::MissingExecutionRpc),
-            "expected MissingExecutionRpc, got {err}"
-        );
-    }
-
-    #[test]
-    fn http_consensus_rpc_without_allow_errors() {
-        let toml = format!(
-            r#"[node]
-consensus_rpc = ["http://localhost:5052"]
-execution_rpc = "https://eth-mainnet.example.com"
-[[contracts]]
-{}"#,
-            minimal_contract_toml()
-        );
-        let cfg: Config = toml::from_str(&toml).unwrap();
-        let err = cfg.validate().unwrap_err();
-        assert!(
-            matches!(err, ConfigError::InsecureRpcUrl { .. }),
-            "expected InsecureRpcUrl, got {err}"
-        );
-    }
-
-    #[test]
-    fn http_execution_rpc_without_allow_errors() {
-        let toml = format!(
-            r#"[node]
-consensus_rpc = ["https://www.lightclientdata.org"]
-execution_rpc = "http://localhost:8545"
-[[contracts]]
-{}"#,
-            minimal_contract_toml()
-        );
-        let cfg: Config = toml::from_str(&toml).unwrap();
-        let err = cfg.validate().unwrap_err();
-        assert!(
-            matches!(err, ConfigError::InsecureRpcUrl { .. }),
-            "expected InsecureRpcUrl, got {err}"
-        );
-    }
-
-    #[test]
-    fn allow_http_permits_http_urls() {
-        let toml = format!(
-            r#"[node]
-consensus_rpc = ["http://localhost:5052"]
-execution_rpc = "http://localhost:8545"
-allow_http_consensus_rpc = true
-[[contracts]]
-{}"#,
-            minimal_contract_toml()
-        );
-        let cfg: Config = toml::from_str(&toml).unwrap();
-        cfg.validate().unwrap();
-    }
-
-    #[test]
-    fn https_consensus_and_execution_rpc_passes() {
-        let toml = format!(
-            r#"[node]
-consensus_rpc = ["https://www.lightclientdata.org"]
-execution_rpc = "https://eth-mainnet.example.com"
-[[contracts]]
-{}"#,
-            minimal_contract_toml()
-        );
-        let cfg: Config = toml::from_str(&toml).unwrap();
-        cfg.validate().unwrap();
     }
 
     #[test]

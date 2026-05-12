@@ -180,14 +180,6 @@ fn test_config(contract_address: Address) -> Config {
         node: NodeConfig {
             port: 18545,
             data_dir: None,
-            consensus_rpc: vec![],
-            reorg_buffer: 64,
-            execution_rpc: None,
-            beacon_unverified_ack: false,
-            beacon_fallback_unverified: false,
-            allow_http_consensus_rpc: false,
-            consensus_checkpoint: None,
-            beacon_sync_timeout_secs: 300,
         },
         source: Some(SourceConfig {
             kind: SourceKind::Era1,
