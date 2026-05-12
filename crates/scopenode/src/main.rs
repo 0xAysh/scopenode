@@ -27,19 +27,6 @@ use tracing_subscriber::{fmt, EnvFilter};
 /// takes precedence over `-v` flags when set.
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Daemon child mode — detected BEFORE any CLI parsing or logging setup.
-    // The daemon installs its own tracing subscriber.
-    if std::env::var(scopenode_core::daemon::DAEMON_CHILD_ENV).is_ok() {
-        let data_dir = std::env::var("SCOPENODE_DAEMON_DATA_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| default_data_dir());
-        std::fs::create_dir_all(&data_dir).with_context(|| {
-            format!("daemon: failed to create data dir: {}", data_dir.display())
-        })?;
-        scopenode_core::daemon::DaemonBoot::run(data_dir).await?;
-        return Ok(());
-    }
-
     let cli = Cli::parse();
 
     // Map verbosity flags to log levels:
@@ -159,15 +146,8 @@ async fn main() -> Result<()> {
             commands::validate::run(config.clone()).await?;
         }
 
-        Command::Retry { config } => {
-            let cfg = Config::from_file(config).context("Failed to load config")?;
-            let data_dir = resolve_data_dir(&cfg);
-            std::fs::create_dir_all(&data_dir)
-                .with_context(|| format!("Failed to create data dir: {}", data_dir.display()))?;
-            let db = Db::open(data_dir.join("scopenode.db"))
-                .await
-                .context("Failed to open database")?;
-            commands::retry::run(cfg, db, data_dir).await?;
+        Command::Retry => {
+            commands::retry::run().await?;
         }
 
         Command::Snapshot { label } => {
@@ -186,23 +166,6 @@ async fn main() -> Result<()> {
                 .await
                 .context("Failed to open database")?;
             commands::doctor::run(db, &data_dir).await?;
-        }
-
-        Command::Start => {
-            let data_dir = resolve_data_dir_no_config(&cli.data_dir);
-            std::fs::create_dir_all(&data_dir)
-                .with_context(|| format!("Failed to create data dir: {}", data_dir.display()))?;
-            commands::start::run(&data_dir).await?;
-        }
-
-        Command::Stop { force } => {
-            let data_dir = resolve_data_dir_no_config(&cli.data_dir);
-            commands::stop::run(&data_dir, *force).await?;
-        }
-
-        Command::Logs { lines } => {
-            let data_dir = resolve_data_dir_no_config(&cli.data_dir);
-            commands::logs::run(&data_dir, *lines).await?;
         }
 
         Command::Export {

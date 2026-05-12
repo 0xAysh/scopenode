@@ -84,11 +84,8 @@ pub enum Command {
         /// Path to config file
         config: PathBuf,
     },
-    /// Re-fetch all blocks that failed receipt verification
-    Retry {
-        /// Path to config file
-        config: PathBuf,
-    },
+    /// Print a message that retry is not supported in ERA1 mode
+    Retry,
     /// Save a snapshot of the database
     Snapshot {
         /// Optional label for this snapshot (default: timestamp)
@@ -101,22 +98,8 @@ pub enum Command {
         #[arg(long)]
         label: Option<String>,
     },
-    /// Check node health: peers, beacon head, DB integrity, retry queue
+    /// Check node health: DB integrity and retry queue
     Doctor,
-    /// Start the background sync daemon
-    Start,
-    /// Stop the background sync daemon
-    Stop {
-        /// Kill immediately without waiting for the current job to finish
-        #[arg(long)]
-        force: bool,
-    },
-    /// Stream daemon log output (Ctrl+C detaches without stopping daemon)
-    Logs {
-        /// Number of backlog lines to show before streaming live output
-        #[arg(long, default_value = "20")]
-        lines: usize,
-    },
     /// Export all matching events to stdout as CSV or JSON (no row cap)
     Export {
         /// Filter by contract address
