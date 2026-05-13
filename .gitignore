@@ -8,9 +8,8 @@ config.test.toml
 .claude
 .worktrees/
 /graphify-out
-/docs/plans
-/docs/brainstorms
-/docs/superpowers
+/docs/*
+!/docs/phases
 .context
 
 # ERA1/era data files
