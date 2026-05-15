@@ -253,6 +253,20 @@ scopenode/
 
 ---
 
+## Roadmap
+
+scopenode is intentionally minimal right now. The core pipeline is solid — ERA1 files → verified events → SQLite → JSON-RPC. What's missing is the ability to stay current and to reach more users who don't have a full ERA1 archive.
+
+| | Feature | Why |
+|--|---------|-----|
+| 🔜 | **Live P2P sync** | Connect to Ethereum devp2p peers (`GetBlockHeaders` + `GetReceipts`) so scopenode can index new blocks as they're produced, past the ERA1 archive boundary. Picks up where ERA1 leaves off — no gap, no RPC dependency. |
+| 🔜 | **Hash-chain verification** | Verify the ERA1 file chain (each file's first block hash must match the parent of the next file) to catch truncated or corrupt archives before indexing starts. |
+| 🔜 | **`eth_subscribe` (WebSocket)** | Push live events to subscribers as they land — useful for apps that poll `eth_getLogs` in a loop today. Requires live P2P sync to be meaningful. |
+| 🔜 | **Multi-address + topic wildcard queries** | `eth_getLogs` currently requires a single address and at most one topic0. Lifting this to match the full Ethereum filter spec (address array, topic OR logic) removes the last compatibility gap with public RPC providers. |
+| 💭 | **Checkpoint-verified light client** | Use a beacon light client (BLS-verified sync committee) to confirm that devp2p peer headers are on the canonical chain — eliminates the trust assumption in live P2P mode. |
+
+---
+
 ## Key dependencies
 
 | Crate | Purpose |
