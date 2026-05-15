@@ -7805,7 +7805,6 @@ dependencies = [
  "libc",
  "notify-debouncer-full",
  "openssl",
- "reqwest 0.13.2",
  "reth-dns-discovery",
  "reth-eth-wire",
  "reth-ethereum-forks",
@@ -7829,7 +7828,6 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber 0.3.22",
- "url",
  "wiremock",
 ]
 

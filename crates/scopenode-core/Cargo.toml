@@ -16,10 +16,8 @@ serde             = { workspace = true }
 serde_json        = { workspace = true }
 toml              = { workspace = true }
 tracing           = { workspace = true }
-reqwest           = { workspace = true }
 async-trait       = { workspace = true }
 indicatif         = { workspace = true }
-url               = { workspace = true }
 scopenode-storage = { workspace = true }
 # devp2p
 reth-network             = { workspace = true }

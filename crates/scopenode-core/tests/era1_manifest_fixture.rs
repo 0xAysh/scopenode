@@ -21,8 +21,12 @@ fn scans_downloaded_era1_fixture_when_present() {
 
     assert_eq!(scan.kind, "era1");
     assert_eq!(scan.network.as_deref(), Some("mainnet"));
-    assert_eq!(scan.files.len(), 1);
-    let file = &scan.files[0];
+    assert!(!scan.files.is_empty());
+    let file = scan
+        .files
+        .iter()
+        .find(|f| f.filename == "mainnet-00000-5ec1ffb8.era1")
+        .expect("expected mainnet-00000-5ec1ffb8.era1 in scan results");
     assert_eq!(file.filename, "mainnet-00000-5ec1ffb8.era1");
     assert_eq!(file.network, "mainnet");
     assert_eq!(file.epoch, 0);

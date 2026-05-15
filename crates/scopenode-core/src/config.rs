@@ -7,17 +7,16 @@
 //! ```toml
 //! [node]
 //! port = 8545
-//! consensus_rpc = [
-//!     "https://www.lightclientdata.org",
-//!     "https://sync-mainnet.beaconcha.in",
-//! ]
-//! reorg_buffer = 64
+//! rest_port = 8546
+//! data_dir = "~/.scopenode"
+//! era_dir = "~/era1"
 //!
 //! [[contracts]]
-//! name = "Uniswap V3 USDC/ETH"
 //! address = "0x8ad599c3A0ff1De082011EFDDc58f1908eb6e6D8"
 //! events = ["Swap"]
-//! from_block = "12.3M"   # or 12376729
+//! from_block = "25M"
+//! to_block = "25.01M"
+//! abi_override = "./abis/UniswapV3Pool.json"
 //! ```
 
 use crate::error::ConfigError;
@@ -25,50 +24,16 @@ use alloy_primitives::Address;
 use serde::Deserialize;
 use std::fmt;
 use std::path::PathBuf;
-use url::Url;
 
 /// Root configuration loaded from `config.toml`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// Node-level settings (port, data directory, consensus RPCs, reorg buffer).
+    /// Node-level settings (port, data directory, era directory).
     pub node: NodeConfig,
-
-    /// Optional local historical source used by `scopenode index`.
-    #[serde(default)]
-    pub source: Option<SourceConfig>,
 
     /// List of contracts and events to sync. At least one contract is required.
     pub contracts: Vec<ContractConfig>,
-}
-
-/// Local historical source configuration.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SourceConfig {
-    /// Source adapter kind. The first supported source is ERA1.
-    pub kind: SourceKind,
-
-    /// Local path to a source directory.
-    pub path: PathBuf,
-
-    /// Optional network override used when source filenames do not carry one.
-    pub network: Option<String>,
-}
-
-/// Supported historical source adapters.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SourceKind {
-    Era1,
-}
-
-impl SourceKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Era1 => "era1",
-        }
-    }
 }
 
 /// Settings that apply to the whole node instance.
@@ -79,83 +44,26 @@ pub struct NodeConfig {
     #[serde(default = "default_port")]
     pub port: u16,
 
+    /// REST API server port. Default: 8546.
+    #[serde(default = "default_rest_port")]
+    pub rest_port: u16,
+
     /// Directory for the SQLite database and other persistent state.
     ///
-    /// Defaults to `~/.scopenode`. Tilde expansion is performed.
+    /// Defaults to `~/.scopenode`. Tilde expansion is performed by the caller.
     pub data_dir: Option<PathBuf>,
 
-    /// Beacon chain consensus RPC endpoints for Helios live sync.
+    /// Directory containing ERA1 files.
     ///
-    /// Multiple endpoints are used for Byzantine fault tolerance — all must
-    /// agree on the latest execution block hash before live sync proceeds.
-    /// Disagreement halts live sync and logs an error. Only used when at least
-    /// one contract has `to_block` absent (live sync mode).
-    ///
-    /// Example public endpoints:
-    /// - `https://www.lightclientdata.org`
-    /// - `https://sync-mainnet.beaconcha.in`
-    #[serde(default)]
-    pub consensus_rpc: Vec<Url>,
-
-    /// Depth of the rolling reorg-detection buffer (number of block hashes to keep).
-    ///
-    /// Post-Merge finality: after ~64 blocks (~12.8 min) the beacon chain
-    /// cryptographically finalizes a block. Reorgs beyond this depth are
-    /// impossible without breaking PoS security. Decrease only if you understand
-    /// the trade-off — shallower buffers miss deep reorgs.
-    ///
-    /// Default: 64 (matches the post-Merge finality window).
-    #[serde(default = "default_reorg_buffer")]
-    pub reorg_buffer: u64,
-
-    /// Execution-layer RPC URL required when `consensus_rpc` is non-empty.
-    ///
-    /// Helios uses it for bootstrap block lookups only — it is not used for
-    /// indexing or event queries. Any public Ethereum RPC endpoint works.
-    /// Must use `https://` unless `allow_http_consensus_rpc = true`.
-    pub execution_rpc: Option<Url>,
-
-    /// Suppress the startup warning when no `consensus_rpc` is configured.
-    ///
-    /// Live headers will be trusted from devp2p peers without beacon verification.
-    /// Set this only after explicitly accepting the reduced security guarantee.
-    #[serde(default)]
-    pub beacon_unverified_ack: bool,
-
-    /// Fall back to unverified mode if Helios does not sync within the timeout.
-    ///
-    /// By default, live sync halts on bootstrap timeout. Set this to allow
-    /// processing to continue without beacon verification when the timeout expires.
-    #[serde(default)]
-    pub beacon_fallback_unverified: bool,
-
-    /// Allow `http://` scheme for `consensus_rpc` and `execution_rpc` URLs.
-    ///
-    /// HTTP endpoints allow MITM of sync committee data. Only enable for local
-    /// testing (e.g. a localhost Lodestar node). Logs a warning when active.
-    #[serde(default)]
-    pub allow_http_consensus_rpc: bool,
-
-    /// Hex-encoded finalized beacon checkpoint to anchor the BLS trust chain.
-    ///
-    /// Overrides the compiled-in default checkpoint. Must be a 0x-prefixed 32-byte
-    /// hex string (the finalized block hash from `eth_getBlockByNumber("finalized")`).
-    /// Leave unset to use the release default, which is updated each release.
-    pub consensus_checkpoint: Option<String>,
-
-    /// Seconds to wait for Helios to reach synced state before timing out.
-    ///
-    /// Default: 300. Recommended minimum: 120. On mainnet with a recent
-    /// checkpoint this typically takes 15–60 seconds; cold starts may take longer.
-    #[serde(default = "default_beacon_sync_timeout_secs")]
-    pub beacon_sync_timeout_secs: u64,
+    /// Tilde expansion is performed by the caller.
+    pub era_dir: PathBuf,
 }
 
 /// Configuration for a single contract to sync.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContractConfig {
-    /// Optional human-readable label shown in progress output and `scopenode status`.
+    /// Optional human-readable label shown in progress output.
     pub name: Option<String>,
 
     /// The Ethereum contract address to watch.
@@ -173,18 +81,14 @@ pub struct ContractConfig {
     #[serde(deserialize_with = "deser_block_number")]
     pub from_block: u64,
 
-    /// Last block to sync (inclusive).
+    /// Last block to sync (inclusive). Required for ERA1 sync.
     ///
-    /// Omit for live sync — the pipeline runs historical sync then switches to
-    /// live block-by-block processing. Accepts the same shorthand as `from_block`.
+    /// Accepts the same shorthand as `from_block`.
     #[serde(deserialize_with = "deser_opt_block_number", default)]
     pub to_block: Option<u64>,
 
-    /// Path to a local ABI JSON file. Use when the contract is not verified on Sourcify.
+    /// Path to a local ABI JSON file. Required — remote ABI fetching is not supported.
     pub abi_override: Option<PathBuf>,
-
-    /// Implementation address for proxy contracts (EIP-1967 or any proxy pattern).
-    pub impl_address: Option<Address>,
 }
 
 impl Config {
@@ -199,6 +103,12 @@ impl Config {
 
     fn validate(&self) -> Result<(), ConfigError> {
         for c in &self.contracts {
+            if c.abi_override.is_none() {
+                return Err(ConfigError::AbiOverrideRequired(c.address));
+            }
+            if c.to_block.is_none() {
+                return Err(ConfigError::ToBlockRequired(c.address));
+            }
             if let Some(to) = c.to_block {
                 if to < c.from_block {
                     return Err(ConfigError::InvalidRange {
@@ -212,42 +122,16 @@ impl Config {
                 return Err(ConfigError::NoEvents(c.address));
             }
         }
-
-        let n = &self.node;
-        if !n.consensus_rpc.is_empty() && n.execution_rpc.is_none() {
-            return Err(ConfigError::MissingExecutionRpc);
-        }
-        if !n.allow_http_consensus_rpc {
-            for url in &n.consensus_rpc {
-                if url.scheme() == "http" {
-                    return Err(ConfigError::InsecureRpcUrl { url: url.clone() });
-                }
-            }
-            if let Some(url) = &n.execution_rpc {
-                if url.scheme() == "http" {
-                    return Err(ConfigError::InsecureRpcUrl { url: url.clone() });
-                }
-            }
-        }
-
         Ok(())
     }
 }
 
 // ─── Block number deserializers ───────────────────────────────────────────────
 
-/// Deserialize a block number from either an integer or a shorthand string.
-///
-/// Accepts:
-/// - Integer: `12376729`
-/// - `"16M"` → 16,000,000
-/// - `"16.5M"` → 16,500,000
-/// - `"12.3K"` → 12,300
 fn deser_block_number<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
     d.deserialize_any(BlockVisitor)
 }
 
-/// Deserialize an optional block number (absent field = `None`).
 fn deser_opt_block_number<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
     d.deserialize_any(OptBlockVisitor)
 }
@@ -289,7 +173,7 @@ impl<'de> serde::de::Visitor<'de> for OptBlockVisitor {
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "a block number, shorthand like \"16M\", or absent/null for live sync"
+            "a block number, shorthand like \"16M\", or absent/null"
         )
     }
 
@@ -329,9 +213,6 @@ impl<'de> serde::de::Visitor<'de> for OptBlockVisitor {
 /// - `K` — multiply by 1,000 (e.g. `"12.3K"` → 12,300)
 ///
 /// Plain integers (as strings) are also accepted: `"12376729"` → 12,376,729.
-///
-/// # Errors
-/// Returns an error string if the input cannot be parsed.
 pub fn parse_block_shorthand(s: &str) -> Result<u64, String> {
     if let Some(rest) = s.strip_suffix('M') {
         let n: f64 = rest.parse().map_err(|_| {
@@ -388,17 +269,27 @@ fn default_port() -> u16 {
     8545
 }
 
-fn default_reorg_buffer() -> u64 {
-    64
-}
-
-fn default_beacon_sync_timeout_secs() -> u64 {
-    300
+fn default_rest_port() -> u16 {
+    8546
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn minimal_contract_toml() -> &'static str {
+        r#"
+            address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+            events = ["Transfer"]
+            from_block = 1
+            to_block = 100
+            abi_override = "./abi.json"
+        "#
+    }
+
+    fn minimal_node_toml() -> &'static str {
+        r#"era_dir = "/tmp/era1""#
+    }
 
     #[test]
     fn parse_integer_string() {
@@ -432,203 +323,112 @@ mod tests {
 
     #[test]
     fn toml_integer_from_block() {
-        let toml = r#"
-            [node]
-            [[contracts]]
-            address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
-            events = ["Transfer"]
-            from_block = 12376729
-        "#;
-        let cfg: Config = toml::from_str(toml).unwrap();
+        let toml = format!(
+            "[node]\n{}\n[[contracts]]\naddress = \"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48\"\nevents = [\"Transfer\"]\nfrom_block = 12376729\nto_block = 12376800\nabi_override = \"./abi.json\"\n",
+            minimal_node_toml()
+        );
+        let cfg: Config = toml::from_str(&toml).unwrap();
         assert_eq!(cfg.contracts[0].from_block, 12376729);
     }
 
     #[test]
     fn toml_shorthand_from_block() {
-        let toml = r#"
-            [node]
-            [[contracts]]
-            address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
-            events = ["Transfer"]
-            from_block = "16M"
-        "#;
-        let cfg: Config = toml::from_str(toml).unwrap();
+        let toml = format!(
+            "[node]\n{}\n[[contracts]]\naddress = \"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48\"\nevents = [\"Transfer\"]\nfrom_block = \"16M\"\nto_block = \"16.1M\"\nabi_override = \"./abi.json\"\n",
+            minimal_node_toml()
+        );
+        let cfg: Config = toml::from_str(&toml).unwrap();
         assert_eq!(cfg.contracts[0].from_block, 16_000_000);
     }
 
     #[test]
     fn toml_shorthand_decimal() {
-        let toml = r#"
-            [node]
-            [[contracts]]
-            address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
-            events = ["Transfer"]
-            from_block = "16.5M"
-        "#;
-        let cfg: Config = toml::from_str(toml).unwrap();
+        let toml = format!(
+            "[node]\n{}\n[[contracts]]\naddress = \"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48\"\nevents = [\"Transfer\"]\nfrom_block = \"16.5M\"\nto_block = \"17M\"\nabi_override = \"./abi.json\"\n",
+            minimal_node_toml()
+        );
+        let cfg: Config = toml::from_str(&toml).unwrap();
         assert_eq!(cfg.contracts[0].from_block, 16_500_000);
     }
 
     #[test]
-    fn toml_reorg_buffer_default() {
-        let toml = r#"
-            [node]
-            [[contracts]]
-            address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
-            events = ["Transfer"]
-            from_block = 1
-        "#;
-        let cfg: Config = toml::from_str(toml).unwrap();
-        assert_eq!(cfg.node.reorg_buffer, 64);
-    }
-
-    #[test]
-    fn toml_reorg_buffer_custom() {
-        let toml = r#"
-            [node]
-            reorg_buffer = 32
-            [[contracts]]
-            address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
-            events = ["Transfer"]
-            from_block = 1
-        "#;
-        let cfg: Config = toml::from_str(toml).unwrap();
-        assert_eq!(cfg.node.reorg_buffer, 32);
-    }
-
-    fn minimal_contract_toml() -> &'static str {
-        r#"
-            address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
-            events = ["Transfer"]
-            from_block = 1
-        "#
-    }
-
-    #[test]
-    fn beacon_sync_timeout_default() {
-        let toml = format!("[node]\n[[contracts]]\n{}", minimal_contract_toml());
-        let cfg: Config = toml::from_str(&toml).unwrap();
-        assert_eq!(cfg.node.beacon_sync_timeout_secs, 300);
-    }
-
-    #[test]
-    fn beacon_sync_timeout_custom() {
+    fn port_defaults_to_8545() {
         let toml = format!(
-            "[node]\nbeacon_sync_timeout_secs = 120\n[[contracts]]\n{}",
+            "[node]\n{}\n[[contracts]]\n{}\n",
+            minimal_node_toml(),
             minimal_contract_toml()
         );
         let cfg: Config = toml::from_str(&toml).unwrap();
-        assert_eq!(cfg.node.beacon_sync_timeout_secs, 120);
+        assert_eq!(cfg.node.port, 8545);
     }
 
     #[test]
-    fn consensus_rpc_without_execution_rpc_errors() {
+    fn rest_port_defaults_to_8546() {
         let toml = format!(
-            r#"[node]
-consensus_rpc = ["https://www.lightclientdata.org"]
-[[contracts]]
-{}"#,
+            "[node]\n{}\n[[contracts]]\n{}\n",
+            minimal_node_toml(),
             minimal_contract_toml()
+        );
+        let cfg: Config = toml::from_str(&toml).unwrap();
+        assert_eq!(cfg.node.rest_port, 8546);
+    }
+
+    #[test]
+    fn era_dir_required() {
+        let toml = "[node]\n[[contracts]]\naddress = \"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48\"\nevents = [\"Transfer\"]\nfrom_block = 1\nto_block = 100\nabi_override = \"./abi.json\"\n";
+        assert!(toml::from_str::<Config>(toml).is_err());
+    }
+
+    #[test]
+    fn abi_override_required_in_validate() {
+        let toml = format!(
+            "[node]\n{}\n[[contracts]]\naddress = \"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48\"\nevents = [\"Transfer\"]\nfrom_block = 1\nto_block = 100\n",
+            minimal_node_toml()
         );
         let cfg: Config = toml::from_str(&toml).unwrap();
         let err = cfg.validate().unwrap_err();
         assert!(
-            matches!(err, ConfigError::MissingExecutionRpc),
-            "expected MissingExecutionRpc, got {err}"
+            matches!(err, ConfigError::AbiOverrideRequired(_)),
+            "expected AbiOverrideRequired, got {err}"
         );
     }
 
     #[test]
-    fn http_consensus_rpc_without_allow_errors() {
+    fn to_block_required_in_validate() {
         let toml = format!(
-            r#"[node]
-consensus_rpc = ["http://localhost:5052"]
-execution_rpc = "https://eth-mainnet.example.com"
-[[contracts]]
-{}"#,
-            minimal_contract_toml()
+            "[node]\n{}\n[[contracts]]\naddress = \"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48\"\nevents = [\"Transfer\"]\nfrom_block = 1\nabi_override = \"./abi.json\"\n",
+            minimal_node_toml()
         );
         let cfg: Config = toml::from_str(&toml).unwrap();
         let err = cfg.validate().unwrap_err();
         assert!(
-            matches!(err, ConfigError::InsecureRpcUrl { .. }),
-            "expected InsecureRpcUrl, got {err}"
+            matches!(err, ConfigError::ToBlockRequired(_)),
+            "expected ToBlockRequired, got {err}"
         );
     }
 
     #[test]
-    fn http_execution_rpc_without_allow_errors() {
+    fn invalid_range_errors() {
         let toml = format!(
-            r#"[node]
-consensus_rpc = ["https://www.lightclientdata.org"]
-execution_rpc = "http://localhost:8545"
-[[contracts]]
-{}"#,
-            minimal_contract_toml()
+            "[node]\n{}\n[[contracts]]\naddress = \"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48\"\nevents = [\"Transfer\"]\nfrom_block = 100\nto_block = 50\nabi_override = \"./abi.json\"\n",
+            minimal_node_toml()
         );
         let cfg: Config = toml::from_str(&toml).unwrap();
         let err = cfg.validate().unwrap_err();
         assert!(
-            matches!(err, ConfigError::InsecureRpcUrl { .. }),
-            "expected InsecureRpcUrl, got {err}"
+            matches!(err, ConfigError::InvalidRange { .. }),
+            "expected InvalidRange, got {err}"
         );
     }
 
     #[test]
-    fn allow_http_permits_http_urls() {
+    fn happy_path_valid_config() {
         let toml = format!(
-            r#"[node]
-consensus_rpc = ["http://localhost:5052"]
-execution_rpc = "http://localhost:8545"
-allow_http_consensus_rpc = true
-[[contracts]]
-{}"#,
+            "[node]\n{}\n[[contracts]]\n{}\n",
+            minimal_node_toml(),
             minimal_contract_toml()
         );
         let cfg: Config = toml::from_str(&toml).unwrap();
         cfg.validate().unwrap();
-    }
-
-    #[test]
-    fn https_consensus_and_execution_rpc_passes() {
-        let toml = format!(
-            r#"[node]
-consensus_rpc = ["https://www.lightclientdata.org"]
-execution_rpc = "https://eth-mainnet.example.com"
-[[contracts]]
-{}"#,
-            minimal_contract_toml()
-        );
-        let cfg: Config = toml::from_str(&toml).unwrap();
-        cfg.validate().unwrap();
-    }
-
-    #[test]
-    fn source_is_optional_for_existing_configs() {
-        let toml = format!("[node]\n[[contracts]]\n{}", minimal_contract_toml());
-        let cfg: Config = toml::from_str(&toml).unwrap();
-        assert!(cfg.source.is_none());
-        cfg.validate().unwrap();
-    }
-
-    #[test]
-    fn source_config_deserializes() {
-        let toml = format!(
-            r#"[node]
-
-[source]
-kind = "era1"
-path = "fixtures/era1/mainnet"
-network = "mainnet"
-
-[[contracts]]
-{}"#,
-            minimal_contract_toml()
-        );
-        let cfg: Config = toml::from_str(&toml).unwrap();
-        let source = cfg.source.unwrap();
-        assert_eq!(source.kind, SourceKind::Era1);
-        assert_eq!(source.path, PathBuf::from("fixtures/era1/mainnet"));
-        assert_eq!(source.network.as_deref(), Some("mainnet"));
     }
 }

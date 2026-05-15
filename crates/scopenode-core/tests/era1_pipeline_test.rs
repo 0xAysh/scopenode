@@ -7,7 +7,7 @@ use alloy_trie::{HashBuilder, Nibbles};
 use alloy::eips::eip2718::Encodable2718;
 use scopenode_core::{
     abi::AbiCache,
-    config::{Config, ContractConfig, NodeConfig, SourceConfig, SourceKind},
+    config::{Config, ContractConfig, NodeConfig},
     era_pipeline::run_era1_scope,
     source::{ChecksumStatus, RangeCompleteness, SourceFileManifest, SourceRangeManifest},
 };
@@ -179,21 +179,10 @@ fn test_config(contract_address: Address) -> Config {
     Config {
         node: NodeConfig {
             port: 18545,
+            rest_port: 8546,
             data_dir: None,
-            consensus_rpc: vec![],
-            reorg_buffer: 64,
-            execution_rpc: None,
-            beacon_unverified_ack: false,
-            beacon_fallback_unverified: false,
-            allow_http_consensus_rpc: false,
-            consensus_checkpoint: None,
-            beacon_sync_timeout_secs: 300,
+            era_dir: PathBuf::from("/tmp/era1"),
         },
-        source: Some(SourceConfig {
-            kind: SourceKind::Era1,
-            path: PathBuf::from("fixtures/era1/mainnet"),
-            network: Some("mainnet".into()),
-        }),
         contracts: vec![ContractConfig {
             name: Some("USDT".into()),
             address: contract_address,
@@ -201,7 +190,6 @@ fn test_config(contract_address: Address) -> Config {
             from_block: 100,
             to_block: Some(100),
             abi_override: None,
-            impl_address: None,
         }],
     }
 }

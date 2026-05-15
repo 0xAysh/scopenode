@@ -109,9 +109,6 @@ fn rlp_encode_index(index: usize) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::VerifyError;
-    use alloy_primitives::B256;
-    use alloy_trie::EMPTY_ROOT_HASH;
 
     #[test]
     fn verify_era1_empty_block_passes() {
