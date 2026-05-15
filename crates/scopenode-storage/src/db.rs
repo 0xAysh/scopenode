@@ -12,12 +12,8 @@
 //! duplicating data.
 
 use crate::error::DbError;
-use crate::models::{
-    ContractRow, NewSourceFile, SourceFileRow, SourceRangeRow, SourceRow, StoredEvent, StoredHeader,
-};
-use alloy_primitives::{Bloom, B256};
+use crate::models::{ContractRow, StoredEvent};
 use sqlx::SqlitePool;
-use std::collections::HashSet;
 use std::path::PathBuf;
 use tracing::info;
 
@@ -34,11 +30,6 @@ pub struct Db {
 
 impl Db {
     /// Open (or create) the SQLite database at `path` and run migrations.
-    ///
-    /// Enables WAL journal mode for concurrent read safety — this allows the
-    /// JSON-RPC server to read events while the pipeline is writing new ones.
-    /// Runs embedded migrations from `src/migrations/` automatically; the DB
-    /// schema is always up to date after `open` returns.
     pub async fn open(path: PathBuf) -> Result<Self, DbError> {
         use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
         use std::str::FromStr;
@@ -46,15 +37,12 @@ impl Db {
         let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))
             .map_err(|e| DbError::Open(e.to_string()))?
             .create_if_missing(true)
-            // WAL mode: writers don't block readers and readers don't block writers.
             .journal_mode(SqliteJournalMode::Wal);
 
         let pool = SqlitePool::connect_with(options)
             .await
             .map_err(|e| DbError::Open(e.to_string()))?;
 
-        // Run embedded migrations from src/migrations/ — these are baked into
-        // the binary at compile time by the sqlx::migrate! macro.
         sqlx::migrate!("src/migrations")
             .run(&pool)
             .await
@@ -65,279 +53,12 @@ impl Db {
         Ok(Self { pool, path })
     }
 
-    // ─── Headers ─────────────────────────────────────────────────────────────
-
-    /// Insert a block header. Uses `INSERT OR IGNORE` so re-running is safe
-    /// if the header already exists (idempotent).
-    pub async fn insert_header(&self, h: &StoredHeader) -> Result<(), DbError> {
-        sqlx::query(
-            r#"INSERT OR IGNORE INTO headers
-               (number, hash, parent_hash, timestamp, receipts_root, logs_bloom, gas_used, base_fee)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)"#,
-        )
-        .bind(h.number)
-        .bind(&h.hash)
-        .bind(&h.parent_hash)
-        .bind(h.timestamp)
-        .bind(&h.receipts_root)
-        .bind(&h.logs_bloom)
-        .bind(h.gas_used)
-        .bind(h.base_fee)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| DbError::Query(e.to_string()))?;
-        Ok(())
-    }
-
-    /// Fetch a single header by block number.
-    ///
-    /// Returns `None` if the header has not yet been synced. Used by the
-    /// receipt verification stage to look up the expected `receipts_root`.
-    pub async fn get_header(&self, block_num: u64) -> Result<Option<StoredHeader>, DbError> {
-        let n = block_num as i64;
-        sqlx::query_as::<_, StoredHeader>(
-            r#"SELECT number, hash, parent_hash, timestamp, receipts_root, logs_bloom, gas_used, base_fee
-               FROM headers WHERE number = ?"#,
-        )
-        .bind(n)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| DbError::Query(e.to_string()))
-    }
-
-    /// Fetch all headers in `[from, to]` in ascending order.
-    ///
-    /// Returns [`HeaderRow`] which has `logs_bloom` already parsed from the hex
-    /// string into an `alloy_primitives::Bloom` — the bloom scanner can use it
-    /// directly without re-parsing.
-    pub async fn get_headers(&self, from: u64, to: u64) -> Result<Vec<HeaderRow>, DbError> {
-        let from_i = from as i64;
-        let to_i = to as i64;
-
-        #[derive(sqlx::FromRow)]
-        struct RawRow {
-            number: i64,
-            hash: String,
-            parent_hash: String,
-            timestamp: i64,
-            receipts_root: String,
-            logs_bloom: String,
-            gas_used: i64,
-            base_fee: Option<i64>,
-        }
-
-        let rows = sqlx::query_as::<_, RawRow>(
-            r#"SELECT number, hash, parent_hash, timestamp, receipts_root, logs_bloom, gas_used, base_fee
-               FROM headers WHERE number >= ? AND number <= ? ORDER BY number ASC"#,
-        )
-        .bind(from_i)
-        .bind(to_i)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| DbError::Query(e.to_string()))?;
-
-        Ok(rows
-            .into_iter()
-            .map(|r| HeaderRow {
-                number: r.number,
-                hash: r.hash,
-                parent_hash: r.parent_hash,
-                timestamp: r.timestamp,
-                receipts_root: r.receipts_root,
-                logs_bloom: bloom_from_hex(&r.logs_bloom),
-                gas_used: r.gas_used,
-                base_fee: r.base_fee,
-            })
-            .collect())
-    }
-
-    /// Return the highest block number stored in the headers table.
-    ///
-    /// Used by `eth_blockNumber` in the JSON-RPC server to report how far the
-    /// node has synced. Returns `None` if no headers have been stored yet.
-    pub async fn latest_block_number(&self) -> Result<Option<u64>, DbError> {
-        #[derive(sqlx::FromRow)]
-        struct Row {
-            max_num: Option<i64>,
-        }
-        let row = sqlx::query_as::<_, Row>("SELECT MAX(number) as max_num FROM headers")
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| DbError::Query(e.to_string()))?;
-        Ok(row.max_num.map(|n| n as u64))
-    }
-
-    // ─── Bloom candidates ─────────────────────────────────────────────────────
-
-    /// Record that a block passed the bloom filter check for a contract.
-    ///
-    /// `fetched` and `pending_retry` default to `0` (false). Uses `INSERT OR IGNORE`
-    /// so re-running the bloom scan doesn't reset the `fetched` flag on blocks that
-    /// have already been successfully processed.
-    pub async fn insert_bloom_candidate(
-        &self,
-        block_num: u64,
-        block_hash: B256,
-        contract: &str,
-    ) -> Result<(), DbError> {
-        let n = block_num as i64;
-        let hash = block_hash.to_string();
-        sqlx::query(
-            r#"INSERT OR IGNORE INTO bloom_candidates (block_number, block_hash, contract)
-               VALUES (?, ?, ?)"#,
-        )
-        .bind(n)
-        .bind(&hash)
-        .bind(contract)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| DbError::Query(e.to_string()))?;
-        Ok(())
-    }
-
-    /// Check if receipts for this block + contract have already been fetched and verified.
-    ///
-    /// Used to skip already-processed blocks when resuming after an interruption.
-    /// Returns `false` if the block is not in `bloom_candidates` at all.
-    pub async fn is_fetched(&self, block_num: u64, contract: &str) -> Result<bool, DbError> {
-        let n = block_num as i64;
-
-        #[derive(sqlx::FromRow)]
-        struct Row {
-            fetched: i64,
-        }
-
-        let row = sqlx::query_as::<_, Row>(
-            r#"SELECT fetched FROM bloom_candidates WHERE block_number = ? AND contract = ?"#,
-        )
-        .bind(n)
-        .bind(contract)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| DbError::Query(e.to_string()))?;
-        Ok(row.map(|r| r.fetched != 0).unwrap_or(false))
-    }
-
-    /// Return the set of block numbers already fetched for a contract.
-    ///
-    /// Used by `fetch_and_store` to filter candidates in one query instead of
-    /// N individual `is_fetched` calls. Returns block numbers where `fetched = 1`.
-    pub async fn get_fetched_set(&self, contract: &str) -> Result<HashSet<u64>, DbError> {
-        #[derive(sqlx::FromRow)]
-        struct Row {
-            block_number: i64,
-        }
-
-        let rows = sqlx::query_as::<_, Row>(
-            r#"SELECT block_number FROM bloom_candidates WHERE contract = ? AND fetched = 1"#,
-        )
-        .bind(contract)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| DbError::Query(e.to_string()))?;
-
-        Ok(rows.into_iter().map(|r| r.block_number as u64).collect())
-    }
-
-    /// Mark a bloom candidate as successfully fetched.
-    ///
-    /// Sets `fetched = 1, pending_retry = 0`. Called after Merkle verification
-    /// succeeds and events are inserted.
-    pub async fn mark_fetched(&self, block_num: u64, contract: &str) -> Result<(), DbError> {
-        let n = block_num as i64;
-        sqlx::query(
-            r#"UPDATE bloom_candidates SET fetched = 1 WHERE block_number = ? AND contract = ?"#,
-        )
-        .bind(n)
-        .bind(contract)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| DbError::Query(e.to_string()))?;
-        Ok(())
-    }
-
-    /// Check if a bloom candidate is marked for retry (`pending_retry = 1`).
-    ///
-    /// Returns `false` if the row doesn't exist. Used in tests to assert that a
-    /// failed-receipt block was properly flagged for retry.
-    pub async fn is_pending_retry(&self, block_num: u64, contract: &str) -> Result<bool, DbError> {
-        let n = block_num as i64;
-
-        #[derive(sqlx::FromRow)]
-        struct Row {
-            pending_retry: i64,
-        }
-
-        let row = sqlx::query_as::<_, Row>(
-            r#"SELECT pending_retry FROM bloom_candidates WHERE block_number = ? AND contract = ?"#,
-        )
-        .bind(n)
-        .bind(contract)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| DbError::Query(e.to_string()))?;
-        Ok(row.map(|r| r.pending_retry != 0).unwrap_or(false))
-    }
-
-    /// Mark a bloom candidate as failed — will be retried by `scopenode retry` (Phase 3a).
-    ///
-    /// Sets `pending_retry = 1`. Called when receipt fetch fails or Merkle verification
-    /// fails (indicating the peer sent tampered data). The block is not marked as
-    /// fetched so it remains in the unfetched queue.
-    pub async fn mark_retry(&self, block_num: u64, contract: &str) -> Result<(), DbError> {
-        let n = block_num as i64;
-        sqlx::query(
-            r#"UPDATE bloom_candidates SET pending_retry = 1 WHERE block_number = ? AND contract = ?"#,
-        )
-        .bind(n)
-        .bind(contract)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| DbError::Query(e.to_string()))?;
-        Ok(())
-    }
-
-    /// Return bloom candidates that haven't been fetched yet for a contract.
-    ///
-    /// Ordered by block number (ascending) for sequential processing.
-    /// Used by the retry mechanism (Phase 3a) and for resuming interrupted receipt fetches.
-    pub async fn get_unfetched_candidates(
-        &self,
-        contract: &str,
-    ) -> Result<Vec<(u64, B256)>, DbError> {
-        #[derive(sqlx::FromRow)]
-        struct Row {
-            block_number: i64,
-            block_hash: String,
-        }
-
-        let rows = sqlx::query_as::<_, Row>(
-            r#"SELECT block_number, block_hash FROM bloom_candidates
-               WHERE contract = ? AND fetched = 0 ORDER BY block_number ASC"#,
-        )
-        .bind(contract)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| DbError::Query(e.to_string()))?;
-
-        Ok(rows
-            .into_iter()
-            .filter_map(|r| {
-                let hash: B256 = r.block_hash.parse().ok()?;
-                Some((r.block_number as u64, hash))
-            })
-            .collect())
-    }
-
     // ─── Events ────────────────────────────────────────────────────────────────
 
-    /// Bulk insert decoded events into SQLite inside a single transaction.
+    /// Bulk insert decoded events inside a single transaction.
     ///
-    /// Wrapping N inserts in one transaction is dramatically faster than N
-    /// individual transactions (SQLite flushes to disk per-commit by default).
-    /// Uses `INSERT OR IGNORE` on `(block_number, tx_index, log_index)` so
-    /// re-running the pipeline for an already-processed block never creates duplicates.
-    /// The transaction is all-or-nothing: if any insert fails, none are committed.
+    /// Uses `INSERT OR IGNORE` on `(block_number, tx_index, log_index)` for
+    /// idempotent re-sync.
     pub async fn insert_events(&self, events: &[StoredEvent]) -> Result<(), DbError> {
         if events.is_empty() {
             return Ok(());
@@ -378,42 +99,22 @@ impl Db {
         Ok(())
     }
 
-    /// Query events from SQLite for the `scopenode query` command.
+    /// Return the highest block number stored in the events table.
     ///
-    /// Optional filters for `contract`, `event` name, and block range.
-    /// `from_block`/`to_block` default to 0/u64::MAX when `None`.
-    /// The SQL is fully parameterized — no injection possible.
-    pub async fn query_events(
-        &self,
-        contract: Option<&str>,
-        event: Option<&str>,
-        from_block: Option<u64>,
-        to_block: Option<u64>,
-        limit: usize,
-    ) -> Result<Vec<StoredEvent>, DbError> {
-        let limit_i = limit as i64;
-        let from_i = from_block.unwrap_or(0) as i64;
-        let to_i = to_block.map(|b| b as i64).unwrap_or(i64::MAX);
-
-        let (sql, bindings) = build_query_events_sql(contract, event, limit_i);
-        let mut q = sqlx::query_as::<_, StoredEvent>(&sql);
-        if let Some(c) = bindings.contract {
-            q = q.bind(c.to_string());
+    /// Returns `None` if no events have been indexed yet.
+    pub async fn latest_block_number(&self) -> Result<Option<u64>, DbError> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            max_num: Option<i64>,
         }
-        if let Some(e) = bindings.event {
-            q = q.bind(e.to_string());
-        }
-        q = q.bind(from_i).bind(to_i).bind(limit_i);
-        q.fetch_all(&self.pool)
+        let row = sqlx::query_as::<_, Row>("SELECT MAX(block_number) as max_num FROM events")
+            .fetch_one(&self.pool)
             .await
-            .map_err(|e| DbError::Query(e.to_string()))
+            .map_err(|e| DbError::Query(e.to_string()))?;
+        Ok(row.max_num.map(|n| n as u64))
     }
 
     /// Check if a contract address has been indexed.
-    ///
-    /// Returns `true` if the contract exists in the `contracts` table (meaning it
-    /// has been successfully synced at least once). Used by the JSON-RPC server to
-    /// decide whether to answer or reject an `eth_getLogs` request.
     pub async fn is_contract_indexed(&self, address: &str) -> Result<bool, DbError> {
         #[derive(sqlx::FromRow)]
         struct Row {
@@ -430,15 +131,13 @@ impl Db {
     }
 
     /// Count events for a specific contract + event name combination.
-    ///
-    /// Only counts non-reorged events (`reorged = 0`). Used internally.
     pub async fn count_events(&self, contract: &str, event_name: &str) -> Result<i64, DbError> {
         #[derive(sqlx::FromRow)]
         struct Row {
             count: i64,
         }
         let row = sqlx::query_as::<_, Row>(
-            r#"SELECT COUNT(*) as count FROM events WHERE contract = ? AND event_name = ? AND reorged = 0"#,
+            r#"SELECT COUNT(*) as count FROM events WHERE contract = ? AND event_name = ?"#,
         )
         .bind(contract)
         .bind(event_name)
@@ -448,17 +147,14 @@ impl Db {
         Ok(row.count)
     }
 
-    /// Count total non-reorged events for a contract (across all event types).
-    ///
-    /// Used in `scopenode status` output. `reorged = 0` excludes any events that
-    /// were part of a chain reorganization (Phase 3a).
+    /// Count total events for a contract (across all event types).
     pub async fn count_events_for_contract(&self, contract: &str) -> Result<i64, DbError> {
         #[derive(sqlx::FromRow)]
         struct Row {
             count: i64,
         }
         let row = sqlx::query_as::<_, Row>(
-            r#"SELECT COUNT(*) as count FROM events WHERE contract = ? AND reorged = 0"#,
+            r#"SELECT COUNT(*) as count FROM events WHERE contract = ?"#,
         )
         .bind(contract)
         .fetch_one(&self.pool)
@@ -467,88 +163,9 @@ impl Db {
         Ok(row.count)
     }
 
-    // ─── Sync cursor ──────────────────────────────────────────────────────────
-
-    /// Read the sync cursor for a contract.
-    ///
-    /// Returns `None` if no cursor exists yet (first run). The cursor is used by
-    /// the pipeline to determine where each stage should resume from.
-    pub async fn get_sync_cursor(
-        &self,
-        contract: &str,
-    ) -> Result<Option<crate::types::SyncCursor>, DbError> {
-        #[derive(sqlx::FromRow)]
-        struct Row {
-            contract: String,
-            from_block: i64,
-            to_block: Option<i64>,
-            headers_done_to: Option<i64>,
-            bloom_done_to: Option<i64>,
-            receipts_done_to: Option<i64>,
-        }
-
-        let row = sqlx::query_as::<_, Row>(
-            r#"SELECT contract, from_block, to_block, headers_done_to, bloom_done_to, receipts_done_to
-               FROM sync_cursor WHERE contract = ?"#,
-        )
-        .bind(contract)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| DbError::Query(e.to_string()))?;
-
-        Ok(row.map(|r| crate::types::SyncCursor {
-            contract: r.contract,
-            from_block: r.from_block as u64,
-            to_block: r.to_block.map(|n| n as u64),
-            headers_done_to: r.headers_done_to.map(|n| n as u64),
-            bloom_done_to: r.bloom_done_to.map(|n| n as u64),
-            receipts_done_to: r.receipts_done_to.map(|n| n as u64),
-        }))
-    }
-
-    /// Insert or update the sync cursor for a contract.
-    ///
-    /// On conflict, uses `CASE WHEN ... IS NOT NULL` to only advance each stage's
-    /// progress — we never go backwards. Passing `None` for a stage field means
-    /// "don't update that stage's cursor".
-    pub async fn upsert_sync_cursor(
-        &self,
-        cursor: &crate::types::SyncCursor,
-    ) -> Result<(), DbError> {
-        let from = cursor.from_block as i64;
-        let to = cursor.to_block.map(|n| n as i64);
-        let headers = cursor.headers_done_to.map(|n| n as i64);
-        let bloom = cursor.bloom_done_to.map(|n| n as i64);
-        let receipts = cursor.receipts_done_to.map(|n| n as i64);
-        sqlx::query(
-            r#"INSERT INTO sync_cursor (contract, from_block, to_block, headers_done_to, bloom_done_to, receipts_done_to)
-               VALUES (?, ?, ?, ?, ?, ?)
-               ON CONFLICT(contract) DO UPDATE SET
-                 from_block = excluded.from_block,
-                 to_block = excluded.to_block,
-                 headers_done_to = CASE WHEN excluded.headers_done_to IS NOT NULL THEN excluded.headers_done_to ELSE headers_done_to END,
-                 bloom_done_to = CASE WHEN excluded.bloom_done_to IS NOT NULL THEN excluded.bloom_done_to ELSE bloom_done_to END,
-                 receipts_done_to = CASE WHEN excluded.receipts_done_to IS NOT NULL THEN excluded.receipts_done_to ELSE receipts_done_to END"#,
-        )
-        .bind(&cursor.contract)
-        .bind(from)
-        .bind(to)
-        .bind(headers)
-        .bind(bloom)
-        .bind(receipts)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| DbError::Query(e.to_string()))?;
-        Ok(())
-    }
-
     // ─── Contracts ────────────────────────────────────────────────────────────
 
     /// Insert or update a contract record.
-    ///
-    /// On conflict, updates the ABI but preserves any existing `name` if the new
-    /// `name` is `NULL` (using `COALESCE`). This means a config change that removes
-    /// the contract name won't erase a previously set name.
     pub async fn upsert_contract(
         &self,
         address: &str,
@@ -572,9 +189,6 @@ impl Db {
     }
 
     /// Retrieve the cached ABI JSON for a contract.
-    ///
-    /// Returns `None` if the contract is not in the `contracts` table yet (first run).
-    /// The ABI is stored as a JSON array of event definitions after the first Sourcify fetch.
     pub async fn get_contract_abi(&self, address: &str) -> Result<Option<String>, DbError> {
         #[derive(sqlx::FromRow)]
         struct Row {
@@ -588,11 +202,7 @@ impl Db {
         Ok(row.and_then(|r| r.abi_json))
     }
 
-    // ─── Status ────────────────────────────────────────────────────────────────
-
     /// Return all indexed contracts ordered by address.
-    ///
-    /// Used by `scopenode status` to display a table of indexed contracts.
     pub async fn get_all_contracts(&self) -> Result<Vec<ContractRow>, DbError> {
         sqlx::query_as::<_, ContractRow>(
             r#"SELECT address, name, abi_json FROM contracts ORDER BY address ASC"#,
@@ -602,10 +212,7 @@ impl Db {
         .map_err(|e| DbError::Query(e.to_string()))
     }
 
-    /// Return all indexed contracts with their non-reorged event count in one query.
-    ///
-    /// Equivalent to `get_all_contracts()` + `count_events_for_contract()` per row,
-    /// but resolved with a single LEFT JOIN rather than N+1 queries.
+    /// Return all indexed contracts with their event count in one query.
     pub async fn contracts_with_event_counts(&self) -> Result<Vec<(ContractRow, i64)>, DbError> {
         #[derive(sqlx::FromRow)]
         struct Row {
@@ -618,7 +225,7 @@ impl Db {
             r#"SELECT c.address, c.name, c.abi_json,
                       COUNT(e.rowid) as event_count
                FROM contracts c
-               LEFT JOIN events e ON e.contract = c.address AND e.reorged = 0
+               LEFT JOIN events e ON e.contract = c.address
                GROUP BY c.address
                ORDER BY c.address ASC"#,
         )
@@ -642,9 +249,6 @@ impl Db {
     }
 
     /// Count the number of indexed contracts.
-    ///
-    /// Lighter than `get_all_contracts()` when only the count is needed
-    /// (avoids fetching `abi_json` blobs).
     pub async fn count_contracts(&self) -> Result<i64, DbError> {
         #[derive(sqlx::FromRow)]
         struct Row {
@@ -657,304 +261,11 @@ impl Db {
         Ok(row.count)
     }
 
-    /// Count bloom candidates marked for retry (`pending_retry = 1`).
-    ///
-    /// Shown in `scopenode status` output. A non-zero count indicates blocks where
-    /// receipt fetch or Merkle verification failed — run `scopenode retry` to
-    /// re-attempt them (Phase 3a).
-    pub async fn count_pending_retry(&self) -> Result<i64, DbError> {
-        #[derive(sqlx::FromRow)]
-        struct Row {
-            count: i64,
-        }
-        let row = sqlx::query_as::<_, Row>(
-            r#"SELECT COUNT(*) as count FROM bloom_candidates WHERE pending_retry = 1"#,
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| DbError::Query(e.to_string()))?;
-        Ok(row.count)
-    }
-
-    /// Count all bloom candidates for a contract (fetched + pending + unfetched).
-    ///
-    /// Used by `--dry-run` to report the total known candidate count when
-    /// resuming a sync where the bloom scan was already completed.
-    pub async fn count_bloom_candidates(&self, contract: &str) -> Result<i64, DbError> {
-        #[derive(sqlx::FromRow)]
-        struct Row {
-            count: i64,
-        }
-        let row = sqlx::query_as::<_, Row>(
-            r#"SELECT COUNT(*) as count FROM bloom_candidates WHERE contract = ?"#,
-        )
-        .bind(contract)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| DbError::Query(e.to_string()))?;
-        Ok(row.count)
-    }
-
-    // ─── Source Manifest ─────────────────────────────────────────────────────
-
-    /// Insert or update a local historical source and return its row id.
-    pub async fn upsert_source(
-        &self,
-        kind: &str,
-        network: Option<&str>,
-        path: &str,
-    ) -> Result<i64, DbError> {
-        #[derive(sqlx::FromRow)]
-        struct Row {
-            id: i64,
-        }
-
-        let row = sqlx::query_as::<_, Row>(
-            r#"INSERT INTO sources (kind, network, path, last_scanned_at)
-               VALUES (?, ?, ?, unixepoch())
-               ON CONFLICT(kind, path) DO UPDATE SET
-                 network = excluded.network,
-                 last_scanned_at = unixepoch()
-               RETURNING id"#,
-        )
-        .bind(kind)
-        .bind(network)
-        .bind(path)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| DbError::Query(e.to_string()))?;
-
-        Ok(row.id)
-    }
-
-    /// Insert or update one source file manifest row and return its row id.
-    pub async fn upsert_source_file(
-        &self,
-        source_id: i64,
-        file: &NewSourceFile,
-    ) -> Result<i64, DbError> {
-        #[derive(sqlx::FromRow)]
-        struct Row {
-            id: i64,
-        }
-
-        let row = sqlx::query_as::<_, Row>(
-            r#"INSERT INTO source_files
-               (source_id, format, path, filename, network, epoch, file_hash,
-                size_bytes, modified_at, sha256, checksum_status, expected_sha256,
-                last_seen_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
-               ON CONFLICT(source_id, path) DO UPDATE SET
-                 format = excluded.format,
-                 filename = excluded.filename,
-                 network = excluded.network,
-                 epoch = excluded.epoch,
-                 file_hash = excluded.file_hash,
-                 size_bytes = excluded.size_bytes,
-                 modified_at = excluded.modified_at,
-                 sha256 = excluded.sha256,
-                 checksum_status = excluded.checksum_status,
-                 expected_sha256 = excluded.expected_sha256,
-                 last_seen_at = unixepoch()
-               RETURNING id"#,
-        )
-        .bind(source_id)
-        .bind(&file.format)
-        .bind(&file.path)
-        .bind(&file.filename)
-        .bind(&file.network)
-        .bind(file.epoch)
-        .bind(&file.file_hash)
-        .bind(file.size_bytes)
-        .bind(file.modified_at)
-        .bind(&file.sha256)
-        .bind(&file.checksum_status)
-        .bind(&file.expected_sha256)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| DbError::Query(e.to_string()))?;
-
-        Ok(row.id)
-    }
-
-    /// Replace all inferred ranges for a source file.
-    pub async fn replace_source_file_ranges(
-        &self,
-        source_file_id: i64,
-        ranges: &[(u64, u64, &str)],
-    ) -> Result<(), DbError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| DbError::Query(e.to_string()))?;
-
-        sqlx::query("DELETE FROM source_ranges WHERE source_file_id = ?")
-            .bind(source_file_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| DbError::Query(e.to_string()))?;
-
-        for (from_block, to_block, completeness) in ranges {
-            sqlx::query(
-                r#"INSERT INTO source_ranges
-                   (source_file_id, from_block, to_block, completeness)
-                   VALUES (?, ?, ?, ?)"#,
-            )
-            .bind(source_file_id)
-            .bind(*from_block as i64)
-            .bind(*to_block as i64)
-            .bind(*completeness)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| DbError::Query(e.to_string()))?;
-        }
-
-        tx.commit()
-            .await
-            .map_err(|e| DbError::Query(e.to_string()))?;
-        Ok(())
-    }
-
-    /// List source rows for diagnostics and tests.
-    pub async fn list_sources(&self) -> Result<Vec<SourceRow>, DbError> {
-        sqlx::query_as::<_, SourceRow>(
-            r#"SELECT id, kind, network, path, first_seen_at, last_scanned_at
-               FROM sources ORDER BY id ASC"#,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| DbError::Query(e.to_string()))
-    }
-
-    /// List files attached to one source.
-    pub async fn list_source_files(&self, source_id: i64) -> Result<Vec<SourceFileRow>, DbError> {
-        sqlx::query_as::<_, SourceFileRow>(
-            r#"SELECT id, source_id, format, path, filename, network, epoch, file_hash,
-                      size_bytes, modified_at, sha256, checksum_status, expected_sha256,
-                      last_seen_at
-               FROM source_files WHERE source_id = ? ORDER BY path ASC"#,
-        )
-        .bind(source_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| DbError::Query(e.to_string()))
-    }
-
-    /// List inferred ranges attached to one source file.
-    pub async fn list_source_ranges(
-        &self,
-        source_file_id: i64,
-    ) -> Result<Vec<SourceRangeRow>, DbError> {
-        sqlx::query_as::<_, SourceRangeRow>(
-            r#"SELECT id, source_file_id, from_block, to_block, completeness
-               FROM source_ranges WHERE source_file_id = ? ORDER BY from_block ASC"#,
-        )
-        .bind(source_file_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| DbError::Query(e.to_string()))
-    }
-
-    /// Return the on-disk size of the database in bytes.
-    ///
-    /// Uses SQLite `PRAGMA page_count` and `PRAGMA page_size` to compute the
-    /// total file size without reading the file from disk. Shown in `scopenode status`.
-    pub async fn db_size_bytes(&self) -> Result<u64, DbError> {
-        #[derive(sqlx::FromRow)]
-        struct Row {
-            size: i64,
-        }
-        let row = sqlx::query_as::<_, Row>(
-            r#"SELECT page_count * page_size as size FROM pragma_page_count(), pragma_page_size()"#,
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| DbError::Query(e.to_string()))?;
-        Ok(row.size as u64)
-    }
-
-    /// Mark all events from the given block hashes as reorged (`reorged = 1`).
-    ///
-    /// Called by the live-sync pipeline when [`ReorgDetector`] returns a
-    /// [`ReorgEvent`]. Events are soft-deleted — never hard-deleted — so they
-    /// can be inspected post-hoc and are excluded from all normal queries via
-    /// the `WHERE reorged = 0` filter.
-    ///
-    /// Returns the total number of event rows that were updated.
-    ///
-    /// [`ReorgDetector`]: scopenode_core::reorg::ReorgDetector
-    /// [`ReorgEvent`]: scopenode_core::reorg::ReorgEvent
-    pub async fn mark_reorged_by_hash(&self, block_hashes: &[B256]) -> Result<u64, DbError> {
-        if block_hashes.is_empty() {
-            return Ok(0);
-        }
-        let placeholders = block_hashes
-            .iter()
-            .map(|_| "?")
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "UPDATE events SET reorged = 1 WHERE block_hash IN ({placeholders}) AND reorged = 0"
-        );
-        let mut q = sqlx::query(&sql);
-        for hash in block_hashes {
-            q = q.bind(hash.to_string());
-        }
-        let result = q
-            .execute(&self.pool)
-            .await
-            .map_err(|e| DbError::Query(e.to_string()))?;
-        Ok(result.rows_affected())
-    }
-
-    /// Return all `(block_number, block_hash, receipts_root, contract)` tuples that
-    /// have `pending_retry = 1` in `bloom_candidates`, joined with `headers` to get
-    /// the `receipts_root` needed for Merkle verification.
-    pub async fn get_pending_retry_candidates(
-        &self,
-    ) -> Result<Vec<(u64, alloy_primitives::B256, alloy_primitives::B256, String)>, DbError> {
-        #[derive(sqlx::FromRow)]
-        struct Row {
-            block_number: i64,
-            block_hash: String,
-            receipts_root: String,
-            contract: String,
-        }
-        let rows = sqlx::query_as::<_, Row>(
-            r#"SELECT bc.block_number, bc.block_hash, h.receipts_root, bc.contract
-               FROM bloom_candidates bc
-               JOIN headers h ON h.number = bc.block_number
-               WHERE bc.pending_retry = 1"#,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| DbError::Query(e.to_string()))?;
-
-        rows.into_iter()
-            .map(|r| {
-                let block_hash: alloy_primitives::B256 = r
-                    .block_hash
-                    .parse()
-                    .map_err(|_| DbError::Query(format!("invalid block_hash: {}", r.block_hash)))?;
-                let receipts_root: alloy_primitives::B256 =
-                    r.receipts_root.parse().map_err(|_| {
-                        DbError::Query(format!("invalid receipts_root: {}", r.receipts_root))
-                    })?;
-                Ok((r.block_number as u64, block_hash, receipts_root, r.contract))
-            })
-            .collect()
-    }
+    // ─── Queries ──────────────────────────────────────────────────────────────
 
     /// Query events with optional filters.
     ///
-    /// All filters are combined with AND. Only non-reorged events are returned.
     /// `limit` caps the result set; `offset` supports pagination.
-    ///
-    /// - `contract` — EIP-55 checksummed address
-    /// - `event_name` — human-readable event name (e.g. `"Swap"`)
-    /// - `topic0` — raw keccak256 event selector hash (0x-prefixed hex)
-    /// - `from_block` / `to_block` — inclusive block range (defaults to full range)
     #[allow(clippy::too_many_arguments)]
     pub async fn query_events_for_filter(
         &self,
@@ -969,8 +280,7 @@ impl Db {
         let from = from_block.unwrap_or(0) as i64;
         let to = to_block.map(|b| b as i64).unwrap_or(i64::MAX);
 
-        // Build WHERE clauses dynamically — only include filters that are Some.
-        let mut conditions = vec!["reorged = 0"];
+        let mut conditions: Vec<&str> = Vec::new();
         if contract.is_some() {
             conditions.push("contract = ?");
         }
@@ -982,12 +292,18 @@ impl Db {
         }
         conditions.extend(["block_number >= ?", "block_number <= ?"]);
 
+        let where_clause = if conditions.is_empty() {
+            "1=1".to_string()
+        } else {
+            conditions.join(" AND ")
+        };
+
         let sql = format!(
             "SELECT contract, event_name, topic0, block_number, block_hash, \
              tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source \
              FROM events WHERE {} \
              ORDER BY block_number ASC, log_index ASC LIMIT ? OFFSET ?",
-            conditions.join(" AND ")
+            where_clause
         );
 
         let mut q = sqlx::query_as::<_, StoredEvent>(&sql);
@@ -1008,18 +324,6 @@ impl Db {
     }
 
     /// Stream events with optional filters, row by row.
-    ///
-    /// Identical filter semantics to [`query_events_for_filter`] but returns a
-    /// lazy [`futures_core::Stream`] instead of a fully-buffered `Vec`. The
-    /// stream yields one [`StoredEvent`] per row without buffering the entire
-    /// result set, making it suitable for large exports.
-    ///
-    /// No `limit` or `offset` — the stream always covers the full matching set.
-    ///
-    /// - `contract` — EIP-55 checksummed address
-    /// - `event_name` — human-readable event name (e.g. `"Swap"`)
-    /// - `topic0` — raw keccak256 event selector hash (0x-prefixed hex)
-    /// - `from_block` / `to_block` — inclusive block range (defaults to full range)
     pub fn stream_events_for_filter<'a>(
         &'a self,
         contract: Option<&'a str>,
@@ -1031,8 +335,7 @@ impl Db {
         let from = from_block.unwrap_or(0) as i64;
         let to = to_block.map(|b| b as i64).unwrap_or(i64::MAX);
 
-        // Build WHERE clauses dynamically — only include filters that are Some.
-        let mut conditions = vec!["reorged = 0"];
+        let mut conditions: Vec<&str> = Vec::new();
         if contract.is_some() {
             conditions.push("contract = ?");
         }
@@ -1044,17 +347,20 @@ impl Db {
         }
         conditions.extend(["block_number >= ?", "block_number <= ?"]);
 
+        let where_clause = if conditions.is_empty() {
+            "1=1".to_string()
+        } else {
+            conditions.join(" AND ")
+        };
+
         let sql = format!(
             "SELECT contract, event_name, topic0, block_number, block_hash, \
              tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source \
              FROM events WHERE {} \
              ORDER BY block_number ASC, log_index ASC",
-            conditions.join(" AND ")
+            where_clause
         );
 
-        // Leak the SQL string to produce a `'static` reference so the stream
-        // returned by `fetch` does not borrow a local variable. Each call
-        // leaks only a few hundred bytes — acceptable for a batch API.
         let sql: &'static str = Box::leak(sql.into_boxed_str());
         let mut q = sqlx::query_as::<_, StoredEvent>(sql);
         if let Some(c) = contract {
@@ -1068,85 +374,40 @@ impl Db {
         }
         q = q.bind(from).bind(to);
 
-        // sqlx::fetch returns a BoxStream (Pin<Box<dyn Stream<Item = sqlx::Result<T>>>>) —
-        // wrap it to convert sqlx::Error -> DbError without buffering.
         sqlx_stream_to_db_stream(q.fetch(&self.pool))
     }
 
-    /// Count all non-reorged events across all contracts.
-    ///
-    /// Used by the REST `/status` endpoint.
+    /// Count all events across all contracts.
     pub async fn count_all_events(&self) -> Result<i64, DbError> {
         #[derive(sqlx::FromRow)]
         struct Row {
             count: i64,
         }
-        let row =
-            sqlx::query_as::<_, Row>("SELECT COUNT(*) as count FROM events WHERE reorged = 0")
-                .fetch_one(&self.pool)
-                .await
-                .map_err(|e| DbError::Query(e.to_string()))?;
+        let row = sqlx::query_as::<_, Row>("SELECT COUNT(*) as count FROM events")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| DbError::Query(e.to_string()))?;
         Ok(row.count)
     }
-}
 
-/// Parse a lowercase hex string from SQLite back into an alloy `Bloom` type.
-///
-/// Returns the zero bloom (all bits unset) on invalid input — this means any
-/// bloom check on a corrupt header will return false (no false matches), which
-/// is the safe fallback. Logs a warning so corrupt rows are visible.
-fn bloom_from_hex(hex_str: &str) -> Bloom {
-    match alloy_primitives::hex::decode(hex_str) {
-        Ok(bytes) if bytes.len() == 256 => {
-            let mut arr = [0u8; 256];
-            arr.copy_from_slice(&bytes);
-            Bloom::new(arr)
+    /// Return the on-disk size of the database in bytes.
+    pub async fn db_size_bytes(&self) -> Result<u64, DbError> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            size: i64,
         }
-        Ok(bytes) => {
-            tracing::warn!(
-                len = bytes.len(),
-                "logs_bloom hex has wrong byte length (expected 256), using zero bloom"
-            );
-            Bloom::default()
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "corrupt logs_bloom hex in DB, using zero bloom");
-            Bloom::default()
-        }
+        let row = sqlx::query_as::<_, Row>(
+            r#"SELECT page_count * page_size as size FROM pragma_page_count(), pragma_page_size()"#,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| DbError::Query(e.to_string()))?;
+        Ok(row.size as u64)
     }
-}
-
-/// Intermediate row type for [`Db::get_headers`] with `logs_bloom` already parsed.
-///
-/// Avoids re-parsing the 256-byte BLOB on every bloom check in the scanner.
-/// The bloom is parsed once when loading from SQLite and stored as an `alloy_primitives::Bloom`.
-#[derive(Debug, Clone)]
-pub struct HeaderRow {
-    /// Block number.
-    pub number: i64,
-    /// Block hash as a `0x`-prefixed hex string.
-    pub hash: String,
-    /// Parent block hash.
-    pub parent_hash: String,
-    /// Unix timestamp.
-    pub timestamp: i64,
-    /// `receipts_root` as a `0x`-prefixed hex string.
-    pub receipts_root: String,
-    /// Bloom filter, pre-parsed from the raw BLOB for use in the scanner.
-    pub logs_bloom: Bloom,
-    /// Total gas used.
-    pub gas_used: i64,
-    /// EIP-1559 base fee (NULL for pre-London blocks).
-    pub base_fee: Option<i64>,
 }
 
 // ─── Stream adapter ──────────────────────────────────────────────────────────
 
-/// Wraps a boxed sqlx stream to convert `sqlx::Error` items into [`DbError`].
-///
-/// `sqlx::fetch()` returns a `Pin<Box<dyn Stream<Item = sqlx::Result<T>>>>`.
-/// Since the box is already heap-allocated, the inner stream never moves, so
-/// we can project through the `Pin` safely to poll it.
 struct DbStream<'a, T> {
     inner: futures_core::stream::BoxStream<'a, Result<T, sqlx::Error>>,
 }
@@ -1171,64 +432,13 @@ fn sqlx_stream_to_db_stream<'a, T>(
     DbStream { inner: stream }
 }
 
-// ─── Dynamic query builder helpers ─────────────────────────────────────────
-
-/// Holds the optional binding values for a dynamic `query_events` SQL query.
-struct QueryBindings<'a> {
-    contract: Option<&'a str>,
-    event: Option<&'a str>,
-}
-
-/// Build the SQL string and binding values for [`Db::query_events`].
-///
-/// Returns a `(sql, bindings)` pair. The bindings must be applied in the order:
-/// contract (if Some) → event (if Some) → from_block → to_block → limit.
-fn build_query_events_sql<'a>(
-    contract: Option<&'a str>,
-    event: Option<&'a str>,
-    _limit: i64,
-) -> (String, QueryBindings<'a>) {
-    let base = r#"SELECT contract, event_name, topic0, block_number, block_hash,
-                         tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source
-                  FROM events
-                  WHERE reorged = 0"#;
-    // block_number range is always bound (caller passes 0 / i64::MAX as defaults).
-    let tail = "AND block_number >= ? AND block_number <= ? ORDER BY block_number ASC, log_index ASC LIMIT ?";
-
-    let (sql, bind_contract, bind_event) = match (contract, event) {
-        (Some(_), Some(_)) => (
-            format!("{base} AND contract = ? AND event_name = ? {tail}"),
-            true,
-            true,
-        ),
-        (Some(_), None) => (format!("{base} AND contract = ? {tail}"), true, false),
-        (None, Some(_)) => (format!("{base} AND event_name = ? {tail}"), false, true),
-        (None, None) => (format!("{base} {tail}"), false, false),
-    };
-
-    (
-        sql,
-        QueryBindings {
-            contract: if bind_contract { contract } else { None },
-            event: if bind_event { event } else { None },
-        },
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Open a temporary on-disk SQLite database for testing.
-    ///
-    /// Uses a temp file so migrations (which require WAL mode) work correctly.
-    /// The file is cleaned up when `_guard` is dropped.
     async fn open_test_db() -> (Db, tempfile::TempPath) {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let (file, path) = tmp.into_parts();
-        // Drop the file handle so Db::open can open the same path without a lock conflict
-        // on Windows; on Unix this is harmless. The TempPath returned to the caller keeps
-        // the file alive and deletes it on drop.
         drop(file);
         let db = Db::open(path.to_path_buf()).await.unwrap();
         (db, path)
@@ -1255,258 +465,155 @@ mod tests {
                 .to_string(),
             raw_data: "00".to_string(),
             decoded: "{}".to_string(),
-            source: "devp2p".to_string(),
-        }
-    }
-
-    fn make_source_file(path: &str, size_bytes: i64) -> NewSourceFile {
-        NewSourceFile {
-            format: "era1".to_string(),
-            path: path.to_string(),
-            filename: "mainnet-00000-5ec1ffb8.era1".to_string(),
-            network: "mainnet".to_string(),
-            epoch: Some(0),
-            file_hash: Some("5ec1ffb8".to_string()),
-            size_bytes,
-            modified_at: Some(1),
-            sha256: "ab".repeat(32),
-            checksum_status: "verified".to_string(),
-            expected_sha256: None,
+            source: "era1".to_string(),
         }
     }
 
     #[tokio::test]
-    async fn source_manifest_upserts_source_idempotently() {
+    async fn insert_and_count_events() {
         let (db, _guard) = open_test_db().await;
-
-        let first = db
-            .upsert_source("era1", Some("mainnet"), "/tmp/era1")
-            .await
-            .unwrap();
-        let second = db
-            .upsert_source("era1", Some("mainnet"), "/tmp/era1")
-            .await
-            .unwrap();
-
-        assert_eq!(first, second);
-        let sources = db.list_sources().await.unwrap();
-        assert_eq!(sources.len(), 1);
-        assert_eq!(sources[0].kind, "era1");
+        let contract = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
+        db.upsert_contract(contract, Some("USDC"), "[]").await.unwrap();
+        let e = make_event(contract, 100, "0x1111", "0xaaaa", 0);
+        db.insert_events(&[e]).await.unwrap();
+        let count = db.count_events_for_contract(contract).await.unwrap();
+        assert_eq!(count, 1);
     }
 
     #[tokio::test]
-    async fn source_manifest_upserts_file_idempotently() {
+    async fn idempotent_insert_deduplicates() {
         let (db, _guard) = open_test_db().await;
-        let source_id = db
-            .upsert_source("era1", Some("mainnet"), "/tmp/era1")
-            .await
-            .unwrap();
-
-        let first = db
-            .upsert_source_file(
-                source_id,
-                &make_source_file("/tmp/era1/mainnet-00000-5ec1ffb8.era1", 10),
-            )
-            .await
-            .unwrap();
-        let second = db
-            .upsert_source_file(
-                source_id,
-                &make_source_file("/tmp/era1/mainnet-00000-5ec1ffb8.era1", 20),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(first, second);
-        let files = db.list_source_files(source_id).await.unwrap();
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].size_bytes, 20);
+        let contract = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
+        db.upsert_contract(contract, None, "[]").await.unwrap();
+        let e = make_event(contract, 100, "0x1111", "0xaaaa", 0);
+        db.insert_events(&[e.clone()]).await.unwrap();
+        db.insert_events(&[e]).await.unwrap();
+        let count = db.count_events_for_contract(contract).await.unwrap();
+        assert_eq!(count, 1);
     }
 
     #[tokio::test]
-    async fn source_manifest_replaces_file_ranges() {
+    async fn latest_block_number_returns_max_from_events() {
         let (db, _guard) = open_test_db().await;
-        let source_id = db
-            .upsert_source("era1", Some("mainnet"), "/tmp/era1")
-            .await
-            .unwrap();
-        let file_id = db
-            .upsert_source_file(
-                source_id,
-                &make_source_file("/tmp/era1/mainnet-00000-5ec1ffb8.era1", 10),
-            )
-            .await
-            .unwrap();
-
-        db.replace_source_file_ranges(file_id, &[(0, 8191, "inferred")])
-            .await
-            .unwrap();
-        db.replace_source_file_ranges(file_id, &[(8192, 16_383, "inferred")])
-            .await
-            .unwrap();
-
-        let ranges = db.list_source_ranges(file_id).await.unwrap();
-        assert_eq!(ranges.len(), 1);
-        assert_eq!(ranges[0].from_block, 8192);
-        assert_eq!(ranges[0].to_block, 16_383);
-    }
-
-    #[tokio::test]
-    async fn get_logs_excludes_reorged_events() {
-        let (db, _guard) = open_test_db().await;
+        assert_eq!(db.latest_block_number().await.unwrap(), None);
 
         let contract = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
-        let canonical_hash = "0x1111111111111111111111111111111111111111111111111111111111111111";
-        let orphan_hash = "0x2222222222222222222222222222222222222222222222222222222222222222";
+        db.upsert_contract(contract, None, "[]").await.unwrap();
+        let e100 = make_event(contract, 100, "0x1111", "0xaaaa", 0);
+        let e200 = make_event(contract, 200, "0x2222", "0xbbbb", 0);
+        let e300 = make_event(contract, 300, "0x3333", "0xcccc", 0);
+        db.insert_events(&[e100, e200, e300]).await.unwrap();
 
-        // Insert one canonical event and one orphaned (reorged) event.
-        let canonical = make_event(contract, 100, canonical_hash, "0xaaaa", 0);
-        let orphaned = make_event(contract, 101, orphan_hash, "0xbbbb", 0);
+        assert_eq!(db.latest_block_number().await.unwrap(), Some(300));
+    }
 
-        db.insert_events(&[canonical, orphaned]).await.unwrap();
-
-        let hash: B256 = orphan_hash.parse().unwrap();
-        let marked = db.mark_reorged_by_hash(&[hash]).await.unwrap();
-        assert_eq!(marked, 1, "one event should be marked reorged");
+    #[tokio::test]
+    async fn query_events_for_filter_runtime_correctness() {
+        let (db, _guard) = open_test_db().await;
+        let contract = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
+        db.upsert_contract(contract, None, "[]").await.unwrap();
+        db.insert_events(&[make_event(contract, 100, "0x1111", "0xaaaa", 0)])
+            .await
+            .unwrap();
 
         let rows = db
             .query_events_for_filter(Some(contract), None, None, None, None, 100, 0)
             .await
             .unwrap();
-
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].block_hash, canonical_hash);
-    }
-
-    /// Helper: collect all items from a `Stream<Item = Result<T, E>>` into a `Vec<T>`,
-    /// propagating the first error.
-    async fn collect_stream<T, E>(
-        stream: impl futures_core::Stream<Item = Result<T, E>>,
-    ) -> Result<Vec<T>, E> {
-        use futures_util::StreamExt;
-        stream.collect::<Vec<_>>().await.into_iter().collect()
     }
 
     #[tokio::test]
     async fn stream_events_for_filter_returns_all_rows_ordered() {
         let (db, _guard) = open_test_db().await;
-
         let contract = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
-        let hash_a = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let hash_b = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-        let hash_c = "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        db.upsert_contract(contract, None, "[]").await.unwrap();
 
-        // Insert 3 events at different block numbers (out of order to verify ordering).
-        let e3 = make_event(contract, 300, hash_c, "0xcccc", 0);
-        let e1 = make_event(contract, 100, hash_a, "0xaaaa", 0);
-        let e2 = make_event(contract, 200, hash_b, "0xbbbb", 0);
+        let e3 = make_event(contract, 300, "0xcccc", "0xcccc", 0);
+        let e1 = make_event(contract, 100, "0xaaaa", "0xaaaa", 0);
+        let e2 = make_event(contract, 200, "0xbbbb", "0xbbbb", 0);
         db.insert_events(&[e3, e1, e2]).await.unwrap();
 
+        use futures_util::StreamExt;
         let stream = db.stream_events_for_filter(None, None, None, None, None);
-        let rows = collect_stream(stream).await.unwrap();
+        let rows: Vec<StoredEvent> = stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
 
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].block_number, 100, "first row should be block 100");
-        assert_eq!(rows[1].block_number, 200, "second row should be block 200");
-        assert_eq!(rows[2].block_number, 300, "third row should be block 300");
-    }
-
-    #[tokio::test]
-    async fn stream_events_for_filter_with_contract_filter() {
-        let (db, _guard) = open_test_db().await;
-
-        let contract_a = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
-        let contract_b = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2";
-        let hash_a = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let hash_b = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-
-        // One event per contract.
-        let ea = make_event(contract_a, 100, hash_a, "0xaaaa", 0);
-        let eb = make_event(contract_b, 101, hash_b, "0xbbbb", 0);
-        db.insert_events(&[ea, eb]).await.unwrap();
-
-        let stream = db.stream_events_for_filter(Some(contract_a), None, None, None, None);
-        let rows = collect_stream(stream).await.unwrap();
-
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].contract, contract_a);
-    }
-
-    #[tokio::test]
-    async fn stream_events_for_filter_empty_result() {
-        let (db, _guard) = open_test_db().await;
-
-        // No events inserted — stream should yield zero rows without panicking.
-        let stream = db.stream_events_for_filter(
-            Some("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
-            None,
-            None,
-            None,
-            None,
-        );
-        let rows = collect_stream(stream).await.unwrap();
-        assert_eq!(rows.len(), 0);
-    }
-
-    #[tokio::test]
-    async fn stream_events_for_filter_excludes_reorged() {
-        let (db, _guard) = open_test_db().await;
-
-        let contract = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
-        let canonical_hash = "0x1111111111111111111111111111111111111111111111111111111111111111";
-        let orphan_hash = "0x2222222222222222222222222222222222222222222222222222222222222222";
-
-        let canonical = make_event(contract, 100, canonical_hash, "0xaaaa", 0);
-        let orphaned = make_event(contract, 101, orphan_hash, "0xbbbb", 0);
-        db.insert_events(&[canonical, orphaned]).await.unwrap();
-
-        // Mark the second event as reorged.
-        let hash: B256 = orphan_hash.parse().unwrap();
-        db.mark_reorged_by_hash(&[hash]).await.unwrap();
-
-        let stream = db.stream_events_for_filter(None, None, None, None, None);
-        let rows = collect_stream(stream).await.unwrap();
-
-        assert_eq!(rows.len(), 1, "reorged event must be excluded");
-        assert_eq!(rows[0].block_hash, canonical_hash);
+        assert_eq!(rows[0].block_number, 100);
+        assert_eq!(rows[1].block_number, 200);
+        assert_eq!(rows[2].block_number, 300);
     }
 
     #[tokio::test]
     async fn topic0_filter_returns_matching_events() {
         let (db, _guard) = open_test_db().await;
-
         let contract = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
         let transfer_topic0 = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
-
-        let ev = make_event(contract, 100, "0x1111", "0xaaaa", 0);
-        db.insert_events(&[ev]).await.unwrap();
+        db.upsert_contract(contract, None, "[]").await.unwrap();
+        db.insert_events(&[make_event(contract, 100, "0x1111", "0xaaaa", 0)])
+            .await
+            .unwrap();
 
         let rows = db
             .query_events_for_filter(None, None, Some(transfer_topic0), None, None, 100, 0)
             .await
             .unwrap();
-
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].topic0, transfer_topic0);
     }
 
     #[tokio::test]
-    async fn topic0_filter_unknown_hash_returns_empty_not_error() {
+    async fn migration_005_drops_dead_tables() {
         let (db, _guard) = open_test_db().await;
 
-        let contract = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
-        let ev = make_event(contract, 100, "0x1111", "0xaaaa", 0);
-        db.insert_events(&[ev]).await.unwrap();
+        let err = sqlx::query("SELECT 1 FROM bloom_candidates LIMIT 1")
+            .fetch_optional(&db.pool)
+            .await;
+        assert!(err.is_err(), "bloom_candidates table should not exist");
 
-        let unknown_topic0 = "0x0000000000000000000000000000000000000000000000000000000000000000";
-        let rows = db
-            .query_events_for_filter(None, None, Some(unknown_topic0), None, None, 100, 0)
-            .await
-            .unwrap();
+        let err = sqlx::query("SELECT 1 FROM sync_cursor LIMIT 1")
+            .fetch_optional(&db.pool)
+            .await;
+        assert!(err.is_err(), "sync_cursor table should not exist");
 
+        let err = sqlx::query("SELECT 1 FROM headers LIMIT 1")
+            .fetch_optional(&db.pool)
+            .await;
+        assert!(err.is_err(), "headers table should not exist");
+    }
+
+    #[tokio::test]
+    async fn migration_005_drops_reorged_column() {
+        let (db, _guard) = open_test_db().await;
+        let err = sqlx::query("SELECT reorged FROM events LIMIT 1")
+            .fetch_optional(&db.pool)
+            .await;
+        assert!(err.is_err(), "reorged column should not exist after migration 005");
+    }
+
+    #[tokio::test]
+    async fn index_shape_has_no_reorged_predicate() {
+        let (db, _guard) = open_test_db().await;
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            sql: Option<String>,
+        }
+        let row = sqlx::query_as::<_, Row>(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_events_lookup'",
+        )
+        .fetch_optional(&db.pool)
+        .await
+        .unwrap();
+
+        let index_sql = row.and_then(|r| r.sql).unwrap_or_default();
         assert!(
-            rows.is_empty(),
-            "unknown topic0 must return empty list, not error"
+            !index_sql.contains("reorged"),
+            "idx_events_lookup must not reference reorged column, got: {index_sql}"
         );
     }
 }
