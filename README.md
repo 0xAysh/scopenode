@@ -255,13 +255,21 @@ scopenode/
 
 ## Background
 
-The first version of scopenode did all of this over live devp2p. It connected directly to Ethereum mainnet peers, ran Helios as a beacon light client for BLS-verified block headers, fetched receipts via `GetReceipts` wire messages, detected reorgs with a rolling hash buffer, and had a daemon mode so the sync process could run in the background. There were 14 CLI commands.
+scopenode started as a full devp2p node. The original implementation covered a significant slice of the Ethereum networking and consensus stack:
 
-It worked, but the dependency graph was enormous — 10 reth crates, Helios, OpenSSL, reqwest — and the codebase was fighting itself. The devp2p path, the beacon path, the retry queue, the TUI, the daemon, and the ERA1 fallback all had different assumptions about state and lifecycle. Adding anything touched five modules.
+- **devp2p peer management** — discv4 node discovery, RLPx session establishment, ETH handshake, peer scoring. Built on top of `reth-network` which implements the full wire protocol.
+- **ETH wire protocol** — `GetBlockHeaders` and `GetReceipts` request/response handling directly over the P2P transport, no JSON-RPC provider in the data path at any point.
+- **Helios beacon light client** — embedded Helios to track the BLS-signed sync committee and verify that every block header received from a devp2p peer was on the canonical chain. This is the same trust model as a light client: you don't trust the peer, you trust the sync committee signatures.
+- **Merkle Patricia Trie receipt verification** — receipts from peers were verified by reconstructing the receipt trie (RLP-encoded indices as keys, EIP-2718 encoded receipts as values) and asserting the computed root matched `receipts_root` in the peer-supplied header. A peer cannot forge an event log without also forging the header, which requires breaking PoS finality.
+- **Reorg detection** — a rolling buffer of recent block hashes tracked the canonical chain tip; on reorg the affected events were soft-deleted (`reorged = 1`) rather than hard-deleted, so the data was always recoverable.
+- **Resumable multi-stage pipeline** — a `sync_cursor` table recorded per-contract progress through four stages (header sync → bloom scan → receipt fetch → decode/store) so any interruption resumed from the exact block it left off, not from zero.
+- **Daemon mode** — a background process model with Unix socket control, `start`/`stop`/`logs` commands, and a structured log stream for the foreground `logs` command to tail.
 
-While working on ERA1 archive support as a "fallback for historical data", it became clear that ERA1 is actually a better foundation for the whole tool — the data is local, deterministic, Merkle-verifiable, and fast. No peer connection negotiation, no receipt fetch timeouts, no reorg detection needed. Ripping out everything else and rebuilding around ERA1 as the primary source made the codebase about 70% smaller and the pipeline a straight line from file to SQLite.
+That implementation worked and the protocol knowledge is real. But the codebase had grown into something where every feature touched five modules, the devp2p path and the ERA1 fallback path had diverging assumptions, and the dependency graph (10 reth crates, Helios, OpenSSL) made the build slow and the scope hard to reason about.
 
-Live P2P sync is back on the roadmap — but as a clean addition on top of a working core, not tangled into it from the start.
+The architectural decision to reset was made after implementing ERA1 support as a "historical fallback" and realising it was actually a strictly better foundation for the core pipeline: local, deterministic, no peer negotiation, no receipt fetch timeouts, no reorg handling needed. The full five-stage pipeline — bloom filter scan, receipt decode, Merkle verification, ABI decode, idempotent store — runs identically over ERA1. The only thing missing is the live chain tip.
+
+The devp2p and beacon client work is being brought back on top of a clean foundation rather than woven through a codebase that was fighting itself. The git history preserves the full previous implementation for reference.
 
 ---
 
