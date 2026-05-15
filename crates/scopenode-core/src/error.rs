@@ -1,31 +1,12 @@
 //! Error types for the core pipeline.
-//!
-//! Each pipeline stage has its own error type; [`CoreError`] wraps them all via
-//! `From` implementations so `?` can be used throughout the pipeline without
-//! manual error conversion at each call site.
-//!
-//! Error hierarchy:
-//! - [`CoreError`] — top-level, returned by [`crate::pipeline::Pipeline::run`]
-//!   - [`NetworkError`] — transport failures (headers, receipts)
-//!   - [`AbiError`] — Sourcify fetch or ABI decode failures
-//!   - [`VerifyError`] — Merkle Patricia Trie root mismatch
-//!   - [`ConfigError`] — TOML parse or validation failures
-//!   - `DbError` — SQLite errors (re-exported from `scopenode-storage`)
 
 use alloy_primitives::Address;
 use thiserror::Error;
 use url::Url;
 
 /// Top-level error for pipeline operations.
-///
-/// Returned by [`crate::pipeline::Pipeline::run`] and its sub-methods.
-/// Each variant wraps a stage-specific error type, allowing callers to
-/// match on the stage that failed without losing the original detail.
 #[derive(Debug, Error)]
 pub enum CoreError {
-    #[error("Network error: {0}")]
-    Network(#[from] NetworkError),
-
     #[error("ABI error: {0}")]
     Abi(#[from] AbiError),
 
@@ -43,42 +24,6 @@ pub enum CoreError {
 
     #[error("Internal error: {0}")]
     Internal(String),
-}
-
-/// Errors from the devp2p network transport layer.
-#[derive(Debug, Error)]
-pub enum NetworkError {
-    /// devp2p stack failed to start (NetworkManager init, discv4 bind, etc.).
-    #[error("devp2p boot failed: {0}")]
-    Boot(String),
-
-    /// No peers are currently connected.
-    ///
-    /// Returned by [`crate::network::EthNetwork::best_block_number`] when the
-    /// peer map is empty at the time of the call. The startup path no longer
-    /// produces this error — `wait_for_peers` loops indefinitely until a peer
-    /// completes the ETH Status handshake.
-    #[error("devp2p found {found} peer(s), need at least {wanted}")]
-    NoPeers { wanted: usize, found: usize },
-
-    /// All connected peers failed to return headers for this block range.
-    ///
-    /// Peers may not have this range (pruned node) or the range may be
-    /// too far behind for non-archive peers.
-    #[error("Failed to fetch headers for blocks {0}..{1} from any peer")]
-    HeadersFailed(u64, u64),
-
-    /// All connected peers failed to return receipts for one or more blocks.
-    #[error("Failed to fetch receipts: {0}")]
-    ReceiptsFailed(String),
-
-    /// A peer request failed (session error, disconnect, protocol violation).
-    #[error("Peer request failed: {0}")]
-    Peer(String),
-
-    /// Failed to read or write the persistent node key file.
-    #[error("Node key I/O error: {0}")]
-    KeyIo(String),
 }
 
 /// Errors from ABI fetching or decoding.

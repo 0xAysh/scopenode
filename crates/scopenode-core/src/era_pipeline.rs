@@ -8,12 +8,12 @@ use crate::abi::{AbiCache, EventDecoder};
 use crate::config::ContractConfig;
 use crate::error::CoreError;
 use crate::headers::BloomScanner;
-use crate::pipeline::core_to_storage_event;
 use crate::receipts::verify_era1_receipts;
 use crate::source::{
     decode_era1_header, decode_era1_receipts, decode_era1_tx_hashes, iter_era1_block_tuples,
     SourceFileManifest,
 };
+use crate::types::StoredEvent as CoreEvent;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use scopenode_storage::Db;
 use tracing::warn;
@@ -149,4 +149,27 @@ pub async fn run_era1_scope(
 
     pb.finish_with_message(format!("done ({total_events} events)"));
     Ok(())
+}
+
+fn core_to_storage_event(e: &CoreEvent) -> scopenode_storage::models::StoredEvent {
+    scopenode_storage::models::StoredEvent {
+        contract: e.contract.to_checksum(None),
+        event_name: e.event_name.clone(),
+        topic0: e.topic0.to_string(),
+        block_number: e.block_number as i64,
+        block_hash: e.block_hash.to_string(),
+        tx_hash: e.tx_hash.to_string(),
+        tx_index: e.tx_index as i64,
+        log_index: e.log_index as i64,
+        raw_topics: serde_json::to_string(
+            &e.raw_topics
+                .iter()
+                .map(|t| t.to_string())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap_or_default(),
+        raw_data: alloy_primitives::hex::encode(&e.raw_data),
+        decoded: e.decoded.to_string(),
+        source: e.source.clone(),
+    }
 }
