@@ -257,7 +257,7 @@ scopenode/
 
 The first version of scopenode did all of this over live devp2p. It connected directly to Ethereum mainnet peers, ran Helios as a beacon light client for BLS-verified block headers, fetched receipts via `GetReceipts` wire messages, detected reorgs with a rolling hash buffer, and had a daemon mode so the sync process could run in the background. There were 14 CLI commands.
 
-It worked, but the dependency graph was enormous — 10 reth crates, Helios, OpenSSL, reqwest — and the codebase was fighting itself. The devp2p path, the beacon path, the retry queue, the TUI, the daemon, and the ERA1 fallback all had different assumptions about state and lifecycle. Adding anything touched five modules. Debugging meant understanding which of three pipelines was actually running.
+It worked, but the dependency graph was enormous — 10 reth crates, Helios, OpenSSL, reqwest — and the codebase was fighting itself. The devp2p path, the beacon path, the retry queue, the TUI, the daemon, and the ERA1 fallback all had different assumptions about state and lifecycle. Adding anything touched five modules.
 
 While working on ERA1 archive support as a "fallback for historical data", it became clear that ERA1 is actually a better foundation for the whole tool — the data is local, deterministic, Merkle-verifiable, and fast. No peer connection negotiation, no receipt fetch timeouts, no reorg detection needed. Ripping out everything else and rebuilding around ERA1 as the primary source made the codebase about 70% smaller and the pipeline a straight line from file to SQLite.
 
