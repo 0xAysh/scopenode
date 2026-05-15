@@ -1,3 +1,5 @@
+> **Deprecated (2026-05-14):** This phase document is superseded by the architectural reset. See `docs/brainstorms/2026-05-14-architectural-reset-requirements.md`.
+
 # Phase 2 - Source Hardening, Verification, and Tooling
 
 ## Goal

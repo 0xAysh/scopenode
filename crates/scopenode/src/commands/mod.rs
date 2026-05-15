@@ -1,14 +1,2 @@
-pub mod abi;
-pub mod doctor;
-pub mod export;
-pub mod index;
-pub mod logs;
-pub mod query;
-pub mod restore;
-pub mod retry;
-pub mod snapshot;
-pub mod start;
-pub mod status;
-pub mod stop;
+pub mod serve;
 pub mod sync;
-pub mod validate;

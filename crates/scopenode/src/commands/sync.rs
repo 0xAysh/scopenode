@@ -1,23 +1,10 @@
-//! `sync` command — runs the ERA1 pipeline to index contract events from local ERA1 files.
-//!
-//! # Modes
-//!
-//! - **Plain mode** (default): indicatif progress bars during indexing.
-//! - **Quiet mode** (`--quiet`): no progress output, plain text only.
-//! - **Dry-run mode** (`--dry-run`): validates config and reports source path, no data read.
-//!
-//! # Steps
-//!
-//! 1. Validate that a `[source]` section is present in the config
-//! 2. Scan the ERA1 source directory to build a file manifest
-//! 3. For each contract in the config, run [`run_era1_scope`]
-//! 4. Print a completion message and exit
+//! `sync` command — indexes contract events from local ERA1 files.
 
 use anyhow::{Context, Result};
 use indicatif::{MultiProgress, ProgressDrawTarget};
 use scopenode_core::{
     abi::AbiCache,
-    config::{Config, SourceKind},
+    config::Config,
     era_pipeline::run_era1_scope,
     source::scan_era1_source,
 };
@@ -25,36 +12,34 @@ use scopenode_storage::Db;
 use std::path::PathBuf;
 
 /// Run the `sync` command.
-///
-/// Reads ERA1 files from the configured source path and indexes events for
-/// every contract listed in the config.  Dry-run mode exits early after
-/// printing the resolved source path.
-pub async fn run(
-    config: Config,
-    db: Db,
-    dry_run: bool,
-    quiet: bool,
-    _blocks_override: Option<String>,
-    _data_dir: PathBuf,
-    _config_path: PathBuf,
-) -> Result<()> {
-    let source = config
-        .source
-        .as_ref()
-        .context("sync requires a [source] config section — add [source] kind = \"era1\" path = \"...\" to your config")?;
+pub async fn run(config: Config, db: Db, dry_run: bool, quiet: bool) -> Result<()> {
+    let era_dir = expand_tilde(config.node.era_dir.clone());
 
     if dry_run {
-        println!(
-            "ERA1 source configured at {} — run `scopenode index config.toml` first to validate coverage",
-            source.path.display()
-        );
+        println!("ERA1 source: {}", era_dir.display());
+        println!("Contracts to sync:");
+        for c in &config.contracts {
+            println!(
+                "  {} blocks {}-{}",
+                c.name.as_deref().unwrap_or(&c.address.to_string()),
+                c.from_block,
+                c.to_block.unwrap_or(0),
+            );
+        }
         return Ok(());
     }
 
-    let scan = match source.kind {
-        SourceKind::Era1 => scan_era1_source(&source.path, source.network.as_deref())
-            .with_context(|| format!("Failed to scan ERA1 source: {}", source.path.display()))?,
-    };
+    // Compute union range across all contracts so scan only SHA256-hashes in-range files.
+    let union_from = config.contracts.iter().map(|c| c.from_block).min().unwrap_or(0);
+    let union_to = config
+        .contracts
+        .iter()
+        .filter_map(|c| c.to_block)
+        .max()
+        .unwrap_or(u64::MAX);
+
+    let scan = scan_era1_source(&era_dir, None, union_from, union_to)
+        .with_context(|| format!("Failed to scan ERA1 source: {}", era_dir.display()))?;
 
     let progress = MultiProgress::new();
     if quiet {
@@ -78,93 +63,60 @@ pub async fn run(
     Ok(())
 }
 
-// ── --blocks flag parsing ─────────────────────────────────────────────────────
+/// Entry point called from main.rs — loads config, opens DB, calls run().
+pub async fn execute(config_path: PathBuf, dry_run: bool, quiet: bool) -> Result<()> {
+    let config = Config::from_file(&config_path).context("Failed to load config")?;
 
-/// Parse a `--blocks` range string into `(from_block, to_block)`.
-///
-/// Formats:
-/// - `"16M:17M"` → (16_000_000, Some(17_000_000))
-/// - `"16M:+1000"` → (16_000_000, Some(16_001_000))
-/// - `"16M:+0"` → (16_000_000, Some(16_000_000))
-///
-/// Shorthand suffixes `M` and `K` are supported on both sides.
-/// Relative offset (`+N`) is resolved against the left bound.
-#[allow(dead_code)]
-pub fn parse_blocks_flag(s: &str) -> Result<(u64, Option<u64>), String> {
-    use scopenode_core::config::parse_block_shorthand;
+    let data_dir = expand_tilde(
+        config
+            .node
+            .data_dir
+            .clone()
+            .unwrap_or_else(default_data_dir),
+    );
+    std::fs::create_dir_all(&data_dir)
+        .with_context(|| format!("Failed to create data dir: {}", data_dir.display()))?;
 
-    let (left, right) = s.split_once(':').ok_or_else(|| {
-        format!(
-            "expected colon separator in \"{}\" — use e.g. \"16M:17M\" or \"16M:+1000\"",
-            s
-        )
-    })?;
+    let db = Db::open(data_dir.join("scopenode.db"))
+        .await
+        .context("Failed to open database")?;
 
-    let from = parse_block_shorthand(left.trim())?;
+    run(config, db, dry_run, quiet).await
+}
 
-    let right = right.trim();
-    let to = if let Some(offset_str) = right.strip_prefix('+') {
-        let offset: u64 = offset_str.parse().map_err(|_| {
-            format!(
-                "invalid relative offset \"+{}\" — expected a non-negative integer",
-                offset_str
-            )
-        })?;
-        from.checked_add(offset)
-            .ok_or_else(|| format!("block range overflow: {} + {}", from, offset))?
-    } else {
-        parse_block_shorthand(right)?
-    };
+fn default_data_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".scopenode")
+}
 
-    if to < from {
-        return Err(format!(
-            "to_block ({}) must be >= from_block ({})",
-            to, from
-        ));
+fn expand_tilde(path: PathBuf) -> PathBuf {
+    if let Some(s) = path.to_str() {
+        if let Some(stripped) = s.strip_prefix("~/") {
+            if let Some(home) = dirs::home_dir() {
+                return home.join(stripped);
+            }
+        }
     }
-
-    Ok((from, Some(to)))
+    path
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use scopenode_core::config::parse_block_shorthand;
 
     #[test]
-    fn parse_absolute_range() {
-        let (from, to) = parse_blocks_flag("16M:17M").unwrap();
-        assert_eq!(from, 16_000_000);
-        assert_eq!(to, Some(17_000_000));
+    fn parse_absolute_block() {
+        assert_eq!(parse_block_shorthand("16000000").unwrap(), 16_000_000);
     }
 
     #[test]
-    fn parse_relative_offset() {
-        let (from, to) = parse_blocks_flag("16M:+500").unwrap();
-        assert_eq!(from, 16_000_000);
-        assert_eq!(to, Some(16_000_500));
+    fn parse_shorthand_m() {
+        assert_eq!(parse_block_shorthand("16M").unwrap(), 16_000_000);
     }
 
     #[test]
-    fn parse_zero_offset() {
-        let (from, to) = parse_blocks_flag("16M:+0").unwrap();
-        assert_eq!(from, 16_000_000);
-        assert_eq!(to, Some(16_000_000));
-    }
-
-    #[test]
-    fn parse_integer_range() {
-        let (from, to) = parse_blocks_flag("12376729:12500000").unwrap();
-        assert_eq!(from, 12376729);
-        assert_eq!(to, Some(12500000));
-    }
-
-    #[test]
-    fn parse_inverted_errors() {
-        assert!(parse_blocks_flag("17M:16M").is_err());
-    }
-
-    #[test]
-    fn parse_missing_colon_errors() {
-        assert!(parse_blocks_flag("16M").is_err());
+    fn parse_shorthand_k() {
+        assert_eq!(parse_block_shorthand("16K").unwrap(), 16_000);
     }
 }

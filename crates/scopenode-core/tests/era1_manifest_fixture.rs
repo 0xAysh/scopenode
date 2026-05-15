@@ -17,7 +17,7 @@ fn scans_downloaded_era1_fixture_when_present() {
         return;
     }
 
-    let scan = scan_era1_source(&root, None).unwrap();
+    let scan = scan_era1_source(&root, None, 0, u64::MAX).unwrap();
 
     assert_eq!(scan.kind, "era1");
     assert_eq!(scan.network.as_deref(), Some("mainnet"));

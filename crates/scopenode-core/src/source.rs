@@ -141,9 +141,17 @@ struct Era1FileName {
     to_block: u64,
 }
 
+/// Scan a directory for ERA1 files and return a manifest.
+///
+/// `from_block`/`to_block` define the union range of interest. Files whose
+/// block range does not overlap `[from_block, to_block]` are excluded. SHA256
+/// is only computed for files that pass the range filter (cheap seek-based check
+/// runs first).
 pub fn scan_era1_source(
     path: impl AsRef<Path>,
     network_override: Option<&str>,
+    from_block: u64,
+    to_block: u64,
 ) -> Result<SourceScan, SourceError> {
     let path = path.as_ref();
     if !path.exists() {
@@ -180,8 +188,27 @@ pub fn scan_era1_source(
             continue;
         }
 
-        let sha256 = sha256_file(&file_path)?;
+        // Read block range first (cheap seek-based pass) to filter out files
+        // that don't overlap the requested range before computing SHA256.
         let content_range = read_era1_block_index_range(&file_path)?;
+
+        let (file_from, file_to, completeness) = content_range
+            .as_ref()
+            .map(|range| (range.from_block, range.to_block, range.completeness))
+            .unwrap_or((
+                parsed.from_block,
+                parsed.to_block,
+                RangeCompleteness::Inferred,
+            ));
+
+        // Skip files that don't overlap [from_block, to_block].
+        if file_to < from_block || file_from > to_block {
+            continue;
+        }
+
+        // Only SHA256 files that are in range.
+        let sha256 = sha256_file(&file_path)?;
+
         let filename = file_path
             .file_name()
             .and_then(|name| name.to_str())
@@ -193,15 +220,6 @@ pub fn scan_era1_source(
             .ok()
             .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
             .map(|duration| duration.as_secs() as i64);
-
-        let (from_block, to_block, completeness) = content_range
-            .as_ref()
-            .map(|range| (range.from_block, range.to_block, range.completeness))
-            .unwrap_or((
-                parsed.from_block,
-                parsed.to_block,
-                RangeCompleteness::Inferred,
-            ));
 
         files.push(SourceFileManifest {
             format: "era1".to_string(),
@@ -215,8 +233,8 @@ pub fn scan_era1_source(
             sha256,
             checksum_status,
             ranges: vec![SourceRangeManifest {
-                from_block,
-                to_block,
+                from_block: file_from,
+                to_block: file_to,
                 completeness,
             }],
         });
@@ -690,7 +708,7 @@ fn sha256_file(path: &Path) -> Result<String, SourceError> {
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(hex::encode(hasher.finalize()))
+    Ok(alloy_primitives::hex::encode(hasher.finalize()))
 }
 
 fn read_era1_block_index_range(path: &Path) -> Result<Option<SourceRangeManifest>, SourceError> {
@@ -874,7 +892,7 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("notes.txt"), "ignore me").unwrap();
 
-        let scan = scan_era1_source(dir.path(), None).unwrap();
+        let scan = scan_era1_source(dir.path(), None, 0, u64::MAX).unwrap();
 
         assert!(scan.files.is_empty());
     }
@@ -887,7 +905,7 @@ mod tests {
         let hash = sha256_file(&era1).unwrap();
         fs::write(dir.path().join("checksums.txt"), format!("0x{hash}\n")).unwrap();
 
-        let scan = scan_era1_source(dir.path(), None).unwrap();
+        let scan = scan_era1_source(dir.path(), None, 0, u64::MAX).unwrap();
 
         assert_eq!(scan.files.len(), 1);
         assert_eq!(scan.files[0].checksum_status, ChecksumStatus::Verified);
@@ -904,7 +922,7 @@ mod tests {
         let wrong_hash = "00".repeat(32);
         fs::write(dir.path().join("checksums.txt"), format!("{wrong_hash}\n")).unwrap();
 
-        let scan = scan_era1_source(dir.path(), None).unwrap();
+        let scan = scan_era1_source(dir.path(), None, 0, u64::MAX).unwrap();
 
         assert_eq!(
             scan.files[0].checksum_status,
@@ -923,7 +941,7 @@ mod tests {
         )
         .unwrap();
 
-        let scan = scan_era1_source(dir.path(), None).unwrap();
+        let scan = scan_era1_source(dir.path(), None, 0, u64::MAX).unwrap();
 
         assert_eq!(scan.files[0].ranges[0].from_block, 64);
         assert_eq!(scan.files[0].ranges[0].to_block, 66);
@@ -939,7 +957,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = scan_era1_source(dir.path(), None).unwrap_err();
+        let err = scan_era1_source(dir.path(), None, 0, u64::MAX).unwrap_err();
 
         assert!(
             err.to_string().contains("block index count is zero"),
