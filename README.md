@@ -1,70 +1,47 @@
 # scopenode
 
-> [!IMPORTANT]
-> Some parts of this project are work in progress and not ready for production use.
+A focused Ethereum event indexer. Point it at a directory of local ERA1 archive files, tell it which contract events to watch, and it builds a queryable SQLite database you can serve via standard JSON-RPC.
 
-
-> **Project status: active refactor / product pivot**
-> 
-> scopenode is currently undergoing a significant architectural refactor and
-> product direction review. The current implementation is experimental and is
-> not recommended for production use or critical workflows. Expect bugs,
-> incomplete behavior, and core functionality that may change substantially as
-> the project evolves.
-
-A custom Ethereum node that syncs exactly the contract events you care about — directly from mainnet peers, verified cryptographically, served locally at `localhost:8545`.
-
-No Infura. No Alchemy. No API keys. No rate limits.
-
-```
-scopenode sync config.toml
-# ✓ connected to 12 devp2p peers
-# ✓ fetched 1,000 headers  (bloom: 87 candidates)
-# ✓ verified 87 receipt batches against receiptsRoot
-# ✓ decoded 412 Swap events → stored in SQLite
-# ✓ JSON-RPC server running at localhost:8545
-```
+No API keys. No Infura. No live P2P networking. ERA1 files only.
 
 ---
 
 ## How it works
 
-```text
-  Ethereum mainnet peers (devp2p)
-          │
-          │  GetBlockHeaders    ──▶  bloom scan (local CPU)
-          │  GetReceipts        ──▶  Merkle verify (alloy-trie)
-          │
-          ▼
-  SQLite (WAL mode)
-          │
-          ▼
-  JSON-RPC :8545   ──▶  eth_getLogs / eth_blockNumber / eth_chainId
+```
+ERA1 files (local disk)
+    │
+    ├── bloom filter (headers)   ──▶  skip ~87% of blocks instantly
+    ├── fetch receipts           ──▶  Merkle verify against receipts_root
+    └── ABI-decode matching logs ──▶  INSERT OR IGNORE into SQLite
+                                              │
+                                    JSON-RPC :8545   eth_getLogs
+                                    REST API :8546   GET /events
 ```
 
-**Five pipeline stages**, run once per configured contract:
+**Pipeline per contract:**
 
-| Stage | What happens |
-|---|---|
-| **1. ABI fetch** | Pull event signatures from [Sourcify](https://sourcify.dev) (or a local file). Cached in SQLite. |
-| **2. Header sync** | `GetBlockHeaders` via devp2p → store `logs_bloom` + `receipts_root` for each block. |
-| **3. Bloom scan** | CPU-only: check each header's bloom filter. Skips ~87% of blocks instantly. |
-| **4. Receipt fetch + verify** | `GetReceipts` for bloom candidates → rebuild Merkle Patricia Trie → assert root == `receipts_root`. |
-| **5. Decode + store** | ABI-decode matching logs via `alloy-dyn-abi`. `INSERT OR IGNORE` into SQLite. |
+| Step | What happens |
+|------|--------------|
+| 1. Scan ERA1 source | Discover `.era1` files in `era_dir` that overlap the block range |
+| 2. Bloom filter | Check each block header's bloom — skip blocks that can't contain your events |
+| 3. Receipt decode | Decompress and decode ERA1 receipts for bloom-hit blocks |
+| 4. Merkle verify | Reconstruct receipt trie, assert root == `receipts_root` in the header |
+| 5. Decode + store | ABI-decode matching logs, `INSERT OR IGNORE` into SQLite |
 
-Every sync is **resumable** — interrupt with Ctrl+C, re-run `scopenode sync`, pick up exactly where you left off.
+Every sync is **resumable** — interrupt with Ctrl+C and re-run `scopenode sync`.
 
 ---
 
 ## Install
 
-**Prerequisites:** Rust 1.80+ and Cargo.
+**Prerequisites:** Rust 1.80+ and a local ERA1 archive directory.
 
 ```bash
-git clone https://github.com/you/scopenode
+git clone https://github.com/0xAysh/scopenode
 cd scopenode
 cargo build --release
-# binary at: ./target/release/scopenode
+# binary: ./target/release/scopenode
 ```
 
 ---
@@ -75,37 +52,43 @@ cargo build --release
 
 ```toml
 # config.toml
-
 [node]
-port = 8545
+port      = 8545
+rest_port = 8546
+data_dir  = "~/.scopenode"
+era_dir   = "~/era1"            # directory containing *.era1 files
 
 [[contracts]]
-name     = "Uniswap V3 ETH/USDC"
-address  = "0x8ad599c3A0ff1De082011EFDDc58f1908eb6e6D8"
-events   = ["Swap", "Mint", "Burn"]
-from_block = 17000000
-to_block   = 17001000
+name       = "Uniswap V3 ETH/USDC"
+address    = "0x8ad599c3A0ff1De082011EFDDc58f1908eb6e6D8"
+events     = ["Swap"]
+from_block = 25000000
+to_block   = 25010000
+abi_override = "./abis/UniswapV3Pool.json"  # required — local ABI file
 ```
 
-**2. Sync:**
+**2. Index events:**
 
 ```bash
-scopenode sync config.toml
+scopenode sync --config config.toml
 ```
 
-**3. Query:**
+**3. Serve:**
 
 ```bash
-# standard eth_getLogs via any Ethereum library
+scopenode serve --config config.toml
+```
+
+**4. Query:**
+
+```bash
+# via standard Ethereum JSON-RPC
 cast logs --rpc-url http://localhost:8545 \
   --address 0x8ad599c3A0ff1De082011EFDDc58f1908eb6e6D8 \
   --event "Swap(address,address,int256,int256,uint160,uint128,int24)"
-```
 
-Or via the built-in query command:
-
-```bash
-scopenode query --contract 0x8ad599c3A0ff1De082011EFDDc58f1908eb6e6D8 --event Swap
+# via REST
+curl "http://localhost:8546/events?contract=0x8ad5...&fromBlock=25000000&toBlock=25010000"
 ```
 
 ---
@@ -114,26 +97,28 @@ scopenode query --contract 0x8ad599c3A0ff1De082011EFDDc58f1908eb6e6D8 --event Sw
 
 ```toml
 [node]
-port      = 8545          # JSON-RPC port (default: 8545)
-data_dir  = "~/.scopenode" # Where to store the SQLite database
+port      = 8545            # JSON-RPC port (default: 8545)
+rest_port = 8546            # REST API port (default: 8546)
+data_dir  = "~/.scopenode"  # SQLite database location (tilde expanded)
+era_dir   = "~/era1"        # Directory containing *.era1 files (required)
 
 [[contracts]]
-name       = "My Contract"   # Optional label
-address    = "0x..."         # Contract address (required)
-events     = ["Transfer"]    # Event names to index (required)
-from_block = 17000000        # First block (required)
-to_block   = 18000000        # Last block (optional — omit for live-tip sync)
-abi_override = "./abi.json"  # Local ABI file if contract isn't on Sourcify
+name         = "My Contract"   # Optional label for progress output
+address      = "0x..."         # Contract address (required)
+events       = ["Transfer"]    # Event names to index (required, at least one)
+from_block   = 17000000        # First block, inclusive (required)
+to_block     = 18000000        # Last block, inclusive (required)
+abi_override = "./abi.json"    # Local ABI JSON file (required — no remote fetch)
 
-# Add as many [[contracts]] sections as you need
+# Add as many [[contracts]] sections as needed.
+# Block numbers accept shorthand: "16M" → 16_000_000, "12.3K" → 12_300.
 ```
 
-**Data directory resolution** (highest priority first):
-
-1. `--data-dir /path` CLI flag
-2. `SCOPENODE_DATA_DIR=/path` environment variable
-3. `data_dir = "..."` in config file
-4. Default: `~/.scopenode/`
+**Validation at startup:**
+- `abi_override` must be set — remote ABI fetching is not supported
+- `to_block` must be set — live sync is not supported
+- `to_block >= from_block` required
+- Unknown fields in config are rejected
 
 ---
 
@@ -143,116 +128,80 @@ abi_override = "./abi.json"  # Local ABI file if contract isn't on Sourcify
 scopenode <COMMAND>
 
 Commands:
-  sync    Sync events for contracts in a config file
-  status  Show indexed contracts and event counts
-  query   Query indexed events from the terminal
-  help    Print help
+  sync   Read ERA1 files and index contract events into SQLite
+  serve  Start the JSON-RPC (:8545) and REST (:8546) servers
 
 Options:
-  --data-dir <PATH>   Override data directory
-  -v, --verbose       Increase log verbosity (-vv, -vvv)
+  -v, --verbose   Increase log verbosity (-v info, -vv debug, -vvv trace)
 ```
 
 ### `sync`
 
 ```bash
-scopenode sync config.toml [OPTIONS]
+scopenode sync [--config <path>] [--dry-run]
 
 Options:
-  --dry-run   Bloom scan only — show candidate count and time estimate, don't fetch receipts
+  --config <path>   Path to config file (default: ./config.toml)
+  --dry-run         Print ERA1 source path and contract list, then exit
 ```
 
-### `status`
+### `serve`
 
 ```bash
-scopenode status
-# Contract: Uniswap V3 ETH/USDC (0x8ad5...)
-#   Events indexed: 412 (Swap: 389, Mint: 18, Burn: 5)
-#   Blocks:  17,000,000 – 17,001,000  (headers: ✓  receipts: ✓)
-```
-
-### `query`
-
-```bash
-scopenode query [OPTIONS]
+scopenode serve [--config <path>]
 
 Options:
-  --contract <ADDR>    Filter by contract address
-  --event <NAME>       Filter by event name
-  --limit <N>          Max results (default: 20)
-  --output <FORMAT>    Output format: table or json
+  --config <path>   Path to config file (default: ./config.toml)
 ```
+
+Both servers run until Ctrl+C.
 
 ---
 
-## JSON-RPC
+## JSON-RPC (`:8545`)
 
-scopenode serves standard Ethereum JSON-RPC at `localhost:8545`. Drop it into any Ethereum tooling:
+Standard Ethereum JSON-RPC. Drop into any Ethereum tooling:
 
 ```javascript
 // viem
-const client = createPublicClient({ transport: http("http://localhost:8545") });
 const logs = await client.getLogs({ address: "0x8ad5..." });
 
 // ethers.js
 const provider = new ethers.JsonRpcProvider("http://localhost:8545");
 
-// web3.py
-w3 = Web3(Web3.HTTPProvider("http://localhost:8545"))
+// cast
+cast rpc eth_getLogs '{"address":"0x8ad5...","fromBlock":"0x17D4208","toBlock":"0x17D6990"}'
 ```
 
 **Supported methods:**
 
-| Method | Description |
-|---|---|
-| `eth_getLogs` | Query indexed events. Supports `address`, `topics`, `fromBlock`, `toBlock`. |
-| `eth_blockNumber` | Highest indexed block. |
+| Method | Notes |
+|--------|-------|
+| `eth_getLogs` | Supports `address`, `topics[0]`, `fromBlock`, `toBlock`. Returns error (not truncation) when result exceeds 10,000 rows. |
+| `eth_blockNumber` | Highest block number in the events table. |
 | `eth_chainId` | Always `0x1` (Ethereum mainnet). |
-
-Querying a contract that hasn't been indexed returns a clear error pointing to `scopenode status`.
+| `net_peerCount` | Always `0x0` (ERA1-only; no live peers). |
 
 ---
 
-## Project structure
+## REST API (`:8546`)
 
 ```
-scopenode/
-├── config.example.toml
-├── crates/
-│   ├── scopenode/           # CLI binary
-│   │   └── src/
-│   │       ├── main.rs
-│   │       └── commands/
-│   │           ├── sync.rs
-│   │           ├── status.rs
-│   │           └── query.rs
-│   ├── scopenode-core/      # Pipeline + P2P networking
-│   │   └── src/
-│   │       ├── pipeline.rs  # 5-stage orchestrator
-│   │       ├── network.rs   # EthNetwork trait + DevP2PNetwork (reth devp2p)
-│   │       ├── headers.rs   # Bloom filter scanning
-│   │       ├── receipts.rs  # Merkle Patricia Trie verification
-│   │       ├── abi.rs       # Sourcify fetch + event decoding
-│   │       ├── config.rs    # TOML config types
-│   │       ├── types.rs     # ScopeHeader, StoredEvent, etc.
-│   │       └── error.rs
-│   ├── scopenode-storage/   # SQLite layer
-│   │   └── src/
-│   │       ├── db.rs        # Db handle (Arc, WAL mode, INSERT OR IGNORE)
-│   │       └── migrations/
-│   │           └── 001_init.sql
-│   └── scopenode-rpc/       # JSON-RPC server
-│       └── src/
-│           └── server.rs    # eth_getLogs, eth_blockNumber, eth_chainId
+GET /events
+    ?contract=0x...      filter by contract address
+    &event=Swap          filter by event name
+    &topic0=0xddf252…    filter by raw topic0 hash
+    &fromBlock=N         inclusive lower bound
+    &toBlock=N           inclusive upper bound
+    &limit=100           max rows (default 100, hard cap 10,000)
+    &offset=0            pagination offset
+
+GET /status             block number, contract count, total event count
+GET /contracts          indexed contracts with per-contract event counts
+GET /abi/:address       raw cached ABI JSON for a contract
 ```
 
-**Key design decisions:**
-
-- **`EthNetwork` trait** — the pipeline is generic over its transport. Swapping from devp2p to a different source (e.g. ERA1 archives) only changes `network.rs`.
-- **No RPC provider** — all block data comes from Ethereum P2P peers via `GetBlockHeaders` and `GetReceipts` wire messages.
-- **Merkle verification** — receipts are rejected if the reconstructed trie root doesn't match `receipts_root` in the header. Peers cannot forge events.
-- **Bloom filter scan** — skips ~87% of blocks with zero false negatives before touching the network.
-- **Idempotent storage** — `INSERT OR IGNORE` everywhere, so interrupting and re-running is always safe.
+Returns error (HTTP 400) when result exceeds 10,000 rows — consistent with `eth_getLogs`.
 
 ---
 
@@ -263,28 +212,59 @@ Database: `~/.scopenode/scopenode.db` (SQLite, WAL mode).
 **Tables:**
 
 | Table | Contents |
-|---|---|
-| `headers` | Block headers: number, hash, receipts_root, logs_bloom, timestamp, gas_used |
-| `bloom_candidates` | Blocks that passed bloom filter per contract |
-| `events` | Decoded events: contract, event_name, block, tx_hash, log_index, raw_topics, raw_data, decoded JSON |
-| `sync_cursor` | Per-contract progress: headers_done_to, receipts_done_to |
-| `contracts` | Contract registry + cached ABI JSON from Sourcify |
+|-------|----------|
+| `events` | Decoded events: contract, event_name, topic0, block_number, block_hash, tx_hash, tx_index, log_index, raw_topics, raw_data, decoded JSON |
+| `contracts` | Contract registry + cached ABI JSON |
 
+`UNIQUE(block_number, tx_index, log_index)` ensures re-syncing is always idempotent.
 
+---
+
+## Project structure
+
+```
+scopenode/
+├── config.example.toml
+├── crates/
+│   ├── scopenode/              # CLI binary
+│   │   └── src/
+│   │       ├── main.rs
+│   │       └── commands/
+│   │           ├── sync.rs     # ERA1 scan → index pipeline
+│   │           └── serve.rs    # JSON-RPC + REST server startup
+│   ├── scopenode-core/         # Pipeline logic
+│   │   └── src/
+│   │       ├── era_pipeline.rs # Per-contract ERA1 index loop
+│   │       ├── source.rs       # ERA1 file discovery + block iterator
+│   │       ├── headers.rs      # Bloom filter scanning
+│   │       ├── receipts.rs     # Merkle Patricia Trie verification
+│   │       ├── abi.rs          # ABI loading + event decoding
+│   │       ├── config.rs       # TOML config types
+│   │       └── error.rs
+│   ├── scopenode-storage/      # SQLite layer
+│   │   └── src/
+│   │       ├── db.rs           # Db handle (WAL mode, INSERT OR IGNORE)
+│   │       └── migrations/     # 005 migrations total
+│   └── scopenode-rpc/          # Servers
+│       └── src/
+│           ├── server.rs       # eth_getLogs, eth_blockNumber, eth_chainId
+│           └── rest.rs         # GET /events, /status, /contracts, /abi/:address
+```
 
 ---
 
 ## Key dependencies
 
 | Crate | Purpose |
-|---|---|
-| `alloy` | Ethereum types, RLP, provider traits |
+|-------|---------|
+| `alloy` | Ethereum types, RLP, EIP-2718 encoding |
 | `alloy-dyn-abi` | Runtime ABI decoding for arbitrary event logs |
 | `alloy-trie` | Merkle Patricia Trie (receipt root verification) |
-| `reth-network` | devp2p: discv4 discovery + RLPx transport |
-| `reth-eth-wire` | ETH wire protocol messages (GetBlockHeaders, GetReceipts) |
-| `sqlx` | Async SQLite with compile-time query checking |
+| `sqlx` | Async SQLite with WAL mode |
 | `jsonrpsee` | JSON-RPC 2.0 server |
+| `axum` | REST HTTP server |
 | `tokio` | Async runtime |
 | `clap` | CLI argument parsing |
 | `indicatif` | Progress bars |
+| `snap` | Snappy decompression for ERA1 entries |
+| `sha2` | SHA256 checksums for ERA1 file verification |
