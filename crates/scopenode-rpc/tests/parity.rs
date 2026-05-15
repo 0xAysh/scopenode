@@ -1,9 +1,5 @@
 //! Parity test: confirm GET /events and eth_getLogs return equivalent rows
 //! for the same filter.
-//!
-//! Both endpoints delegate to `query_events_for_filter`. This test seeds 3
-//! events into a temp DB (one with a distinct topic0), calls both endpoints
-//! independently, and asserts that the same rows come back.
 
 use alloy::rpc::types::Filter;
 use alloy_primitives::{address, Address};
@@ -12,7 +8,6 @@ use scopenode_rpc::{rest::build_rest_router, server::{EthApiImpl, EthApiServer}}
 use scopenode_storage::models::StoredEvent as StoredRow;
 use scopenode_storage::Db;
 use std::sync::atomic::{AtomicU32, Ordering};
-use tokio::sync::broadcast;
 use tower::ServiceExt;
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -51,11 +46,10 @@ fn make_row(block_number: i64, log_index: i64, topic0: &str) -> StoredRow {
         raw_topics:   format!("[\"{topic0}\"]"),
         raw_data:     "00".to_string(),
         decoded:      "{}".to_string(),
-        source:       "devp2p".to_string(),
+        source:       "era1".to_string(),
     }
 }
 
-/// Seed the DB with a contract row and 3 events (2 Transfer, 1 Swap).
 async fn seed(db: &Db) {
     db.upsert_contract(ADDR_STR, Some("USDC"), "[]")
         .await
@@ -68,12 +62,9 @@ async fn seed(db: &Db) {
     db.insert_events(&rows).await.unwrap();
 }
 
-/// Normalize hex to lowercase for stable comparison.
 fn norm(s: &str) -> String {
     s.to_lowercase()
 }
-
-// ── Row comparison helper ─────────────────────────────────────────────────────
 
 #[derive(Debug, Eq, PartialEq, PartialOrd, Ord)]
 struct Row {
@@ -84,9 +75,6 @@ struct Row {
     topic0:       String,
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
-/// Both endpoints return the same 3 rows for a plain contract filter.
 #[tokio::test]
 async fn parity_all_events_for_contract() {
     let (db, path) = open_test_db().await;
@@ -101,7 +89,6 @@ async fn parity_all_events_for_contract() {
     cleanup(&path);
 }
 
-/// Both endpoints return only the 2 Transfer rows when filtered by topic0.
 #[tokio::test]
 async fn parity_topic0_filter() {
     let (db, path) = open_test_db().await;
@@ -116,13 +103,8 @@ async fn parity_topic0_filter() {
     cleanup(&path);
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-/// Call EthApiImpl::get_logs directly with an address filter (and optional topic0).
 async fn get_rpc_rows(db: &Db, topic0: Option<&str>) -> Vec<Row> {
-    let (broadcast_tx, _) = broadcast::channel(8);
-    let (headers_tx, _) = broadcast::channel(8);
-    let api = EthApiImpl::new(db.clone(), broadcast_tx, headers_tx, Default::default());
+    let api = EthApiImpl::new(db.clone());
 
     let mut filter = Filter::new().address(ADDR);
     if let Some(t0) = topic0 {
@@ -149,10 +131,8 @@ async fn get_rpc_rows(db: &Db, topic0: Option<&str>) -> Vec<Row> {
     rows
 }
 
-/// Call GET /events via axum tower::ServiceExt::oneshot (no port binding).
 async fn get_rest_rows(db: &Db, topic0: Option<&str>) -> Vec<Row> {
-    let (broadcast_tx, _) = broadcast::channel(8);
-    let router = build_rest_router(db.clone(), broadcast_tx);
+    let router = build_rest_router(db.clone());
 
     let uri = if let Some(t0) = topic0 {
         format!("/events?contract={ADDR_STR}&topic0={t0}")

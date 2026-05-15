@@ -1,61 +1,40 @@
 //! REST API server at `:8546`.
 //!
-//! Provides a JSON HTTP API and a Server-Sent Events (SSE) stream so any app
-//! can consume indexed events without speaking Ethereum JSON-RPC.
-//!
 //! # Endpoints
 //!
 //! ```text
 //! GET /events
 //!       ?contract=0x...   — filter by contract address
 //!       &event=Swap       — filter by event name
-//!       &topic0=0xddf252… — filter by raw topic0 hash (alternative to ?event)
+//!       &topic0=0xddf252… — filter by raw topic0 hash
 //!       &fromBlock=N      — inclusive lower bound
 //!       &toBlock=N        — inclusive upper bound
-//!       &limit=100        — max rows (default 100, hard cap 10 000)
+//!       &limit=100        — max rows (default 100, hard cap 10_000)
 //!       &offset=0         — pagination offset
 //!
 //! GET /status            — block number, contract count, total event count
-//! GET /contracts         — list of indexed contracts with per-contract event counts
+//! GET /contracts         — indexed contracts with per-contract event counts
 //! GET /abi/:address      — raw ABI JSON for a contract
-//! GET /stream/events     — SSE: live events pushed as they are indexed
-//!       ?contract=0x...   — optional contract filter
-//!       &event=Swap       — optional event-name filter
 //! ```
-//!
-//! All endpoints support CORS (open by default).
-//! SSE subscribes to the live-sync broadcast channel — zero extra overhead.
 
-use std::convert::Infallible;
 use std::sync::Arc;
 
 use axum::{
     extract::{Path, Query, State},
-    response::{
-        sse::{Event, KeepAlive, Sse},
-        IntoResponse, Json,
-    },
+    response::{IntoResponse, Json},
     routing::get,
     Router,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::broadcast;
-use tokio_stream::{wrappers::BroadcastStream, Stream, StreamExt as _};
 use tower_http::cors::CorsLayer;
 use tracing::info;
 
-use scopenode_core::types::StoredEvent as LiveEvent;
 use scopenode_storage::Db;
-
-// ── Shared state ──────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 struct AppState {
     db: Db,
-    broadcast: broadcast::Sender<LiveEvent>,
 }
-
-// ── Query parameter types ─────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
 struct EventsQuery {
@@ -69,14 +48,6 @@ struct EventsQuery {
     limit: Option<usize>,
     offset: Option<u64>,
 }
-
-#[derive(Deserialize)]
-struct StreamQuery {
-    contract: Option<String>,
-    event: Option<String>,
-}
-
-// ── Response types ────────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
 struct EventResponse {
@@ -134,8 +105,6 @@ struct ContractsResponse {
     contracts: Vec<ContractResponse>,
 }
 
-// ── Route handlers ────────────────────────────────────────────────────────────
-
 async fn get_events(
     State(state): State<Arc<AppState>>,
     Query(q): Query<EventsQuery>,
@@ -156,6 +125,13 @@ async fn get_events(
         )
         .await
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if rows.len() >= 10_000 {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "result set exceeds 10,000 rows — narrow your filter (smaller block range or add address/topic filter)".into(),
+        ));
+    }
 
     let events: Vec<EventResponse> = rows.iter().map(EventResponse::from).collect();
     let count = events.len();
@@ -225,91 +201,28 @@ async fn get_abi(
     }
 }
 
-async fn stream_events(
-    State(state): State<Arc<AppState>>,
-    Query(q): Query<StreamQuery>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let rx = state.broadcast.subscribe();
-    let contract_filter = q.contract;
-    let event_filter = q.event;
-
-    let stream = BroadcastStream::new(rx).filter_map(move |result| {
-        let ev = result.ok()?; // swallow lagged errors — slow clients miss some events
-
-        if !sse_matches(&ev, contract_filter.as_deref(), event_filter.as_deref()) {
-            return None;
-        }
-
-        let addr = ev.contract.to_checksum(None);
-        let data = serde_json::json!({
-            "contract": addr,
-            "event_name": ev.event_name,
-            "block_number": ev.block_number,
-            "tx_hash": format!("{:?}", ev.tx_hash),
-            "log_index": ev.log_index,
-            "decoded": ev.decoded,
-        });
-
-        Some(Ok(Event::default().data(data.to_string())))
-    });
-
-    Sse::new(stream).keep_alive(KeepAlive::default())
-}
-
-// ── SSE filter helper ─────────────────────────────────────────────────────────
-
-/// Returns `true` when `ev` passes the optional contract and event-name filters.
-///
-/// Both comparisons are case-insensitive. An absent filter matches everything.
-fn sse_matches(ev: &LiveEvent, contract_filter: Option<&str>, event_filter: Option<&str>) -> bool {
-    let addr = ev.contract.to_checksum(None);
-    if let Some(c) = contract_filter {
-        if !addr.eq_ignore_ascii_case(c) {
-            return false;
-        }
-    }
-    if let Some(e) = event_filter {
-        if !ev.event_name.eq_ignore_ascii_case(e) {
-            return false;
-        }
-    }
-    true
-}
-
-// ── Server startup ────────────────────────────────────────────────────────────
-
 /// Build the REST API router without binding a port — used in integration tests.
 #[doc(hidden)]
-pub fn build_rest_router(db: Db, broadcast: broadcast::Sender<LiveEvent>) -> Router {
-    let state = Arc::new(AppState { db, broadcast });
+pub fn build_rest_router(db: Db) -> Router {
+    let state = Arc::new(AppState { db });
     Router::new()
         .route("/events", get(get_events))
         .route("/status", get(get_status))
         .route("/contracts", get(get_contracts))
         .route("/abi/:address", get(get_abi))
-        .route("/stream/events", get(stream_events))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
 
 /// Start the REST API server on `127.0.0.1:<port>`.
-///
-/// The server runs as a background tokio task for the process lifetime.
-/// `broadcast` is the live-sync event sender — the SSE endpoint subscribes
-/// to it so live events appear within one block (~12 s) of being indexed.
-pub async fn start_rest_server(
-    port: u16,
-    db: Db,
-    broadcast: broadcast::Sender<LiveEvent>,
-) -> anyhow::Result<()> {
-    let state = Arc::new(AppState { db, broadcast });
+pub async fn start_rest_server(port: u16, db: Db) -> anyhow::Result<()> {
+    let state = Arc::new(AppState { db });
 
     let router = Router::new()
         .route("/events", get(get_events))
         .route("/status", get(get_status))
         .route("/contracts", get(get_contracts))
         .route("/abi/:address", get(get_abi))
-        .route("/stream/events", get(stream_events))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -325,83 +238,4 @@ pub async fn start_rest_server(
     });
 
     Ok(())
-}
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use alloy_primitives::{Address, Bytes, B256};
-    use tokio::sync::broadcast;
-
-    fn make_event(contract: Address, event_name: &str) -> LiveEvent {
-        LiveEvent {
-            contract,
-            event_name: event_name.to_string(),
-            topic0: B256::ZERO,
-            block_number: 1,
-            block_hash: B256::ZERO,
-            tx_hash: B256::ZERO,
-            tx_index: 0,
-            log_index: 0,
-            raw_topics: vec![],
-            raw_data: Bytes::default(),
-            decoded: serde_json::json!({}),
-            source: "devp2p".to_string(),
-            timestamp: 0,
-        }
-    }
-
-    #[test]
-    fn sse_no_filter_passes_all() {
-        let addr: Address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".parse().unwrap();
-        let ev = make_event(addr, "Transfer");
-        assert!(sse_matches(&ev, None, None));
-    }
-
-    #[test]
-    fn sse_contract_filter_passes_matching() {
-        let addr: Address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".parse().unwrap();
-        let ev = make_event(addr, "Transfer");
-        assert!(sse_matches(&ev, Some(&addr.to_checksum(None)), None));
-    }
-
-    #[test]
-    fn sse_contract_filter_blocks_other_contract() {
-        let addr: Address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".parse().unwrap();
-        let other = "0x0000000000000000000000000000000000000001";
-        let ev = make_event(addr, "Transfer");
-        assert!(!sse_matches(&ev, Some(other), None));
-    }
-
-    #[test]
-    fn sse_event_filter_passes_matching_case_insensitive() {
-        let addr: Address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".parse().unwrap();
-        let ev = make_event(addr, "Transfer");
-        assert!(sse_matches(&ev, None, Some("transfer")));
-        assert!(sse_matches(&ev, None, Some("TRANSFER")));
-    }
-
-    #[test]
-    fn sse_event_filter_blocks_other_event() {
-        let addr: Address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".parse().unwrap();
-        let ev = make_event(addr, "Transfer");
-        assert!(!sse_matches(&ev, None, Some("Swap")));
-    }
-
-    /// Events sent on the broadcast channel are received by all active subscribers.
-    #[tokio::test]
-    async fn sse_broadcast_fan_out_reaches_all_receivers() {
-        let addr: Address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".parse().unwrap();
-        let (tx, mut rx1) = broadcast::channel::<LiveEvent>(8);
-        let mut rx2 = tx.subscribe();
-
-        tx.send(make_event(addr, "Transfer")).unwrap();
-
-        let e1 = rx1.recv().await.unwrap();
-        let e2 = rx2.recv().await.unwrap();
-        assert_eq!(e1.event_name, "Transfer");
-        assert_eq!(e2.event_name, "Transfer");
-    }
 }
