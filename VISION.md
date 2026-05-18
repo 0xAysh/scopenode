@@ -1,669 +1,431 @@
-# scopenode — Vision & Goals
+# scopenode — Vision
 
-## What this is
+## One-line vision
 
-A custom Ethereum node that sits between a light node and a full node.
+scopenode is a **local-first Ethereum data backend for early apps**.
 
-Not a full node (doesn't store all state, doesn't execute every transaction).
-Not a light node (doesn't blindly trust peers, doesn't rely on centralized RPCs).
-
-You tell it what you care about. It fetches exactly that from the Ethereum P2P
-network, proves it's real using cryptographic verification, and serves it locally
-at localhost:8545.
-
-Zero Infura. Zero Alchemy. Zero rate limits. Zero ongoing cost.
-Zero trust.
+It lets developers build and validate Ethereum apps without paying for RPC
+providers, running a full node, or committing to The Graph before they know the
+app deserves production-scale infrastructure.
 
 ---
 
-## The problem it solves
+## The core idea
 
-Developers who need Ethereum data have three options today:
+Most Ethereum apps do not need the whole chain on day one.
 
-1. Run a full node — 1TB+ storage, weeks to sync, expensive to maintain
-2. Use Infura/Alchemy — rate limits, costs money, you trust a third party,
-   their data can be wrong, they can go down
-3. Use The Graph — complex setup (AssemblyScript subgraphs), costs GRT tokens,
-   you trust decentralized indexers, takes hours to index
+They need a narrow slice of mainnet data:
 
-None of these are good for a solo dev or small team who just needs the events
-from one or two contracts to build their thing.
+- events from a few contracts
+- receipts for transactions they care about
+- blocks around those transactions
+- maybe live updates for the same scoped data
 
-scopenode is the fourth option:
+Today, developers usually reach for Infura, Alchemy, a full node, or The Graph
+immediately. That means cost, rate limits, setup complexity, and operational
+commitment before the product is even validated.
 
-- Specify what contracts and events you want in plain English
-- It syncs exactly that from the P2P network, verified trustlessly
-- Runs on your laptop
-- Takes minutes (for small/niche contracts) to hours (for Uniswap-scale)
-- Serves standard JSON-RPC on localhost:8545 — any Ethereum library works
-  without code changes
+scopenode gives them a fourth path:
 
----
-
-## Who it's for
-
-Small projects and solo developers who:
-- Want specific blockchain data (DeFi analytics, NFT tracking, DAO tooling, etc.)
-- Don't want to set up The Graph or pay for API keys
-- Don't want to run a full node
-- Want to just run one command and start building
-
-Example users:
-- DeFi dev who wants 2 years of Uniswap swap history for an analytics dashboard
-- NFT project tracking all mints and transfers for their collection
-- DAO building a governance history tool
-- Developer building a personal portfolio tracker
-- Academic researcher studying MEV or liquidity patterns
-- Security researcher monitoring specific contracts for anomalies
-- Anyone at a hackathon who needs blockchain data fast
-
----
-
-## How it works (the pipeline)
-
-### Input — TOML config
-
-Write a TOML config file describing what you want:
-
-```toml
-[node]
-port = 8545
-
-[[contracts]]
-name = "Uniswap V3 ETH/USDC"
-address = "0x8ad599c3A0ff1De082011EFDDc58f1908eb6e6D8"
-events = ["Swap", "Mint", "Burn"]
-from = "17000000"
-to = "17555000"
+```text
+Tell scopenode what your app cares about.
+It builds a local verified dataset.
+Your app queries localhost instead of a provider.
+When the app grows, graduate to provider-scale infra.
 ```
 
-### Step 1 — Header Sync
-
-Download block headers for the requested range from the Ethereum P2P network.
-Headers are verified trustlessly via the beacon chain sync committee — a set of
-512 validators that sign each block. No RPC provider needed.
-
-Each header contains:
-- `logsBloom` — a 2048-bit bloom filter fingerprinting every contract that
-  emitted an event in this block
-- `receiptsRoot` — a Merkle root that cryptographically commits to all receipts
-  in the block
-- `transactionsRoot` — same for transactions (used in wallet/EOA mode)
-
-Headers for 555,000 blocks ≈ 280MB. Fast to download.
-
-### Step 2 — Bloom Filter Scan
-
-The `logsBloom` in each header lets us ask: "did contract 0x8ad... emit anything
-in this block?" in microseconds, with no network call.
-
-We scan all downloaded headers locally. Output: a list of block hashes where
-our target contract *might* have emitted events. Pure CPU work.
-
-Bloom filters have false positives, never false negatives — we might fetch some
-blocks that turn out empty, but we never miss a block that matters.
-
-### Step 3 — Receipt Fetching (contract mode)
-
-For each block that passed the bloom scan, request full receipts from devp2p
-peers — full nodes on the main Ethereum P2P network via the ETH wire protocol
-(`GetReceipts` message).
-
-This is the slow step. A block's receipts contain the result of every
-transaction: gas used, success/fail, and every log (event) emitted.
-
-For wallet/EOA mode: fetch block bodies instead (the transaction list), look for
-transactions where `from` or `to` matches the target address.
-
-### Step 4 — Merkle Verification
-
-How do we know the peer didn't send us fake receipts?
-
-We verify them against the `receiptsRoot` in the block header (which came from
-the beacon chain — trustless).
-
-Process:
-1. Take all received receipts for a block
-2. RLP-encode each one
-3. Build a Merkle Patricia Trie from them
-4. Compute the trie root hash
-5. Assert: computed root == header.receiptsRoot
-
-If they match — the receipts are real, guaranteed by math. If they don't —
-discard, try a different peer.
-
-This is the core of why scopenode doesn't require trusting anyone.
-
-### Step 5 — Event Extraction
-
-Receipts verified. Now scan all logs inside them. Keep only:
-- Logs from the target contract address
-- With the requested event topic hash (keccak256 of the event signature)
-- Discard everything else
-
-### Step 6 — ABI Decoding + Storage
-
-Raw log data is ABI-encoded binary. Decode it using the ABI fetched from
-Sourcify into named, typed fields. Store in SQLite with full context
-(block number, tx hash, decoded fields).
-
-### Step 7 — JSON-RPC Server
-
-Serve a standard Ethereum JSON-RPC interface on localhost:8545.
-
-In-scope calls (contracts we've indexed): answered instantly from SQLite.
-Out-of-scope calls: could be proxied to a public endpoint in future.
-
-Any Ethereum library works without code changes:
-```js
-const logs = await client.getLogs({ address: "0x8ad...", event: swapAbi })
-// → answered from local SQLite, instant, free
-```
-
-### Step 8 — Live Sync
-
-After historical sync completes, continue watching for new blocks. For each new
-block: bloom scan → fetch receipts → verify → extract → store. Runs in the
-background forever.
+The goal is not to replace every RPC provider forever.
+The goal is to replace the provider calls an early app actually needs, while the
+app is still small enough to run from a local scoped dataset.
 
 ---
 
-## Architecture diagram
+## Product promise
 
+For configured scopes, scopenode should provide provider-like APIs backed by
+local verified Ethereum data.
+
+```text
+ERA1 historical files
+    + scoped indexing
+    + SQLite local storage
+    + JSON-RPC / REST APIs
+    + future P2P live tail
+    + future light-client validation
+    = local app data backend before provider scale
 ```
-TOML config
-         |
-         v
-   [Sourcify]  <-- fetch ABI once (event signatures, param types)
-         |
-         v
-+--------+--------+
-|   Header Sync   |  <-- Beacon sync committee (P2P, trustless)
-|   (all blocks   |
-|    in range)    |
-+--------+--------+
-         |
-         v
-+--------+--------+
-|  Bloom Scanner  |  <-- local CPU, milliseconds
-|  (find matches) |
-+--------+--------+
-         |
-         v
-+--------+--------+
-| Receipt Fetcher |  <-- devp2p (ETH wire protocol)
-|  (matching      |
-|   blocks only)  |
-+--------+--------+
-         |
-         v
-+--------+--------+
-| Merkle Verifier |  <-- receiptsRoot proof (trust nobody)
-|                 |
-+--------+--------+
-         |
-         v
-+--------+--------+
-|  Log Extractor  |  <-- filter + ABI decode
-|  + SQLite store |
-+--------+--------+
-         |
-         v
-+--------+--------+
-| JSON-RPC Server |  <-- localhost:8545
-|                 |
-+--------+--------+
-         |
-         v
-   your app (viem / ethers.js / web3.py / alloy / anything)
+
+The user experience should feel like:
+
+```text
+1. Define contracts/events/ranges my app needs
+2. Run scopenode sync
+3. Point my app at http://localhost:8545
+4. Build without paying for RPC infra
+5. Move to Alchemy/The Graph/custom infra only when scale justifies it
 ```
 
 ---
 
-## Developer Experience
+## What scopenode is
 
-The pipeline being correct is table stakes. The DX is what makes people
-actually use this instead of just signing up for Alchemy.
+scopenode is:
 
-### First-run experience
+- a scoped Ethereum data backend
+- a local verified event/receipt/block indexer
+- a provider-compatible development backend for early apps
+- a way to postpone infra spend until after product validation
+- a migration bridge from prototype to production infra
 
-Install is a single command:
-```bash
-cargo install scopenode
-```
+scopenode is not:
 
-Write a `config.toml` describing the contracts and events you want, then run:
-```bash
-scopenode sync config.toml
+- a full Ethereum node
+- a general archive-state database
+- a universal replacement for every RPC provider method
+- a tracing node
+- a promise that every Ethereum query can be answered locally for free
+
+---
+
+## Target users
+
+scopenode is for developers building Ethereum apps before scale.
+
+Examples:
+
+- a DeFi analytics dashboard for one or two pools
+- an NFT mint or holder dashboard
+- a DAO governance history page
+- a wallet/portfolio app for a known set of contracts
+- a hackathon project that needs real mainnet data
+- a researcher analyzing a bounded historical range
+- a security tool watching specific contracts
+
+The common pattern:
+
+```text
+The app needs real mainnet data,
+but not enough data or traffic to justify production infra yet.
 ```
 
 ---
 
-### CLI commands
+## The user journey
 
-```bash
-scopenode sync config.toml             # start sync (resumes if interrupted)
-scopenode sync config.toml --dry-run   # bloom scan only, no receipt fetch
-scopenode status                       # what's indexed, sync progress, peer count
-scopenode query [options]              # query local data from terminal
-scopenode export [options]             # export data to csv/json
-scopenode validate config.toml        # check config before committing to a sync
-scopenode abi 0x8ad599c3...            # show available events for a contract
-scopenode retry                        # retry blocks that failed receipt fetch
-scopenode doctor                       # diagnose connectivity, peer health, db integrity
+```text
+Idea / hackathon
+    ↓
+scopenode on laptop
+    ↓
+validated app with real users
+    ↓
+hosted scopenode or bigger local machine
+    ↓
+Alchemy / Infura / The Graph / custom indexer
 ```
+
+The value is not “never pay providers.”
+
+The value is:
+
+> Do not pay for provider-scale infrastructure before you know your app deserves
+> provider-scale infrastructure.
 
 ---
 
-### Dry run — know what you're getting into before you commit
+## Compatibility boundary
 
-```bash
-scopenode sync config.toml --dry-run
-```
+scopenode should be honest about what it can answer.
 
-Runs bloom scan across all headers in the range (fast, local, CPU only).
-No receipts fetched. Output:
+For any request, there are three possible outcomes:
 
-```
-Dry run complete for Uniswap V3 ETH/USDC (0x8ad599c3...)
-  Block range:     17000000 → 17555000 (555,000 blocks)
-  Bloom matches:   48,231 blocks (8.7% hit rate)
-  False positives: ~15% estimated (bloom filter)
-  Net fetches:     ~41,000 receipt fetches needed
-  Estimated time:  2.1 – 3.4 hours (devp2p, 4 peers)
-  Estimated events: unknown until fetched
+1. **Answered locally** — data is inside the verified local scope.
+2. **Rejected loudly** — data is outside local coverage or unsupported.
+3. **Optionally proxied** — in development mode, unsupported calls can be sent to
+   a configured provider.
 
-Start sync? [Y/n]
-```
+Silent partial data is never acceptable.
 
-This is the single most important DX feature. A user starting a 3-hour sync
-without knowing it's 3 hours is a user who closes the terminal and never comes back.
+A missing range, missing contract, unsupported method, or incomplete source must
+return an explicit error that tells the user what is missing and how to fix it.
 
 ---
 
-### Progress visibility during sync
+## Provider method strategy
 
-Not a spinner. Real numbers.
+scopenode should first replace provider calls that are naturally derived from
+blocks, transactions, receipts, and logs.
 
-```
-scopenode — Uniswap V3 ETH/USDC (0x8ad599c3...)
+### Tier 1 — core local backend
 
-Stage 1/3  Header sync      ████████████████████  555,000 / 555,000   done
-Stage 2/3  Bloom scan       ████████████████████  555,000 / 555,000   done (48,231 hits)
-Stage 3/3  Receipt fetch    ████████░░░░░░░░░░░░   21,847 / 41,000    53%
+These are the highest-value methods for early apps:
 
-Peers: 5 active  |  Speed: 14.2 receipts/sec  |  ETA: 1h 23m
-Events found so far: 12,439 Swap  |  844 Mint  |  601 Burn
-Failed blocks (pending retry): 3
-```
+- `eth_getLogs`
+- `eth_getTransactionReceipt`
+- `eth_getTransactionByHash`
+- `eth_getBlockByNumber`
+- `eth_getBlockByHash`
+- `eth_blockNumber`
+- `eth_chainId`
 
-Updates every second. On `--quiet`, only final summary. On `--verbose`, per-block logs.
+REST equivalents should exist for app backends and scripts:
 
----
+- `/events`
+- `/transactions`
+- `/receipts`
+- `/blocks`
+- `/contracts`
+- `/status`
 
-### Resumable sync — Ctrl+C safe
+### Tier 2 — compatibility helpers
 
-Sync progress is stored in SQLite. If interrupted:
+These improve app compatibility but must be scoped carefully:
 
-```bash
-^C
-Interrupted. Progress saved. Run `scopenode sync config.toml` to resume.
+- `eth_getCode` for configured contracts
+- limited/cached read models for common contract state
+- provider fallback mode for unsupported calls
+- export to CSV/JSON
+- migration tooling toward The Graph or provider-backed infra
 
-scopenode sync config.toml
-Resuming from block 17321847 (58% complete)...
-```
+### Tier 3 — later expansion
 
-Never restarts from zero. Bloom scan results are cached. Only un-fetched
-receipt blocks are retried.
+These are powerful but should not block initial validation:
 
----
-
-### `scopenode query` — use data without writing code
-
-```bash
-# print to terminal as table
-scopenode query --contract 0x8ad... --event Swap --limit 20
-
-# filter by decoded field
-scopenode query --contract 0x8ad... --event Swap --where "amount0 > 1000000"
-
-# output formats
-scopenode query --contract 0x8ad... --event Swap --output json
-scopenode query --contract 0x8ad... --event Swap --output csv > swaps.csv
-```
-
-Terminal table output:
-```
-block     tx_hash    sender      amount0      amount1      sqrtPrice...
-────────  ─────────  ──────────  ───────────  ───────────  ────────────
-17000021  0xabc...   0x123...    -1000000000  500000       1234567...
-17000034  0xdef...   0x456...    2000000000   -998000      1234621...
-...
-Showing 20 of 12,439 results
-```
-
-CSV and JSON output makes this immediately useful for data science / analytics
-workflows (pandas, dbt, etc.) without any code.
+- live P2P indexing
+- checkpoint/light-client validated headers
+- WebSocket subscriptions
+- safe/finalized/latest head policies
+- reorg handling
+- hosted scopenode
+- generalized state access
+- tracing APIs
 
 ---
 
-### HTTP REST API + SSE stream (alongside JSON-RPC)
+## Trust model
 
-JSON-RPC at `:8545` for Ethereum library compatibility (viem, ethers, web3.py).
+scopenode should be more trustworthy than a normal provider for the data it has
+verified locally.
 
-REST API at `:8546` for everything else:
+Historical path:
 
-```
-GET  /events?contract=0x8ad...&event=Swap&fromBlock=17000000&limit=100
-GET  /events?contract=0x8ad...&event=Swap&where=amount0>0&orderBy=block_number
-GET  /status                   → sync state, peer count, indexed contracts
-GET  /contracts                → list of all indexed contracts
-GET  /abi/0x8ad...             → ABI for a contract
-```
-
-Server-Sent Events for live streaming — no polling:
-
-```
-GET  /stream/events?contract=0x8ad...&event=Swap
-```
-
-```js
-const source = new EventSource('http://localhost:8546/stream/events?contract=0x8ad...')
-source.onmessage = (e) => console.log(JSON.parse(e.data))
-// fires in real-time as new events arrive
+```text
+ERA1 files
+    ↓
+headers + blooms + receipts
+    ↓
+receipt trie verification against receiptsRoot
+    ↓
+ABI decode
+    ↓
+SQLite
+    ↓
+JSON-RPC / REST
 ```
 
-This makes scopenode usable from any language (Python, Go, shell scripts) without
-an Ethereum library.
+Future live path:
+
+```text
+Ethereum P2P peers
+    ↓
+headers + block bodies + receipts
+    ↓
+light client validates canonical/safe/finalized headers
+    ↓
+receipt trie verifies logs against receiptsRoot
+    ↓
+local storage
+    ↓
+provider-like APIs
+```
+
+The light client verifies canonical headers.
+Receipt verification proves logs belong to those headers.
+Coverage tracking proves whether scopenode has enough local data to answer a
+query completely.
 
 ---
 
-### `scopenode status` — know what's indexed
+## Current MVP
 
+The current implementation is intentionally narrow:
+
+```text
+local ERA1 files → verified events → SQLite → JSON-RPC + REST
 ```
-scopenode status
 
-Contracts indexed:
-  Uniswap V3 ETH/USDC (0x8ad599c3...)
-    Events: Swap (12,439)  Mint (844)  Burn (601)
-    Range:  block 17000000 → 17555000 (fully synced)
-    Live:   watching (last block: 19001234, 3s ago)
-    DB:     142 MB
+Current strengths:
 
-  Aave V3 (0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2)
-    Events: Supply (3,211)  Withdraw (1,844)
-    Range:  block 16291127 → live
-    Status: syncing... (78% — ETA 42min)
+- no API keys
+- no provider dependency in the indexing path
+- local deterministic ERA1 input
+- bloom filtering
+- receipt decoding
+- receipt-root verification
+- ABI decoding
+- SQLite persistence
+- resumable/idempotent inserts
+- `eth_getLogs` for indexed scopes
+- REST `/events`, `/status`, `/contracts`, `/abi/:address`
 
-Node:  localhost:8545 (JSON-RPC)  |  localhost:8546 (REST)
-Peers: 6 devp2p peers
-DB:    /Users/you/.scopenode/data.db (286 MB)
-```
+Current limitations:
+
+- historical ERA1 only
+- no live P2P tail yet
+- no light-client validation yet
+- scoped data only
+- limited JSON-RPC method surface
+- incomplete `eth_getLogs` filter compatibility
+- rough first-run/config/fixture UX
+- no general Ethereum state support
+
+This is acceptable for the MVP, as long as the product promise remains scoped and
+coverage-aware.
 
 ---
 
-### `scopenode validate` — catch config errors before a long sync
+## Product principles
 
-```bash
-scopenode validate config.toml
+### 1. Scoped beats universal
 
-✓ Contract address format valid: 0x8ad599c3...
-✓ Proxy detected → using implementation ABI (0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640)
-✓ ABI fetched from Sourcify (4 events: Swap, Mint, Burn, Flash)
-✓ Requested events found in ABI: Swap ✓  Mint ✓  Burn ✓
-✓ Block range valid: 17000000 → 17555000
-✗ from_block 17000000 is before Uniswap V3 deploy (block 12369621) — range is valid but will return no events before 12369621
-! fallback_rpc not set — devp2p peer failures will leave blocks as pending_retry
+Do not try to become a full node first.
 
-Config looks good. Run `scopenode sync config.toml` to start.
-```
+Start with the data early apps actually need. Make that path excellent.
 
----
+### 2. Loud failure beats silent wrongness
 
-### `scopenode doctor` — diagnose issues
-
-```bash
-scopenode doctor
-
-devp2p connectivity
-  Peers discovered:   12
-  Peers responsive:   9 / 12
-  Receipt fetch test: ✓ (block 17000001, 340ms)
-
-Beacon chain
-  Sync committee:     current period, 432/512 validators signing
-  Latest header:      block 19001300
-
-Database
-  Path:               /Users/you/.scopenode/data.db
-  Size:               286 MB
-  Integrity:          ✓
-  Pending retry:      3 blocks
-
-Network
-  devp2p bootstrap:   ✓ connected
-  Sourcify API:       ✓ reachable
-  Fallback RPC:       not configured
-
-All systems operational.
-```
-
----
-
-### Good error messages — no cryptic hex dumps
+If scopenode cannot answer a query completely, it must say so.
 
 Bad:
-```
-Error: 0x00000000000000000000000000000000 != 0xabcdef1234...
-thread 'main' panicked at src/verify.rs:142
+
+```text
+return partial logs and hope nobody notices
 ```
 
 Good:
-```
-Verification failed for block 17000423.
-  Expected receiptsRoot: 0xabcdef...
-  Got from peer 192.168.1.4: 0x000000...
-  → Peer sent invalid data. Trying 2 more peers.
 
-[peer 192.168.1.7] Verification succeeded. Continuing.
+```text
+error: range 18,000,000–18,100,000 is not fully indexed
+missing coverage: 18,043,000–18,050,000
 ```
 
-Every error tells the user: what happened, why, and what scopenode is doing about it.
-If user action is required, say exactly what command to run.
+### 3. Provider-compatible where it matters
 
----
+Apps should be able to point common Ethereum libraries at:
 
-## vs alternatives
-
-| | scopenode | The Graph | Infura/Alchemy | Full node |
-|---|---|---|---|---|
-| Setup | One command | Subgraph in AssemblyScript, deploy | Sign up, get API key | Weeks to sync |
-| Trust | Cryptographically verified | Trust indexers | Trust the provider | Trustless |
-| Cost | Free | Pay GRT tokens | Rate limits / paid tiers | Hardware cost |
-| Data | Exactly what you specify | Full subgraph | Everything | Everything |
-| Latency | Local (instant) | External API | External API | Local |
-| Rate limits | None | Yes | Yes | None |
-
----
-
-## What we build in (rough order)
-
-Phase 1 - EraE-backed MVP:
-1. Local EraE source config - users point scopenode at historical execution data already on disk.
-2. Source coverage scan - build a manifest of files/chunks and covered block ranges.
-3. Loud incomplete-range failure - never silently index partial history by default.
-4. Header reading and continuity checks - store block number, hash, parent hash, bloom, roots, and timestamp.
-5. Bloom filter scan - find candidate blocks for configured contract address + event topic0 pairs.
-6. Receipt reading from EraE - read receipts only for candidate blocks.
-7. Merkle verification - rebuild receipt tries and compare against `receiptsRoot`.
-8. ABI decoding - decode matching logs using Sourcify or `abi_override`.
-9. SQLite storage layer - store verified raw log fields plus decoded JSON.
-10. Local serving - `eth_getLogs`, `eth_blockNumber`, `eth_chainId` over `localhost:8545`.
-11. Query safety - out-of-scope and incomplete ranges return explicit errors.
-12. New command language - `scopenode index`, `serve`, `status`, `query`, `validate`.
-
-Phase 2 - Source hardening and tooling:
-13. Persistent source manifest - source identity, coverage, integrity status, and scan times.
-14. Stronger verification - source/chunk boundaries, header continuity, receipt roots, and transaction roots when bodies are read.
-15. Coverage-aware status - show exactly which sources, scopes, and ranges are complete.
-16. `scopenode validate` - check source path, coverage, ABI, events, and ranges before indexing.
-17. `scopenode abi` - show available events, signatures, and topic0 hashes.
-18. Proxy ergonomics - explicit implementation-address support first; automatic detection only when local data can support it.
-19. `scopenode doctor` - diagnose source, DB, ABI cache, failed blocks, and serving readiness.
-20. `scopenode retry` - reprocess failed verification/decode work after source or config fixes.
-
-Phase 3 - Light client boundary and live/recent data:
-21. Beacon light client - provide finalized/safe/latest execution block identity.
-22. Head policy - reject indexing beyond `finalized`, `safe`, or `latest` according to config.
-23. Canonicality reporting - show indexed local head vs light-client head.
-24. Reorg handling - soft-invalidate orphaned events near the live/recent boundary.
-25. Optional recent/live source - devp2p, local execution node, Portal Network, or explicit RPC fallback as separate modes.
-26. Live subscriptions - stream indexed live events only when recent/live indexing is enabled.
-
-Phase 4 - Developer APIs and product polish:
-27. REST API at `:8546` - `/events`, `/status`, `/sources`, `/scopes`, `/contracts`, `/abi`.
-28. `eth_subscribe` WebSocket - live event and new-head subscriptions when live mode is active.
-29. `scopenode export` - stream verified indexed data to CSV or JSON.
-30. Shared coverage semantics - JSON-RPC, REST, query, and export all enforce the same indexed-range rules.
-31. Better first-run UX - clear errors, useful progress, `--json` automation output, and end-to-end docs.
-
----
-
-## Why Rust
-
-- Dominant language in the Ethereum client ecosystem (reth, lighthouse, alloy
-  are all Rust)
-- Performance matters for bloom scanning millions of headers
-- Memory safety matters when parsing untrusted binary data from P2P peers
-- Best ecosystem for Ethereum tooling — `alloy`, `helios`, `lighthouse`, `trin`
-  are all Rust and actively maintained
-
----
-
-## Libraries we use
-
-The goal is to ship a working, correct pipeline fast — not to reinvent the wheel.
-We use reliable, battle-tested libraries for all lower-level primitives.
-
-| Component | Library | Notes |
-|---|---|---|
-| Primitive types (B256, Address, U256) | `alloy-primitives` | Standard across the Rust Ethereum ecosystem |
-| RLP encoding/decoding | `alloy-rlp` | Used by reth, well-tested |
-| Block header / receipt types | `alloy` | Full Ethereum type system |
-| ABI decoding | `alloy-dyn-abi` / `alloy-sol-types` | Decode event logs into named fields |
-| Bloom filter | `alloy` (via `Header::logs_bloom`) | Already in the header type |
-| Merkle Patricia Trie | `alloy-trie` | Verify `receiptsRoot` proofs |
-| Beacon light client | `helios` | Trustless header sync via sync committee (live sync only) |
-| devp2p networking | `reth-network` + `reth-eth-wire` + `reth-discv4` | devp2p peer management + ETH wire protocol + peer discovery |
-| Keccak256 / BLS | `sha3`, `lighthouse` BLS crates | Never roll your own crypto |
-| SQLite | `sqlx` with `sqlite` feature | Async, compile-time checked queries |
-| JSON-RPC server | `jsonrpsee` | Standard in the Rust Ethereum ecosystem |
-| Async runtime | `tokio` | Standard |
-| CLI | `clap` | Argument parsing |
-| TUI progress | `indicatif` | Progress bars and spinners |
-
----
-
-## Reorg handling
-
-During live sync, every new block: assert `block.parent_hash == our_stored_tip`.
-
-If they don't match, a reorg has occurred:
-1. Walk back via `parent_hash` links until we find the common ancestor between
-   our chain and the new chain
-2. Mark all events from the forked blocks as `reorged = true` in SQLite
-   (soft delete — never hard delete, useful for debugging)
-3. Re-sync forward from the common ancestor on the new chain
-
-Post-Merge safety: anything older than 2 epochs (~12.8 minutes, 64 blocks) is
-finalized and cryptographically cannot be reorged. We only need to handle reorgs
-within the last 64 blocks during live sync.
-
-SQLite schema implication: every event row gets a `reorged BOOLEAN DEFAULT 0`
-column and a `block_hash TEXT` column so we can invalidate by block.
-
----
-
-## Proxy contract handling
-
-Many contracts are proxies (EIP-1967, EIP-1822, OpenZeppelin TransparentProxy).
-The proxy address is what emits events, but the ABI lives at the implementation.
-
-Detection:
-- Read EIP-1967 storage slot `0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc`
-  from the proxy address at any recent block
-- If non-zero, that 32-byte value (last 20 bytes) is the implementation address
-- Fetch the implementation's ABI from Sourcify instead
-
-Config override (for non-standard proxies or contracts not on Sourcify):
-```toml
-[[contracts]]
-address = "0x..."
-abi_override = "./abis/MyContract.json"   # local file, bypasses Sourcify
+```text
+http://localhost:8545
 ```
 
-Warn the user in the CLI when a proxy is detected and which implementation ABI
-is being used.
+and use familiar methods for supported scopes.
+
+### 4. Local-first, not local-only
+
+Strict local mode is important for trust and reproducibility.
+But development ergonomics may require optional provider fallback for unsupported
+calls.
+
+Both modes should be explicit.
+
+### 5. Migration is part of the product
+
+scopenode should help users leave when they outgrow it.
+
+A user graduating to The Graph, Alchemy, or custom infra is not failure. It means
+scopenode helped them validate the app cheaply.
 
 ---
 
-## Data source fallback chain
+## Roadmap
 
-devp2p peer availability is uneven for older historical data — non-archive
-nodes prune old receipts. We don't paper over this — we handle it with a
-layered fallback chain. Every source feeds into the same Merkle verification
-step.
+### Phase 1 — make the historical local MVP undeniable
 
-Strategy (tried in order per block):
-1. devp2p peers (mainnet full nodes, ETH wire protocol) — retry up to 3 different peers
-2. ERA1 archives — if `era1_dir` is configured and the block falls within a
-   locally available archive file
-3. `fallback_rpc` — if configured, used as last resort
-4. If all fail: log a warning, record the block as `pending_retry`
+Goal: one real app can replace provider-backed historical event reads with
+scopenode.
 
-### ERA1 archives
+- Fix config and fixture UX
+- Require real local ABI files or provide clear ABI setup
+- Add `scopenode status`
+- Add `scopenode validate`
+- Add `scopenode doctor`
+- Improve `eth_getLogs` compatibility:
+  - address arrays
+  - topic wildcards
+  - topic OR logic
+  - block tags where meaningful
+  - clear out-of-scope errors
+- Add coverage-aware query checks
+- Add a polished demo app using localhost JSON-RPC
+- Document the exact provider calls scopenode supports today
 
-ERA1 files are flat-file archives of historical Ethereum data published by the
-Ethereum Foundation. Each file covers ~8192 blocks and contains headers, block
-bodies, and receipts. The files are checksummed and available via HTTP mirrors,
-BitTorrent, and IPFS.
+### Phase 2 — expand provider-compatible local data
 
-ERA1 solves the biggest gap in devp2p coverage: old historical data. Non-archive
-devp2p peers prune old receipts, but an ERA1 file downloaded once covers that
-range forever. Fully offline after download, no peers needed.
+Goal: support the common non-state calls early apps need.
 
-Verification is identical: extract receipts from the ERA1 file, rebuild the
-Merkle Patricia Trie, check root against the header's `receiptsRoot`. Same
-math, different transport.
+- `eth_getTransactionReceipt`
+- `eth_getTransactionByHash`
+- `eth_getBlockByNumber`
+- `eth_getBlockByHash`
+- transaction/receipt/block REST endpoints
+- better SQLite indexes for app query patterns
+- export command for CSV/JSON
+- clear result caps and pagination
 
-```toml
-[node]
-port = 8545
-era1_dir = "~/.scopenode/era1"  # optional, local ERA1 archive directory
-fallback_rpc = "https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY"  # optional, last resort
-```
+### Phase 3 — source hardening
 
-Every receipt is tagged with its source: `source = "devp2p"`, `source = "era1"`,
-or `source = "rpc"`. The `scopenode status` output shows the breakdown:
+Goal: make local historical data trustworthy and diagnosable.
 
-```
-Sources: 38,412 blocks from devp2p (94%)  |  2,100 from ERA1 (5%)  |  419 from RPC (1%)
-```
+- ERA1 checksum verification
+- ERA1 hash-chain/continuity verification
+- persistent source manifest
+- incomplete-range detection
+- integrity status in `status` and REST
+- named errors for missing/corrupt/truncated sources
 
-The verification step (Merkle check) runs regardless of source — we verify
-everything. The goal: never silently miss events. Either verify + store, or
-loudly fail.
+### Phase 4 — live/recent data
+
+Goal: let scopenode continue past historical ERA1 coverage.
+
+- P2P header fetching
+- P2P receipt fetching
+- safe/finalized/latest head policy
+- light-client validation for canonical headers
+- receipt verification for live receipts
+- reorg handling near the live boundary
+- WebSocket subscriptions for scoped live events
+
+### Phase 5 — compatibility and migration
+
+Goal: make scopenode fit naturally into real app development.
+
+- optional provider fallback mode
+- strict local mode by default for verified data paths
+- unsupported-method diagnostics
+- SDK examples for viem, ethers, wagmi, Foundry/cast
+- migration docs:
+  - scopenode → Alchemy/Infura
+  - scopenode → The Graph
+  - scopenode → custom indexer
+- possible hosted scopenode offering
 
 ---
 
-## Goal
+## Success criteria
 
-Build a working, useful scoped Ethereum node as fast as possible using reliable
-libraries — while deeply understanding every aspect of what we're building.
+scopenode is working if a developer can say:
 
-We don't reinvent the wheel, but we never use something as a black box either.
-For every library we use, we understand what it's doing under the hood: why RLP
-encodes the way it does, how bloom filters work mathematically, what the beacon
-sync committee is actually signing, how Merkle Patricia Tries prove data integrity.
+```text
+I built my Ethereum app against real mainnet data without paying for an RPC
+provider, without running a full node, and without writing a subgraph.
 
-Ship the pipeline. Learn by doing. Use great tools. Understand everything.
+When the app got traction, I knew exactly which infra to graduate to.
+```
+
+The near-term success metric is not total chain coverage.
+
+The near-term success metric is:
+
+> Can one real app get the exact mainnet data it needs from scopenode faster and
+> cheaper than from a provider-backed script?
+
+If yes, the product is valid.

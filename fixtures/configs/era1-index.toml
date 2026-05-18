@@ -1,11 +1,8 @@
 [node]
 port = 8545
+rest_port = 8546
 data_dir = ".scopenode-era1-fixture"
-
-[source]
-kind = "era1"
-path = "fixtures/era1/mainnet"
-network = "mainnet"
+era_dir = "fixtures/era1/mainnet"
 
 # Uniswap V3 ETH/USDC pool — first full epoch of trading activity
 # Epoch 01510 covers blocks 12369920 → 12378111 (day 1-2 after launch)
@@ -16,3 +13,4 @@ address = "0x8ad599c3A0ff1De082011EFDDc58f1908eb6e6D8"
 events = ["Swap", "Mint", "Burn"]
 from_block = 12369920
 to_block = 12378111
+abi_override = "ABI_ALREADY_CACHED_IN_DB.json"
