@@ -33,4 +33,10 @@ pub enum Command {
         #[arg(long, default_value = "./config.toml")]
         config: PathBuf,
     },
+    /// Show indexed contracts, event counts, block range, and serving URLs
+    Status {
+        /// Path to config file
+        #[arg(long, default_value = "./config.toml")]
+        config: PathBuf,
+    },
 }

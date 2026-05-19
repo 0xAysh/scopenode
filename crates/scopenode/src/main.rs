@@ -30,6 +30,9 @@ async fn main() -> Result<()> {
         Command::Serve { config } => {
             commands::serve::execute(config).await?;
         }
+        Command::Status { config } => {
+            commands::status::execute(config).await?;
+        }
     }
 
     Ok(())

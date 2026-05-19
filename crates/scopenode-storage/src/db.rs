@@ -153,14 +153,58 @@ impl Db {
         struct Row {
             count: i64,
         }
-        let row = sqlx::query_as::<_, Row>(
-            r#"SELECT COUNT(*) as count FROM events WHERE contract = ?"#,
+        let row =
+            sqlx::query_as::<_, Row>(r#"SELECT COUNT(*) as count FROM events WHERE contract = ?"#)
+                .bind(contract)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| DbError::Query(e.to_string()))?;
+        Ok(row.count)
+    }
+
+    /// Return per-event-name counts for a contract.
+    pub async fn event_counts_for_contract(
+        &self,
+        contract: &str,
+    ) -> Result<Vec<(String, i64)>, DbError> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            event_name: String,
+            count: i64,
+        }
+        let rows = sqlx::query_as::<_, Row>(
+            r#"SELECT event_name, COUNT(*) as count
+               FROM events
+               WHERE contract = ?
+               GROUP BY event_name
+               ORDER BY event_name ASC"#,
         )
         .bind(contract)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DbError::Query(e.to_string()))?;
+
+        Ok(rows.into_iter().map(|r| (r.event_name, r.count)).collect())
+    }
+
+    /// Return the min/max block range for indexed events.
+    pub async fn indexed_block_range(&self) -> Result<Option<(u64, u64)>, DbError> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            min_num: Option<i64>,
+            max_num: Option<i64>,
+        }
+        let row = sqlx::query_as::<_, Row>(
+            "SELECT MIN(block_number) as min_num, MAX(block_number) as max_num FROM events",
+        )
         .fetch_one(&self.pool)
         .await
         .map_err(|e| DbError::Query(e.to_string()))?;
-        Ok(row.count)
+
+        Ok(match (row.min_num, row.max_num) {
+            (Some(min), Some(max)) => Some((min as u64, max as u64)),
+            _ => None,
+        })
     }
 
     // ─── Contracts ────────────────────────────────────────────────────────────
@@ -473,7 +517,9 @@ mod tests {
     async fn insert_and_count_events() {
         let (db, _guard) = open_test_db().await;
         let contract = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
-        db.upsert_contract(contract, Some("USDC"), "[]").await.unwrap();
+        db.upsert_contract(contract, Some("USDC"), "[]")
+            .await
+            .unwrap();
         let e = make_event(contract, 100, "0x1111", "0xaaaa", 0);
         db.insert_events(&[e]).await.unwrap();
         let count = db.count_events_for_contract(contract).await.unwrap();
@@ -593,7 +639,10 @@ mod tests {
         let err = sqlx::query("SELECT reorged FROM events LIMIT 1")
             .fetch_optional(&db.pool)
             .await;
-        assert!(err.is_err(), "reorged column should not exist after migration 005");
+        assert!(
+            err.is_err(),
+            "reorged column should not exist after migration 005"
+        );
     }
 
     #[tokio::test]
