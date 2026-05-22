@@ -110,6 +110,7 @@ async fn get_events(
     Query(q): Query<EventsQuery>,
 ) -> Result<Json<EventsResponse>, (axum::http::StatusCode, String)> {
     let limit = q.limit.unwrap_or(100).min(10_000);
+    let query_limit = if limit == 10_000 { 10_001 } else { limit };
     let offset = q.offset.unwrap_or(0);
 
     let rows = state
@@ -120,20 +121,20 @@ async fn get_events(
             q.topic0.as_deref(),
             q.from_block,
             q.to_block,
-            limit,
+            query_limit,
             offset,
         )
         .await
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    if rows.len() >= 10_000 {
+    if rows.len() > 10_000 {
         return Err((
             axum::http::StatusCode::BAD_REQUEST,
             "result set exceeds 10,000 rows — narrow your filter (smaller block range or add address/topic filter)".into(),
         ));
     }
 
-    let events: Vec<EventResponse> = rows.iter().map(EventResponse::from).collect();
+    let events: Vec<EventResponse> = rows.iter().take(limit).map(EventResponse::from).collect();
     let count = events.len();
     Ok(Json(EventsResponse { events, count }))
 }
@@ -145,7 +146,14 @@ async fn get_status(
         (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     };
     let (block_number, contract_count, event_count) = tokio::try_join!(
-        async { state.db.latest_block_number().await.map(|n| n.unwrap_or(0)).map_err(err) },
+        async {
+            state
+                .db
+                .latest_block_number()
+                .await
+                .map(|n| n.unwrap_or(0))
+                .map_err(err)
+        },
         async { state.db.count_contracts().await.map_err(err) },
         async { state.db.count_all_events().await.map_err(err) },
     )?;
@@ -226,8 +234,7 @@ pub async fn start_rest_server(port: u16, db: Db) -> anyhow::Result<()> {
         .layer(CorsLayer::permissive())
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
-        .await?;
+    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await?;
 
     info!(port, "REST server started at http://127.0.0.1:{port}");
 

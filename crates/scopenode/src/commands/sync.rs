@@ -3,10 +3,7 @@
 use anyhow::{Context, Result};
 use indicatif::{MultiProgress, ProgressDrawTarget};
 use scopenode_core::{
-    abi::AbiCache,
-    config::Config,
-    era_pipeline::run_era1_scope,
-    source::scan_era1_source,
+    abi::AbiCache, config::Config, era_pipeline::run_era1_scopes, source::scan_era1_source,
 };
 use scopenode_storage::Db;
 use std::path::PathBuf;
@@ -30,7 +27,12 @@ pub async fn run(config: Config, db: Db, dry_run: bool, quiet: bool) -> Result<(
     }
 
     // Compute union range across all contracts so scan only SHA256-hashes in-range files.
-    let union_from = config.contracts.iter().map(|c| c.from_block).min().unwrap_or(0);
+    let union_from = config
+        .contracts
+        .iter()
+        .map(|c| c.from_block)
+        .min()
+        .unwrap_or(0);
     let union_to = config
         .contracts
         .iter()
@@ -48,16 +50,15 @@ pub async fn run(config: Config, db: Db, dry_run: bool, quiet: bool) -> Result<(
 
     let mut abi_cache = AbiCache::new(db.clone());
 
-    for contract in &config.contracts {
-        if let Err(e) =
-            run_era1_scope(&scan.files, contract, &mut abi_cache, &db, &progress).await
-        {
-            eprintln!(
-                "scope failed for {}: {e}",
-                contract.name.as_deref().unwrap_or(&contract.address.to_string())
-            );
-        }
-    }
+    run_era1_scopes(
+        &scan.files,
+        &config.contracts,
+        &mut abi_cache,
+        &db,
+        &progress,
+    )
+    .await
+    .context("ERA1 sync failed")?;
 
     println!("sync complete — run `scopenode serve` to start JSON-RPC server");
     Ok(())

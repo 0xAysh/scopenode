@@ -122,10 +122,7 @@ impl AbiCache {
     /// Get the event ABIs for a contract, loading from SQLite cache or `abi_override`.
     ///
     /// Returns [`AbiError::AbiRequired`] if `abi_override` is not set.
-    pub async fn get_or_fetch(
-        &self,
-        contract: &ContractConfig,
-    ) -> Result<Vec<EventAbi>, AbiError> {
+    pub async fn get_or_fetch(&self, contract: &ContractConfig) -> Result<Vec<EventAbi>, AbiError> {
         let addr_str = contract.address.to_checksum(None);
 
         // Fast path: ABI already in SQLite from a previous run.
@@ -140,7 +137,7 @@ impl AbiCache {
         let override_path = contract
             .abi_override
             .as_ref()
-            .ok_or_else(|| AbiError::AbiRequired(contract.address))?;
+            .ok_or(AbiError::AbiRequired(contract.address))?;
 
         let all_events = load_abi_override(override_path, contract.address)?;
 
@@ -218,15 +215,62 @@ fn filter_events(
     Ok(result)
 }
 
+/// Precomputed decode metadata for one Solidity event.
+struct CompiledEvent {
+    name: String,
+    indexed_inputs: Vec<EventInput>,
+    non_indexed_inputs: Vec<EventInput>,
+    non_indexed_tuple_type: Option<DynSolType>,
+}
+
+impl CompiledEvent {
+    fn new(event: &EventAbi) -> Result<Self, AbiError> {
+        let indexed_inputs = event
+            .inputs
+            .iter()
+            .filter(|input| input.indexed)
+            .cloned()
+            .collect();
+        let non_indexed_inputs: Vec<EventInput> = event
+            .inputs
+            .iter()
+            .filter(|input| !input.indexed)
+            .cloned()
+            .collect();
+
+        let non_indexed_tuple_type = if non_indexed_inputs.is_empty() {
+            None
+        } else {
+            let sol_types: Result<Vec<DynSolType>, _> = non_indexed_inputs
+                .iter()
+                .map(|input| input.ty.parse::<DynSolType>())
+                .collect();
+            Some(DynSolType::Tuple(sol_types.map_err(
+                |e: alloy_dyn_abi::Error| AbiError::Decode(e.to_string()),
+            )?))
+        };
+
+        Ok(Self {
+            name: event.name.clone(),
+            indexed_inputs,
+            non_indexed_inputs,
+            non_indexed_tuple_type,
+        })
+    }
+}
+
 /// Decodes raw Ethereum log data into named [`StoredEvent`] values.
 pub struct EventDecoder {
-    events: HashMap<B256, EventAbi>,
+    events: HashMap<B256, CompiledEvent>,
     contract: Address,
 }
 
 impl EventDecoder {
     pub fn new(events: &[EventAbi], contract: Address) -> Result<Self, AbiError> {
-        let map = events.iter().map(|e| (e.topic0(), e.clone())).collect();
+        let mut map = HashMap::new();
+        for event in events {
+            map.insert(event.topic0(), CompiledEvent::new(event)?);
+        }
         Ok(Self {
             events: map,
             contract,
@@ -289,13 +333,10 @@ impl EventDecoder {
         results
     }
 
-    fn decode_log(&self, abi: &EventAbi, topics: &[B256], data: &[u8]) -> Value {
+    fn decode_log(&self, event: &CompiledEvent, topics: &[B256], data: &[u8]) -> Value {
         let mut obj = serde_json::Map::new();
 
-        let indexed_inputs: Vec<&EventInput> = abi.inputs.iter().filter(|i| i.indexed).collect();
-        let non_indexed_inputs: Vec<&EventInput> = abi.inputs.iter().filter(|i| !i.indexed).collect();
-
-        for (i, input) in indexed_inputs.iter().enumerate() {
+        for (i, input) in event.indexed_inputs.iter().enumerate() {
             let topic_idx = i + 1;
             if topic_idx >= topics.len() {
                 break;
@@ -304,24 +345,22 @@ impl EventDecoder {
             obj.insert(input.name.clone(), value);
         }
 
-        if !non_indexed_inputs.is_empty() && !data.is_empty() {
-            let types: Vec<String> = non_indexed_inputs.iter().map(|i| i.ty.clone()).collect();
-            match decode_abi_data(&types, data) {
-                Ok(values) => {
-                    for (input, value) in non_indexed_inputs.iter().zip(values.iter()) {
-                        obj.insert(input.name.clone(), dyn_sol_value_to_json(value));
+        if let Some(tuple_type) = &event.non_indexed_tuple_type {
+            if !data.is_empty() {
+                match decode_precompiled_abi_data(tuple_type, data) {
+                    Ok(values) => {
+                        for (input, value) in event.non_indexed_inputs.iter().zip(values.iter()) {
+                            obj.insert(input.name.clone(), dyn_sol_value_to_json(value));
+                        }
                     }
-                }
-                Err(e) => {
-                    warn!(event = %abi.name, err = %e, "Failed to decode non-indexed params");
-                    obj.insert(
-                        "_decode_error".to_string(),
-                        Value::String(e.to_string()),
-                    );
-                    obj.insert(
-                        "_raw_data".to_string(),
-                        Value::String(alloy_primitives::hex::encode(data)),
-                    );
+                    Err(e) => {
+                        warn!(event = %event.name, err = %e, "Failed to decode non-indexed params");
+                        obj.insert("_decode_error".to_string(), Value::String(e.to_string()));
+                        obj.insert(
+                            "_raw_data".to_string(),
+                            Value::String(alloy_primitives::hex::encode(data)),
+                        );
+                    }
                 }
             }
         }
@@ -351,21 +390,17 @@ fn decode_indexed_param(ty: &str, topic: &B256) -> Value {
                 alloy_primitives::hex::encode(&topic.as_slice()[..size])
             ))
         }
-        _ => {
-            Value::String(format!("0x{}", alloy_primitives::hex::encode(topic.as_slice())))
-        }
+        _ => Value::String(format!(
+            "0x{}",
+            alloy_primitives::hex::encode(topic.as_slice())
+        )),
     }
 }
 
-fn decode_abi_data(types: &[String], data: &[u8]) -> Result<Vec<DynSolValue>, AbiError> {
-    let sol_types: Result<Vec<DynSolType>, _> = types
-        .iter()
-        .map(|t| t.parse::<DynSolType>())
-        .collect();
-
-    let sol_types = sol_types.map_err(|e: alloy_dyn_abi::Error| AbiError::Decode(e.to_string()))?;
-    let tuple_type = DynSolType::Tuple(sol_types);
-
+fn decode_precompiled_abi_data(
+    tuple_type: &DynSolType,
+    data: &[u8],
+) -> Result<Vec<DynSolValue>, AbiError> {
     let decoded = tuple_type
         .abi_decode(data)
         .map_err(|e| AbiError::Decode(e.to_string()))?;
@@ -385,9 +420,7 @@ fn dyn_sol_value_to_json(value: &DynSolValue) -> Value {
             Value::String(format!("0x{}", alloy_primitives::hex::encode(b.as_slice())))
         }
         DynSolValue::Address(a) => Value::String(a.to_checksum(None)),
-        DynSolValue::Bytes(b) => {
-            Value::String(format!("0x{}", alloy_primitives::hex::encode(b)))
-        }
+        DynSolValue::Bytes(b) => Value::String(format!("0x{}", alloy_primitives::hex::encode(b))),
         DynSolValue::String(s) => Value::String(s.clone()),
         DynSolValue::Array(arr) | DynSolValue::FixedArray(arr) => {
             Value::Array(arr.iter().map(dyn_sol_value_to_json).collect())
@@ -404,6 +437,26 @@ mod era1_tests {
     use super::*;
     use alloy_consensus::{Eip658Value, Receipt, ReceiptEnvelope, ReceiptWithBloom};
     use alloy_primitives::{address, keccak256, Bloom, Bytes, Log as PrimitiveLog, LogData, B256};
+
+    #[test]
+    fn event_decoder_rejects_invalid_non_indexed_type_at_construction() {
+        let contract = Address::repeat_byte(0x11);
+        let events = vec![EventAbi {
+            name: "Bad".to_string(),
+            inputs: vec![EventInput {
+                name: "broken".to_string(),
+                ty: "definitely_not_a_solidity_type".to_string(),
+                indexed: false,
+                components: vec![],
+            }],
+        }];
+
+        let err = match EventDecoder::new(&events, contract) {
+            Ok(_) => panic!("invalid type should fail when decoder is built"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("decode"));
+    }
 
     #[test]
     fn extract_and_decode_era1_finds_matching_log() {
@@ -434,20 +487,30 @@ mod era1_tests {
         let events = vec![EventAbi {
             name: "Transfer".into(),
             inputs: vec![
-                EventInput { name: "from".into(), ty: "address".into(), indexed: true, components: vec![] },
-                EventInput { name: "to".into(), ty: "address".into(), indexed: true, components: vec![] },
-                EventInput { name: "value".into(), ty: "uint256".into(), indexed: false, components: vec![] },
+                EventInput {
+                    name: "from".into(),
+                    ty: "address".into(),
+                    indexed: true,
+                    components: vec![],
+                },
+                EventInput {
+                    name: "to".into(),
+                    ty: "address".into(),
+                    indexed: true,
+                    components: vec![],
+                },
+                EventInput {
+                    name: "value".into(),
+                    ty: "uint256".into(),
+                    indexed: false,
+                    components: vec![],
+                },
             ],
         }];
 
         let decoder = EventDecoder::new(&events, contract).unwrap();
-        let stored = decoder.extract_and_decode_era1(
-            &receipts,
-            &tx_hashes,
-            100,
-            B256::ZERO,
-            1_000_000,
-        );
+        let stored =
+            decoder.extract_and_decode_era1(&receipts, &tx_hashes, 100, B256::ZERO, 1_000_000);
 
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].event_name, "Transfer");
@@ -472,29 +535,55 @@ mod tests {
     #[test]
     fn canonical_type_tuple_expands_components() {
         let components = vec![
-            EventInput { name: "a".into(), ty: "address".into(), indexed: false, components: vec![] },
-            EventInput { name: "b".into(), ty: "uint256".into(), indexed: false, components: vec![] },
+            EventInput {
+                name: "a".into(),
+                ty: "address".into(),
+                indexed: false,
+                components: vec![],
+            },
+            EventInput {
+                name: "b".into(),
+                ty: "uint256".into(),
+                indexed: false,
+                components: vec![],
+            },
         ];
         assert_eq!(canonical_type("tuple", &components), "(address,uint256)");
     }
 
     #[test]
     fn canonical_type_tuple_array_keeps_suffix() {
-        let components = vec![
-            EventInput { name: "x".into(), ty: "uint128".into(), indexed: false, components: vec![] },
-        ];
+        let components = vec![EventInput {
+            name: "x".into(),
+            ty: "uint128".into(),
+            indexed: false,
+            components: vec![],
+        }];
         assert_eq!(canonical_type("tuple[]", &components), "(uint128)[]");
         assert_eq!(canonical_type("tuple[3]", &components), "(uint128)[3]");
     }
 
     #[test]
     fn canonical_type_nested_tuple() {
-        let inner = vec![
-            EventInput { name: "y".into(), ty: "bool".into(), indexed: false, components: vec![] },
-        ];
+        let inner = vec![EventInput {
+            name: "y".into(),
+            ty: "bool".into(),
+            indexed: false,
+            components: vec![],
+        }];
         let outer = vec![
-            EventInput { name: "inner".into(), ty: "tuple".into(), indexed: false, components: inner },
-            EventInput { name: "z".into(), ty: "address".into(), indexed: false, components: vec![] },
+            EventInput {
+                name: "inner".into(),
+                ty: "tuple".into(),
+                indexed: false,
+                components: inner,
+            },
+            EventInput {
+                name: "z".into(),
+                ty: "address".into(),
+                indexed: false,
+                components: vec![],
+            },
         ];
         assert_eq!(canonical_type("tuple", &outer), "((bool),address)");
     }
@@ -537,7 +626,10 @@ mod tests {
     #[test]
     fn filter_events_unknown_name_returns_error() {
         let addr = Address::ZERO;
-        let all = vec![EventAbi { name: "Transfer".into(), inputs: vec![] }];
+        let all = vec![EventAbi {
+            name: "Transfer".into(),
+            inputs: vec![],
+        }];
         let result = filter_events(all, &["Transfer".to_string(), "Mint".to_string()], addr);
         assert!(matches!(result, Err(AbiError::EventNotFound(ref n, _)) if n == "Mint"));
     }
@@ -546,9 +638,18 @@ mod tests {
     fn filter_events_returns_only_requested() {
         let addr = Address::ZERO;
         let all = vec![
-            EventAbi { name: "Transfer".into(), inputs: vec![] },
-            EventAbi { name: "Approval".into(), inputs: vec![] },
-            EventAbi { name: "Mint".into(), inputs: vec![] },
+            EventAbi {
+                name: "Transfer".into(),
+                inputs: vec![],
+            },
+            EventAbi {
+                name: "Approval".into(),
+                inputs: vec![],
+            },
+            EventAbi {
+                name: "Mint".into(),
+                inputs: vec![],
+            },
         ];
         let result = filter_events(all, &["Transfer".to_string()], addr).unwrap();
         assert_eq!(result.len(), 1);
@@ -561,9 +662,24 @@ mod tests {
         let event = EventAbi {
             name: "Transfer".to_string(),
             inputs: vec![
-                EventInput { name: "from".to_string(), ty: "address".to_string(), indexed: true, components: vec![] },
-                EventInput { name: "to".to_string(), ty: "address".to_string(), indexed: true, components: vec![] },
-                EventInput { name: "value".to_string(), ty: "uint256".to_string(), indexed: false, components: vec![] },
+                EventInput {
+                    name: "from".to_string(),
+                    ty: "address".to_string(),
+                    indexed: true,
+                    components: vec![],
+                },
+                EventInput {
+                    name: "to".to_string(),
+                    ty: "address".to_string(),
+                    indexed: true,
+                    components: vec![],
+                },
+                EventInput {
+                    name: "value".to_string(),
+                    ty: "uint256".to_string(),
+                    indexed: false,
+                    components: vec![],
+                },
             ],
         };
         let sig = event.signature();
@@ -578,17 +694,55 @@ mod tests {
         let event = EventAbi {
             name: "Swap".to_string(),
             inputs: vec![
-                EventInput { name: "sender".to_string(), ty: "address".to_string(), indexed: true, components: vec![] },
-                EventInput { name: "recipient".to_string(), ty: "address".to_string(), indexed: true, components: vec![] },
-                EventInput { name: "amount0".to_string(), ty: "int256".to_string(), indexed: false, components: vec![] },
-                EventInput { name: "amount1".to_string(), ty: "int256".to_string(), indexed: false, components: vec![] },
-                EventInput { name: "sqrtPriceX96".to_string(), ty: "uint160".to_string(), indexed: false, components: vec![] },
-                EventInput { name: "liquidity".to_string(), ty: "uint128".to_string(), indexed: false, components: vec![] },
-                EventInput { name: "tick".to_string(), ty: "int24".to_string(), indexed: false, components: vec![] },
+                EventInput {
+                    name: "sender".to_string(),
+                    ty: "address".to_string(),
+                    indexed: true,
+                    components: vec![],
+                },
+                EventInput {
+                    name: "recipient".to_string(),
+                    ty: "address".to_string(),
+                    indexed: true,
+                    components: vec![],
+                },
+                EventInput {
+                    name: "amount0".to_string(),
+                    ty: "int256".to_string(),
+                    indexed: false,
+                    components: vec![],
+                },
+                EventInput {
+                    name: "amount1".to_string(),
+                    ty: "int256".to_string(),
+                    indexed: false,
+                    components: vec![],
+                },
+                EventInput {
+                    name: "sqrtPriceX96".to_string(),
+                    ty: "uint160".to_string(),
+                    indexed: false,
+                    components: vec![],
+                },
+                EventInput {
+                    name: "liquidity".to_string(),
+                    ty: "uint128".to_string(),
+                    indexed: false,
+                    components: vec![],
+                },
+                EventInput {
+                    name: "tick".to_string(),
+                    ty: "int24".to_string(),
+                    indexed: false,
+                    components: vec![],
+                },
             ],
         };
         let sig = event.signature();
-        assert_eq!(sig, "Swap(address,address,int256,int256,uint160,uint128,int24)");
+        assert_eq!(
+            sig,
+            "Swap(address,address,int256,int256,uint160,uint128,int24)"
+        );
         let expected = keccak256(b"Swap(address,address,int256,int256,uint160,uint128,int24)");
         assert_eq!(event.topic0(), expected);
     }

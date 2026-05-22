@@ -4,7 +4,10 @@
 use alloy::rpc::types::Filter;
 use alloy_primitives::{address, Address};
 use axum::body::Body;
-use scopenode_rpc::{rest::build_rest_router, server::{EthApiImpl, EthApiServer}};
+use scopenode_rpc::{
+    rest::build_rest_router,
+    server::{EthApiImpl, EthApiServer},
+};
 use scopenode_storage::models::StoredEvent as StoredRow;
 use scopenode_storage::Db;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -14,8 +17,8 @@ static COUNTER: AtomicU32 = AtomicU32::new(0);
 
 async fn open_test_db() -> (Db, std::path::PathBuf) {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir()
-        .join(format!("scopenode_parity_{}_{}.db", std::process::id(), n));
+    let path =
+        std::env::temp_dir().join(format!("scopenode_parity_{}_{}.db", std::process::id(), n));
     let db = Db::open(path.clone()).await.unwrap();
     (db, path)
 }
@@ -28,25 +31,28 @@ fn cleanup(path: &std::path::Path) {
 
 const ADDR: Address = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
 const ADDR_STR: &str = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
-const TOPIC0_TRANSFER: &str =
-    "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
-const TOPIC0_SWAP: &str =
-    "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67";
+const TOPIC0_TRANSFER: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+const TOPIC0_SWAP: &str = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67";
 
 fn make_row(block_number: i64, log_index: i64, topic0: &str) -> StoredRow {
     StoredRow {
-        contract:     ADDR_STR.to_string(),
-        event_name:   if topic0 == TOPIC0_TRANSFER { "Transfer" } else { "Swap" }.to_string(),
-        topic0:       topic0.to_string(),
+        contract: ADDR_STR.to_string(),
+        event_name: if topic0 == TOPIC0_TRANSFER {
+            "Transfer"
+        } else {
+            "Swap"
+        }
+        .to_string(),
+        topic0: topic0.to_string(),
         block_number,
-        block_hash:   format!("0x{:064x}", block_number),
-        tx_hash:      format!("0x{:064x}", log_index + 100),
-        tx_index:     0,
+        block_hash: format!("0x{:064x}", block_number),
+        tx_hash: format!("0x{:064x}", log_index + 100),
+        tx_index: 0,
         log_index,
-        raw_topics:   format!("[\"{topic0}\"]"),
-        raw_data:     "00".to_string(),
-        decoded:      "{}".to_string(),
-        source:       "era1".to_string(),
+        raw_topics: format!("[\"{topic0}\"]"),
+        raw_data: "00".to_string(),
+        decoded: "{}".to_string(),
+        source: "era1".to_string(),
     }
 }
 
@@ -68,11 +74,11 @@ fn norm(s: &str) -> String {
 
 #[derive(Debug, Eq, PartialEq, PartialOrd, Ord)]
 struct Row {
-    contract:     String,
+    contract: String,
     block_number: u64,
-    tx_hash:      String,
-    log_index:    u64,
-    topic0:       String,
+    tx_hash: String,
+    log_index: u64,
+    topic0: String,
 }
 
 #[tokio::test]
@@ -83,7 +89,10 @@ async fn parity_all_events_for_contract() {
     let rpc_rows = get_rpc_rows(&db, None).await;
     let rest_rows = get_rest_rows(&db, None).await;
 
-    assert_eq!(rpc_rows, rest_rows, "eth_getLogs and GET /events must return the same rows");
+    assert_eq!(
+        rpc_rows, rest_rows,
+        "eth_getLogs and GET /events must return the same rows"
+    );
     assert_eq!(rpc_rows.len(), 3);
 
     cleanup(&path);
@@ -117,14 +126,17 @@ async fn get_rpc_rows(db: &Db, topic0: Option<&str>) -> Vec<Row> {
     let mut rows: Vec<Row> = logs
         .iter()
         .map(|log| Row {
-            contract:     norm(&format!("{:?}", log.inner.address)),
+            contract: norm(&format!("{:?}", log.inner.address)),
             block_number: log.block_number.unwrap_or(0),
-            tx_hash:      norm(&format!("{:?}", log.transaction_hash.unwrap_or_default())),
-            log_index:    log.log_index.unwrap_or(0),
-            topic0:       log.inner.data.topics()
-                             .first()
-                             .map(|t| norm(&format!("{:?}", t)))
-                             .unwrap_or_default(),
+            tx_hash: norm(&format!("{:?}", log.transaction_hash.unwrap_or_default())),
+            log_index: log.log_index.unwrap_or(0),
+            topic0: log
+                .inner
+                .data
+                .topics()
+                .first()
+                .map(|t| norm(&format!("{:?}", t)))
+                .unwrap_or_default(),
         })
         .collect();
     rows.sort();
@@ -158,13 +170,94 @@ async fn get_rest_rows(db: &Db, topic0: Option<&str>) -> Vec<Row> {
         .unwrap()
         .iter()
         .map(|ev| Row {
-            contract:     norm(ev["contract"].as_str().unwrap_or("")),
+            contract: norm(ev["contract"].as_str().unwrap_or("")),
             block_number: ev["block_number"].as_i64().unwrap_or(0) as u64,
-            tx_hash:      norm(ev["tx_hash"].as_str().unwrap_or("")),
-            log_index:    ev["log_index"].as_i64().unwrap_or(0) as u64,
-            topic0:       norm(ev["topic0"].as_str().unwrap_or("")),
+            tx_hash: norm(ev["tx_hash"].as_str().unwrap_or("")),
+            log_index: ev["log_index"].as_i64().unwrap_or(0) as u64,
+            topic0: norm(ev["topic0"].as_str().unwrap_or("")),
         })
         .collect();
     rows.sort();
     rows
+}
+
+async fn seed_many(db: &Db, count: i64) {
+    db.upsert_contract(ADDR_STR, Some("USDC"), "[]")
+        .await
+        .unwrap();
+    let rows: Vec<_> = (0..count)
+        .map(|i| make_row(1_000 + i, 0, TOPIC0_TRANSFER))
+        .collect();
+    db.insert_events(&rows).await.unwrap();
+}
+
+#[tokio::test]
+async fn rest_allows_exactly_ten_thousand_events() {
+    let (db, path) = open_test_db().await;
+    seed_many(&db, 10_000).await;
+
+    let router = build_rest_router(db.clone());
+    let request = axum::http::Request::builder()
+        .uri(format!("/events?contract={ADDR_STR}&limit=10000"))
+        .body(Body::empty())
+        .unwrap();
+
+    let response = ServiceExt::<axum::http::Request<Body>>::oneshot(router, request)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(json["events"].as_array().unwrap().len(), 10_000);
+
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn rest_rejects_more_than_ten_thousand_events() {
+    let (db, path) = open_test_db().await;
+    seed_many(&db, 10_001).await;
+
+    let router = build_rest_router(db.clone());
+    let request = axum::http::Request::builder()
+        .uri(format!("/events?contract={ADDR_STR}&limit=10000"))
+        .body(Body::empty())
+        .unwrap();
+
+    let response = ServiceExt::<axum::http::Request<Body>>::oneshot(router, request)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn rpc_allows_exactly_ten_thousand_logs() {
+    let (db, path) = open_test_db().await;
+    seed_many(&db, 10_000).await;
+
+    let rows = get_rpc_rows(&db, Some(TOPIC0_TRANSFER)).await;
+    assert_eq!(rows.len(), 10_000);
+
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn rpc_rejects_more_than_ten_thousand_logs() {
+    let (db, path) = open_test_db().await;
+    seed_many(&db, 10_001).await;
+
+    let api = EthApiImpl::new(db.clone());
+    let hash: alloy_primitives::B256 = TOPIC0_TRANSFER.parse().unwrap();
+    let filter = Filter::new().address(ADDR).event_signature(hash);
+    let err = EthApiServer::get_logs(&api, filter).await.unwrap_err();
+    assert_eq!(
+        err.code(),
+        jsonrpsee::types::error::ErrorCode::ServerError(-32005).code()
+    );
+
+    cleanup(&path);
 }

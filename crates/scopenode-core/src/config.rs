@@ -171,10 +171,7 @@ impl<'de> serde::de::Visitor<'de> for OptBlockVisitor {
     type Value = Option<u64>;
 
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "a block number, shorthand like \"16M\", or absent/null"
-        )
+        write!(f, "a block number, shorthand like \"16M\", or absent/null")
     }
 
     fn visit_none<E: serde::de::Error>(self) -> Result<Option<u64>, E> {

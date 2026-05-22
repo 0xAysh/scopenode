@@ -65,8 +65,7 @@ impl BloomScanner {
             // If not, this target can't match — skip to the next target.
             // Checking address first is a cheap early exit since a block can only
             // contain our contract's logs if the address is in the bloom.
-            let address_present =
-                bloom.contains_input(BloomInput::Raw(&target.address_bytes));
+            let address_present = bloom.contains_input(BloomInput::Raw(&target.address_bytes));
             if !address_present {
                 continue;
             }
