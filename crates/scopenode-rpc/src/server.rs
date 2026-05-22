@@ -86,13 +86,13 @@ impl EthApiServer for EthApiImpl {
                 topic0_str.as_deref(),
                 from_block,
                 to_block,
-                10_000,
+                10_001,
                 0,
             )
             .await
             .map_err(|e| internal_error(&e.to_string()))?;
 
-        if rows.len() >= 10_000 {
+        if rows.len() > 10_000 {
             return Err(ErrorObject::owned(
                 -32005,
                 "result set exceeds 10,000 rows — narrow your filter (smaller block range or add address/topic filter)",
@@ -102,6 +102,7 @@ impl EthApiServer for EthApiImpl {
 
         let logs = rows
             .into_iter()
+            .take(10_000)
             .filter_map(|row| row_to_log(&row))
             .collect();
 
@@ -184,7 +185,8 @@ mod tests {
             tx_hash: format!("0x{:064x}", 1),
             tx_index: 0,
             log_index: 0,
-            raw_topics: "[\"0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef\"]".into(),
+            raw_topics: "[\"0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef\"]"
+                .into(),
             raw_data: "00".into(),
             decoded: "{}".into(),
             source: "era1".into(),

@@ -34,9 +34,7 @@ fn load_block() -> Option<Bloom> {
 
 fn skip_if_missing() -> bool {
     if !std::path::Path::new(BLOCK_JSON).exists() {
-        eprintln!(
-            "\n[fixture_verify] Fixtures not found — skipping real-data tests.\n"
-        );
+        eprintln!("\n[fixture_verify] Fixtures not found — skipping real-data tests.\n");
         return true;
     }
     false

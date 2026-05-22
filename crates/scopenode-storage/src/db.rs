@@ -13,7 +13,7 @@
 
 use crate::error::DbError;
 use crate::models::{ContractRow, StoredEvent};
-use sqlx::SqlitePool;
+use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 use std::path::PathBuf;
 use tracing::info;
 
@@ -69,28 +69,34 @@ impl Db {
             .await
             .map_err(|e| DbError::Query(e.to_string()))?;
 
-        for e in events {
-            sqlx::query(
-                r#"INSERT OR IGNORE INTO events
-                   (contract, event_name, topic0, block_number, block_hash,
-                    tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
-            )
-            .bind(&e.contract)
-            .bind(&e.event_name)
-            .bind(&e.topic0)
-            .bind(e.block_number)
-            .bind(&e.block_hash)
-            .bind(&e.tx_hash)
-            .bind(e.tx_index)
-            .bind(e.log_index)
-            .bind(&e.raw_topics)
-            .bind(&e.raw_data)
-            .bind(&e.decoded)
-            .bind(&e.source)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| DbError::Query(e.to_string()))?;
+        // SQLite has a finite bind-parameter limit. Each event uses 12 binds,
+        // so chunking keeps bulk inserts comfortably under common limits while
+        // still avoiding one statement per row.
+        for chunk in events.chunks(500) {
+            let mut builder: QueryBuilder<Sqlite> = QueryBuilder::new(
+                "INSERT OR IGNORE INTO events \
+                 (contract, event_name, topic0, block_number, block_hash, \
+                  tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source) ",
+            );
+            builder.push_values(chunk, |mut row, e| {
+                row.push_bind(&e.contract)
+                    .push_bind(&e.event_name)
+                    .push_bind(&e.topic0)
+                    .push_bind(e.block_number)
+                    .push_bind(&e.block_hash)
+                    .push_bind(&e.tx_hash)
+                    .push_bind(e.tx_index)
+                    .push_bind(e.log_index)
+                    .push_bind(&e.raw_topics)
+                    .push_bind(&e.raw_data)
+                    .push_bind(&e.decoded)
+                    .push_bind(&e.source);
+            });
+            builder
+                .build()
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| DbError::Query(e.to_string()))?;
         }
 
         tx.commit()
@@ -379,33 +385,7 @@ impl Db {
         let from = from_block.unwrap_or(0) as i64;
         let to = to_block.map(|b| b as i64).unwrap_or(i64::MAX);
 
-        let mut conditions: Vec<&str> = Vec::new();
-        if contract.is_some() {
-            conditions.push("contract = ?");
-        }
-        if event_name.is_some() {
-            conditions.push("event_name = ?");
-        }
-        if topic0.is_some() {
-            conditions.push("topic0 = ?");
-        }
-        conditions.extend(["block_number >= ?", "block_number <= ?"]);
-
-        let where_clause = if conditions.is_empty() {
-            "1=1".to_string()
-        } else {
-            conditions.join(" AND ")
-        };
-
-        let sql = format!(
-            "SELECT contract, event_name, topic0, block_number, block_hash, \
-             tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source \
-             FROM events WHERE {} \
-             ORDER BY block_number ASC, log_index ASC",
-            where_clause
-        );
-
-        let sql: &'static str = Box::leak(sql.into_boxed_str());
+        let sql = stream_events_sql(contract.is_some(), event_name.is_some(), topic0.is_some());
         let mut q = sqlx::query_as::<_, StoredEvent>(sql);
         if let Some(c) = contract {
             q = q.bind(c);
@@ -447,6 +427,59 @@ impl Db {
         .await
         .map_err(|e| DbError::Query(e.to_string()))?;
         Ok(row.size as u64)
+    }
+}
+
+fn stream_events_sql(has_contract: bool, has_event_name: bool, has_topic0: bool) -> &'static str {
+    match (has_contract, has_event_name, has_topic0) {
+        (false, false, false) => concat!(
+            "SELECT contract, event_name, topic0, block_number, block_hash, \
+             tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source \
+             FROM events WHERE block_number >= ? AND block_number <= ?",
+            " ORDER BY block_number ASC, log_index ASC"
+        ),
+        (true, false, false) => concat!(
+            "SELECT contract, event_name, topic0, block_number, block_hash, \
+             tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source \
+             FROM events WHERE contract = ? AND block_number >= ? AND block_number <= ?",
+            " ORDER BY block_number ASC, log_index ASC"
+        ),
+        (false, true, false) => concat!(
+            "SELECT contract, event_name, topic0, block_number, block_hash, \
+             tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source \
+             FROM events WHERE event_name = ? AND block_number >= ? AND block_number <= ?",
+            " ORDER BY block_number ASC, log_index ASC"
+        ),
+        (false, false, true) => concat!(
+            "SELECT contract, event_name, topic0, block_number, block_hash, \
+             tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source \
+             FROM events WHERE topic0 = ? AND block_number >= ? AND block_number <= ?",
+            " ORDER BY block_number ASC, log_index ASC"
+        ),
+        (true, true, false) => concat!(
+            "SELECT contract, event_name, topic0, block_number, block_hash, \
+             tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source \
+             FROM events WHERE contract = ? AND event_name = ? AND block_number >= ? AND block_number <= ?",
+            " ORDER BY block_number ASC, log_index ASC"
+        ),
+        (true, false, true) => concat!(
+            "SELECT contract, event_name, topic0, block_number, block_hash, \
+             tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source \
+             FROM events WHERE contract = ? AND topic0 = ? AND block_number >= ? AND block_number <= ?",
+            " ORDER BY block_number ASC, log_index ASC"
+        ),
+        (false, true, true) => concat!(
+            "SELECT contract, event_name, topic0, block_number, block_hash, \
+             tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source \
+             FROM events WHERE event_name = ? AND topic0 = ? AND block_number >= ? AND block_number <= ?",
+            " ORDER BY block_number ASC, log_index ASC"
+        ),
+        (true, true, true) => concat!(
+            "SELECT contract, event_name, topic0, block_number, block_hash, \
+             tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source \
+             FROM events WHERE contract = ? AND event_name = ? AND topic0 = ? AND block_number >= ? AND block_number <= ?",
+            " ORDER BY block_number ASC, log_index ASC"
+        ),
     }
 }
 
@@ -532,7 +565,7 @@ mod tests {
         let contract = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
         db.upsert_contract(contract, None, "[]").await.unwrap();
         let e = make_event(contract, 100, "0x1111", "0xaaaa", 0);
-        db.insert_events(&[e.clone()]).await.unwrap();
+        db.insert_events(std::slice::from_ref(&e)).await.unwrap();
         db.insert_events(&[e]).await.unwrap();
         let count = db.count_events_for_contract(contract).await.unwrap();
         assert_eq!(count, 1);
@@ -642,6 +675,30 @@ mod tests {
         assert!(
             err.is_err(),
             "reorged column should not exist after migration 005"
+        );
+    }
+
+    #[tokio::test]
+    async fn index_shape_covers_contract_topic0_block_log() {
+        let (db, _guard) = open_test_db().await;
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            sql: Option<String>,
+        }
+        let row = sqlx::query_as::<_, Row>(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_events_contract_topic_block_log'",
+        )
+        .fetch_optional(&db.pool)
+        .await
+        .unwrap();
+
+        let index_sql = row.and_then(|r| r.sql).unwrap_or_default().to_lowercase();
+        assert!(
+            index_sql.contains("contract")
+                && index_sql.contains("topic0")
+                && index_sql.contains("block_number")
+                && index_sql.contains("log_index"),
+            "idx_events_contract_topic_block_log must cover JSON-RPC lookup shape, got: {index_sql}"
         );
     }
 

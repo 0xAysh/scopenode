@@ -206,8 +206,14 @@ pub fn scan_era1_source(
             continue;
         }
 
-        // Only SHA256 files that are in range.
-        let sha256 = sha256_file(&file_path)?;
+        // Only hash files when a checksum index is present. Hashing large ERA1
+        // archives is expensive startup work and adds no value when there is
+        // nothing to verify against.
+        let sha256 = if checksum_index.available {
+            sha256_file(&file_path)?
+        } else {
+            String::new()
+        };
 
         let filename = file_path
             .file_name()
@@ -508,7 +514,9 @@ pub fn decode_era1_receipts(
     Ok(receipts)
 }
 
-pub fn decode_era1_tx_hashes(compressed: &[u8]) -> Result<Vec<alloy_primitives::B256>, SourceError> {
+pub fn decode_era1_tx_hashes(
+    compressed: &[u8],
+) -> Result<Vec<alloy_primitives::B256>, SourceError> {
     let mut raw = Vec::new();
     FrameDecoder::new(compressed)
         .read_to_end(&mut raw)
@@ -520,7 +528,9 @@ pub fn decode_era1_tx_hashes(compressed: &[u8]) -> Result<Vec<alloy_primitives::
     let body_header = alloy_rlp::Header::decode(&mut slice)
         .map_err(|e| SourceError::InvalidEra1Header(e.to_string()))?;
     if !body_header.list {
-        return Err(SourceError::InvalidEra1Header("body is not an RLP list".into()));
+        return Err(SourceError::InvalidEra1Header(
+            "body is not an RLP list".into(),
+        ));
     }
 
     // Transactions list header
@@ -888,6 +898,18 @@ mod tests {
     }
 
     #[test]
+    fn scan_without_checksum_index_skips_sha256_hashing() {
+        let dir = tempdir().unwrap();
+        let era1 = dir.path().join("mainnet-00000-deadbeef.era1");
+        fs::write(&era1, synthetic_era1_with_block_index(0, &[10])).unwrap();
+
+        let scan = scan_era1_source(dir.path(), None, 0, u64::MAX).unwrap();
+
+        assert_eq!(scan.files[0].checksum_status, ChecksumStatus::Unavailable);
+        assert_eq!(scan.files[0].sha256, "");
+    }
+
+    #[test]
     fn ignores_unrelated_files() {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("notes.txt"), "ignore me").unwrap();
@@ -1153,13 +1175,19 @@ mod tests {
         use std::io::Write;
 
         // RLP of [[],[]] — empty transactions list and empty uncles list
-        let empty = RlpHeader { list: true, payload_length: 0 };
+        let empty = RlpHeader {
+            list: true,
+            payload_length: 0,
+        };
         let mut txs = Vec::new();
         empty.encode(&mut txs);
         let mut uncles = Vec::new();
         empty.encode(&mut uncles);
         let body_payload = txs.len() + uncles.len();
-        let body_h = RlpHeader { list: true, payload_length: body_payload };
+        let body_h = RlpHeader {
+            list: true,
+            payload_length: body_payload,
+        };
         let mut body_buf = Vec::new();
         body_h.encode(&mut body_buf);
         body_buf.extend_from_slice(&txs);

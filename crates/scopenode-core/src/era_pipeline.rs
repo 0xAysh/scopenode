@@ -18,6 +18,47 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use scopenode_storage::Db;
 use tracing::warn;
 
+struct PreparedScope {
+    name: String,
+    from: u64,
+    to: u64,
+    targets: Vec<crate::types::BloomTarget>,
+    decoder: EventDecoder,
+}
+
+impl PreparedScope {
+    async fn new(contract: &ContractConfig, abi_cache: &mut AbiCache) -> Result<Self, CoreError> {
+        let events = abi_cache.get_or_fetch(contract).await?;
+        let topic0s: Vec<_> = events.iter().map(|e| e.topic0()).collect();
+        let targets = BloomScanner::build_targets(&topic0s, contract.address);
+        let decoder = EventDecoder::new(&events, contract.address)?;
+        let to = contract.to_block.ok_or_else(|| {
+            CoreError::Internal("ERA1 scope requires to_block — live sync not yet supported".into())
+        })?;
+
+        Ok(Self {
+            name: contract
+                .name
+                .clone()
+                .unwrap_or_else(|| contract.address.to_checksum(None)),
+            from: contract.from_block,
+            to,
+            targets,
+            decoder,
+        })
+    }
+
+    fn overlaps_file(&self, file: &SourceFileManifest) -> bool {
+        file.ranges
+            .iter()
+            .any(|r| r.to_block >= self.from && r.from_block <= self.to)
+    }
+
+    fn contains_block(&self, block_number: u64) -> bool {
+        block_number >= self.from && block_number <= self.to
+    }
+}
+
 /// Run the ERA1 indexing pipeline for one contract scope.
 ///
 /// `files` must be the manifest entries from the source scan. Only files whose
@@ -32,36 +73,52 @@ pub async fn run_era1_scope(
     db: &Db,
     progress: &MultiProgress,
 ) -> Result<(), CoreError> {
-    let events = abi_cache.get_or_fetch(contract).await?;
-    let topic0s: Vec<_> = events.iter().map(|e| e.topic0()).collect();
-    let targets = BloomScanner::build_targets(&topic0s, contract.address);
-    let decoder = EventDecoder::new(&events, contract.address)?;
+    run_era1_scopes(
+        files,
+        std::slice::from_ref(contract),
+        abi_cache,
+        db,
+        progress,
+    )
+    .await
+}
 
-    let from = contract.from_block;
-    let to = contract.to_block.ok_or_else(|| {
-        CoreError::Internal(
-            "ERA1 scope requires to_block — live sync not yet supported".into(),
-        )
-    })?;
+/// Run the ERA1 indexing pipeline for all configured contract scopes in one pass.
+///
+/// Files are scanned once. For each block, the header is decoded once, bloom
+/// matches are evaluated for all active scopes, and receipts/body data are
+/// decompressed and verified once when at least one scope might match.
+pub async fn run_era1_scopes(
+    files: &[SourceFileManifest],
+    contracts: &[ContractConfig],
+    abi_cache: &mut AbiCache,
+    db: &Db,
+    progress: &MultiProgress,
+) -> Result<(), CoreError> {
+    let mut scopes = Vec::new();
+    for contract in contracts {
+        match PreparedScope::new(contract, abi_cache).await {
+            Ok(scope) => scopes.push(scope),
+            Err(err) if contracts.len() == 1 => return Err(err),
+            Err(err) => {
+                warn!(contract = %contract.address, err = %err, "Skipping scope preparation failure")
+            }
+        }
+    }
 
-    // Only process files whose range overlaps the requested scope.
+    if scopes.is_empty() {
+        return Ok(());
+    }
+
     let covering: Vec<&SourceFileManifest> = files
         .iter()
-        .filter(|f| {
-            f.ranges
-                .iter()
-                .any(|r| r.to_block >= from && r.from_block <= to)
-        })
+        .filter(|file| scopes.iter().any(|scope| scope.overlaps_file(file)))
         .collect();
 
     let total_blocks: u64 = covering
         .iter()
         .flat_map(|f| &f.ranges)
-        .map(|r| {
-            let start = r.from_block.max(from);
-            let end = r.to_block.min(to);
-            if end >= start { end - start + 1 } else { 0 }
-        })
+        .map(|r| r.to_block.saturating_sub(r.from_block) + 1)
         .sum();
 
     let pb = progress.add(ProgressBar::new(total_blocks.max(1)));
@@ -74,9 +131,17 @@ pub async fn run_era1_scope(
     pb.set_message("scanning...");
 
     let mut total_events = 0usize;
-    let addr_str = contract.address.to_checksum(None);
 
     for file in &covering {
+        let active_scope_indices: Vec<usize> = scopes
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, scope)| scope.overlaps_file(file).then_some(idx))
+            .collect();
+        if active_scope_indices.is_empty() {
+            continue;
+        }
+
         let tuples = match iter_era1_block_tuples(&file.path) {
             Ok(it) => it,
             Err(e) => {
@@ -94,11 +159,16 @@ pub async fn run_era1_scope(
                 }
             };
 
-            if tuple.block_number < from || tuple.block_number > to {
+            pb.inc(1);
+
+            let matching_scope_indices_by_range: Vec<usize> = active_scope_indices
+                .iter()
+                .copied()
+                .filter(|idx| scopes[*idx].contains_block(tuple.block_number))
+                .collect();
+            if matching_scope_indices_by_range.is_empty() {
                 continue;
             }
-
-            pb.inc(1);
 
             let header = match decode_era1_header(&tuple.compressed_header) {
                 Ok(h) => h,
@@ -108,7 +178,11 @@ pub async fn run_era1_scope(
                 }
             };
 
-            if !BloomScanner::matches(&header.logs_bloom, &targets) {
+            let matching_scope_indices: Vec<usize> = matching_scope_indices_by_range
+                .into_iter()
+                .filter(|idx| BloomScanner::matches(&header.logs_bloom, &scopes[*idx].targets))
+                .collect();
+            if matching_scope_indices.is_empty() {
                 continue;
             }
 
@@ -126,28 +200,36 @@ pub async fn run_era1_scope(
             }
 
             let tx_hashes = decode_era1_tx_hashes(&tuple.compressed_body).unwrap_or_default();
+            let mut storage_events = Vec::new();
 
-            let core_events = decoder.extract_and_decode_era1(
-                &receipts,
-                &tx_hashes,
-                header.number,
-                header.hash,
-                header.timestamp,
-            );
+            for idx in matching_scope_indices {
+                let scope = &scopes[idx];
+                let core_events = scope.decoder.extract_and_decode_era1(
+                    &receipts,
+                    &tx_hashes,
+                    header.number,
+                    header.hash,
+                    header.timestamp,
+                );
+                storage_events.extend(core_events.iter().map(core_to_storage_event));
+            }
 
-            if !core_events.is_empty() {
-                let storage_events: Vec<_> =
-                    core_events.iter().map(core_to_storage_event).collect();
+            if !storage_events.is_empty() {
                 if let Err(e) = db.insert_events(&storage_events).await {
-                    warn!(block = header.number, contract = %addr_str, err = %e, "Event insert failed");
+                    warn!(block = header.number, err = %e, "Event insert failed");
                 } else {
-                    total_events += core_events.len();
+                    total_events += storage_events.len();
                 }
             }
         }
     }
 
-    pb.finish_with_message(format!("done ({total_events} events)"));
+    let scope_names = scopes
+        .iter()
+        .map(|scope| scope.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    pb.finish_with_message(format!("done ({total_events} events across {scope_names})"));
     Ok(())
 }
 

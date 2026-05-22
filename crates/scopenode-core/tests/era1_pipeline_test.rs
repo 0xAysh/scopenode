@@ -1,14 +1,14 @@
+use alloy::eips::eip2718::Encodable2718;
 use alloy_consensus::{Eip658Value, Header, Receipt, ReceiptEnvelope, ReceiptWithBloom};
 use alloy_primitives::{
     address, keccak256, Address, Bloom, BloomInput, Bytes, Log as PrimitiveLog, LogData, B256,
 };
 use alloy_rlp::{Encodable, Header as RlpHeader};
 use alloy_trie::{HashBuilder, Nibbles};
-use alloy::eips::eip2718::Encodable2718;
 use scopenode_core::{
     abi::AbiCache,
     config::{Config, ContractConfig, NodeConfig},
-    era_pipeline::run_era1_scope,
+    era_pipeline::{run_era1_scope, run_era1_scopes},
     source::{ChecksumStatus, RangeCompleteness, SourceFileManifest, SourceRangeManifest},
 };
 use scopenode_storage::Db;
@@ -59,6 +59,90 @@ fn rlp_encode_index(i: usize) -> Vec<u8> {
         out.extend_from_slice(trimmed);
         out
     }
+}
+
+fn build_synthetic_era1_with_logs(logs: Vec<PrimitiveLog>, bloom_inputs: Vec<Vec<u8>>) -> Vec<u8> {
+    let mut bloom = Bloom::default();
+    for input in bloom_inputs {
+        bloom.accrue(BloomInput::Raw(&input));
+    }
+
+    let receipt_body = ReceiptWithBloom::<Receipt<PrimitiveLog>> {
+        receipt: Receipt {
+            status: Eip658Value::Eip658(true),
+            cumulative_gas_used: 21_000,
+            logs,
+        },
+        logs_bloom: bloom,
+    };
+
+    let envelope = ReceiptEnvelope::<PrimitiveLog>::Legacy(receipt_body.clone());
+    let key = rlp_encode_index(0);
+    let mut value = Vec::new();
+    envelope.encode_2718(&mut value);
+    let mut hb = HashBuilder::default();
+    hb.add_leaf(Nibbles::unpack(&key), &value);
+    let receipts_root = hb.root();
+
+    let header = Header {
+        number: 100,
+        parent_hash: B256::ZERO,
+        receipts_root,
+        logs_bloom: bloom,
+        timestamp: 1_000_000,
+        gas_used: 21_000,
+        ..Default::default()
+    };
+
+    let mut header_rlp = Vec::new();
+    header.encode(&mut header_rlp);
+    let compressed_header = snappy_compress(&header_rlp);
+
+    let empty_list: Vec<u8> = {
+        let h = RlpHeader {
+            list: true,
+            payload_length: 0,
+        };
+        let mut buf = Vec::new();
+        h.encode(&mut buf);
+        buf
+    };
+    let body_payload_len = empty_list.len() + empty_list.len();
+    let body_outer = RlpHeader {
+        list: true,
+        payload_length: body_payload_len,
+    };
+    let mut body_buf = Vec::new();
+    body_outer.encode(&mut body_buf);
+    body_buf.extend_from_slice(&empty_list);
+    body_buf.extend_from_slice(&empty_list);
+    let compressed_body = snappy_compress(&body_buf);
+
+    let mut receipt_item = Vec::new();
+    receipt_body.encode(&mut receipt_item);
+    let outer_h = RlpHeader {
+        list: true,
+        payload_length: receipt_item.len(),
+    };
+    let mut receipts_buf = Vec::new();
+    outer_h.encode(&mut receipts_buf);
+    receipts_buf.extend_from_slice(&receipt_item);
+    let compressed_receipts = snappy_compress(&receipts_buf);
+
+    let td = [0u8; 32];
+    let mut index_data = Vec::new();
+    index_data.extend_from_slice(&100u64.to_le_bytes());
+    index_data.extend_from_slice(&0i64.to_le_bytes());
+    index_data.extend_from_slice(&1i64.to_le_bytes());
+
+    let mut file = Vec::new();
+    file.extend(e2store_entry([0x65, 0x32], &[]));
+    file.extend(e2store_entry([0x03, 0x00], &compressed_header));
+    file.extend(e2store_entry([0x04, 0x00], &compressed_body));
+    file.extend(e2store_entry([0x05, 0x00], &compressed_receipts));
+    file.extend(e2store_entry([0x06, 0x00], &td));
+    file.extend(e2store_entry([0x66, 0x32], &index_data));
+    file
 }
 
 fn build_synthetic_era1(contract: Address, transfer_topic0: B256) -> Vec<u8> {
@@ -118,13 +202,19 @@ fn build_synthetic_era1(contract: Address, transfer_topic0: B256) -> Vec<u8> {
 
     // Encode body as snappy(RLP([[],[]])) — empty txs and uncles
     let empty_list: Vec<u8> = {
-        let h = RlpHeader { list: true, payload_length: 0 };
+        let h = RlpHeader {
+            list: true,
+            payload_length: 0,
+        };
         let mut buf = Vec::new();
         h.encode(&mut buf);
         buf
     };
     let body_payload_len = empty_list.len() + empty_list.len();
-    let body_outer = RlpHeader { list: true, payload_length: body_payload_len };
+    let body_outer = RlpHeader {
+        list: true,
+        payload_length: body_payload_len,
+    };
     let mut body_buf = Vec::new();
     body_outer.encode(&mut body_buf);
     body_buf.extend_from_slice(&empty_list);
@@ -150,17 +240,17 @@ fn build_synthetic_era1(contract: Address, transfer_topic0: B256) -> Vec<u8> {
     // Format: u64 starting_number + [i64 offsets per block] + i64 count
     let mut index_data = Vec::new();
     index_data.extend_from_slice(&100u64.to_le_bytes()); // starting_number
-    index_data.extend_from_slice(&0i64.to_le_bytes());   // offset for block 100
-    index_data.extend_from_slice(&1i64.to_le_bytes());   // count
+    index_data.extend_from_slice(&0i64.to_le_bytes()); // offset for block 100
+    index_data.extend_from_slice(&1i64.to_le_bytes()); // count
 
     // Assemble ERA1 file
     let mut file = Vec::new();
-    file.extend(e2store_entry([0x65, 0x32], &[]));                   // version
-    file.extend(e2store_entry([0x03, 0x00], &compressed_header));    // header
-    file.extend(e2store_entry([0x04, 0x00], &compressed_body));      // body
-    file.extend(e2store_entry([0x05, 0x00], &compressed_receipts));  // receipts
-    file.extend(e2store_entry([0x06, 0x00], &td));                   // total difficulty
-    file.extend(e2store_entry([0x66, 0x32], &index_data));           // block index
+    file.extend(e2store_entry([0x65, 0x32], &[])); // version
+    file.extend(e2store_entry([0x03, 0x00], &compressed_header)); // header
+    file.extend(e2store_entry([0x04, 0x00], &compressed_body)); // body
+    file.extend(e2store_entry([0x05, 0x00], &compressed_receipts)); // receipts
+    file.extend(e2store_entry([0x06, 0x00], &td)); // total difficulty
+    file.extend(e2store_entry([0x66, 0x32], &index_data)); // block index
     file
 }
 
@@ -172,7 +262,8 @@ fn transfer_abi_json() -> String {
         {"name":"from","type":"address","indexed":true,"components":[]},
         {"name":"to","type":"address","indexed":true,"components":[]},
         {"name":"value","type":"uint256","indexed":false,"components":[]}
-    ]}]"#.to_string()
+    ]}]"#
+        .to_string()
 }
 
 fn test_config(contract_address: Address) -> Config {
@@ -248,6 +339,97 @@ async fn era1_pipeline_indexes_transfer_event() {
     assert_eq!(count, 1, "expected exactly one Transfer event in DB");
 
     // Cleanup
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+    let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+}
+
+#[tokio::test]
+async fn era1_pipeline_indexes_multiple_contracts_in_one_scope_pass() {
+    let first = address!("dAC17F958D2ee523a2206206994597C13D831ec7");
+    let second = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+    let transfer_topic0 = keccak256(b"Transfer(address,address,uint256)");
+
+    let make_log = |contract: Address, marker: u8| PrimitiveLog {
+        address: contract,
+        data: LogData::new_unchecked(
+            vec![
+                transfer_topic0,
+                B256::from([marker; 32]),
+                B256::from([marker + 1; 32]),
+            ],
+            Bytes::from(vec![0u8; 32]),
+        ),
+    };
+
+    let era1_bytes = build_synthetic_era1_with_logs(
+        vec![make_log(first, 0x11), make_log(second, 0x33)],
+        vec![
+            first.as_slice().to_vec(),
+            second.as_slice().to_vec(),
+            transfer_topic0.as_slice().to_vec(),
+        ],
+    );
+
+    let dir = tempdir().unwrap();
+    let era1_path = dir.path().join("mainnet-00012-deadbeef.era1");
+    std::fs::write(&era1_path, &era1_bytes).unwrap();
+
+    let db_path = unique_db_path();
+    let db = Db::open(db_path.clone()).await.unwrap();
+    db.upsert_contract(&first.to_checksum(None), Some("USDT"), &transfer_abi_json())
+        .await
+        .unwrap();
+    db.upsert_contract(
+        &second.to_checksum(None),
+        Some("USDC"),
+        &transfer_abi_json(),
+    )
+    .await
+    .unwrap();
+
+    let files = vec![SourceFileManifest {
+        format: "era1".into(),
+        path: era1_path,
+        filename: "mainnet-00012-deadbeef.era1".into(),
+        network: "mainnet".into(),
+        epoch: 12,
+        file_hash: "deadbeef".into(),
+        size_bytes: era1_bytes.len() as u64,
+        modified_at: None,
+        sha256: "".into(),
+        checksum_status: ChecksumStatus::Unavailable,
+        ranges: vec![SourceRangeManifest {
+            from_block: 100,
+            to_block: 100,
+            completeness: RangeCompleteness::FileIndex,
+        }],
+    }];
+
+    let contracts = vec![
+        test_config(first).contracts.remove(0),
+        test_config(second).contracts.remove(0),
+    ];
+    let progress = indicatif::MultiProgress::new();
+    let mut abi_cache = AbiCache::new(db.clone());
+
+    run_era1_scopes(&files, &contracts, &mut abi_cache, &db, &progress)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        db.count_events_for_contract(&first.to_checksum(None))
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.count_events_for_contract(&second.to_checksum(None))
+            .await
+            .unwrap(),
+        1
+    );
+
     let _ = std::fs::remove_file(&db_path);
     let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
     let _ = std::fs::remove_file(db_path.with_extension("db-shm"));

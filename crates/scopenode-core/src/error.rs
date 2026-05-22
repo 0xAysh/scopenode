@@ -77,7 +77,11 @@ pub enum ConfigError {
     Parse(#[from] toml::de::Error),
 
     #[error("Invalid block range for contract {address}: from_block {from} > to_block {to}")]
-    InvalidRange { from: u64, to: u64, address: Address },
+    InvalidRange {
+        from: u64,
+        to: u64,
+        address: Address,
+    },
 
     #[error("Contract {0} has no events configured")]
     NoEvents(Address),

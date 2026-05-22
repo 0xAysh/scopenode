@@ -7,8 +7,8 @@
 
 pub mod abi;
 pub mod config;
-pub mod error;
 pub mod era_pipeline;
+pub mod error;
 pub mod headers;
 pub mod receipts;
 pub mod source;
