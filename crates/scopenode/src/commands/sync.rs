@@ -101,23 +101,3 @@ fn expand_tilde(path: PathBuf) -> PathBuf {
     }
     path
 }
-
-#[cfg(test)]
-mod tests {
-    use scopenode_core::config::parse_block_shorthand;
-
-    #[test]
-    fn parse_absolute_block() {
-        assert_eq!(parse_block_shorthand("16000000").unwrap(), 16_000_000);
-    }
-
-    #[test]
-    fn parse_shorthand_m() {
-        assert_eq!(parse_block_shorthand("16M").unwrap(), 16_000_000);
-    }
-
-    #[test]
-    fn parse_shorthand_k() {
-        assert_eq!(parse_block_shorthand("16K").unwrap(), 16_000);
-    }
-}
