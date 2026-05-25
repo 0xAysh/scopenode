@@ -76,7 +76,7 @@ impl Db {
             let mut builder: QueryBuilder<Sqlite> = QueryBuilder::new(
                 "INSERT OR IGNORE INTO events \
                  (contract, event_name, topic0, block_number, block_hash, \
-                  tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source) ",
+                  tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source, timestamp) ",
             );
             builder.push_values(chunk, |mut row, e| {
                 row.push_bind(&e.contract)
@@ -90,7 +90,8 @@ impl Db {
                     .push_bind(&e.raw_topics)
                     .push_bind(&e.raw_data)
                     .push_bind(&e.decoded)
-                    .push_bind(&e.source);
+                    .push_bind(&e.source)
+                    .push_bind(e.timestamp);
             });
             builder
                 .build()
@@ -350,7 +351,7 @@ impl Db {
 
         let sql = format!(
             "SELECT contract, event_name, topic0, block_number, block_hash, \
-             tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source \
+             tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source, timestamp \
              FROM events WHERE {} \
              ORDER BY block_number ASC, log_index ASC LIMIT ? OFFSET ?",
             where_clause
@@ -434,49 +435,49 @@ fn stream_events_sql(has_contract: bool, has_event_name: bool, has_topic0: bool)
     match (has_contract, has_event_name, has_topic0) {
         (false, false, false) => concat!(
             "SELECT contract, event_name, topic0, block_number, block_hash, \
-             tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source \
+             tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source, timestamp \
              FROM events WHERE block_number >= ? AND block_number <= ?",
             " ORDER BY block_number ASC, log_index ASC"
         ),
         (true, false, false) => concat!(
             "SELECT contract, event_name, topic0, block_number, block_hash, \
-             tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source \
+             tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source, timestamp \
              FROM events WHERE contract = ? AND block_number >= ? AND block_number <= ?",
             " ORDER BY block_number ASC, log_index ASC"
         ),
         (false, true, false) => concat!(
             "SELECT contract, event_name, topic0, block_number, block_hash, \
-             tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source \
+             tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source, timestamp \
              FROM events WHERE event_name = ? AND block_number >= ? AND block_number <= ?",
             " ORDER BY block_number ASC, log_index ASC"
         ),
         (false, false, true) => concat!(
             "SELECT contract, event_name, topic0, block_number, block_hash, \
-             tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source \
+             tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source, timestamp \
              FROM events WHERE topic0 = ? AND block_number >= ? AND block_number <= ?",
             " ORDER BY block_number ASC, log_index ASC"
         ),
         (true, true, false) => concat!(
             "SELECT contract, event_name, topic0, block_number, block_hash, \
-             tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source \
+             tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source, timestamp \
              FROM events WHERE contract = ? AND event_name = ? AND block_number >= ? AND block_number <= ?",
             " ORDER BY block_number ASC, log_index ASC"
         ),
         (true, false, true) => concat!(
             "SELECT contract, event_name, topic0, block_number, block_hash, \
-             tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source \
+             tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source, timestamp \
              FROM events WHERE contract = ? AND topic0 = ? AND block_number >= ? AND block_number <= ?",
             " ORDER BY block_number ASC, log_index ASC"
         ),
         (false, true, true) => concat!(
             "SELECT contract, event_name, topic0, block_number, block_hash, \
-             tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source \
+             tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source, timestamp \
              FROM events WHERE event_name = ? AND topic0 = ? AND block_number >= ? AND block_number <= ?",
             " ORDER BY block_number ASC, log_index ASC"
         ),
         (true, true, true) => concat!(
             "SELECT contract, event_name, topic0, block_number, block_hash, \
-             tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source \
+             tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source, timestamp \
              FROM events WHERE contract = ? AND event_name = ? AND topic0 = ? AND block_number >= ? AND block_number <= ?",
             " ORDER BY block_number ASC, log_index ASC"
         ),
@@ -543,6 +544,7 @@ mod tests {
             raw_data: "00".to_string(),
             decoded: "{}".to_string(),
             source: "era1".to_string(),
+            timestamp: 0,
         }
     }
 

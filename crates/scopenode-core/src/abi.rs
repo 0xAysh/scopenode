@@ -12,8 +12,8 @@
 
 use crate::config::ContractConfig;
 use crate::error::AbiError;
-use crate::types::StoredEvent;
 use alloy_consensus::ReceiptEnvelope;
+use scopenode_storage::models::StoredEvent;
 use alloy_dyn_abi::{DynSolType, DynSolValue};
 use alloy_primitives::{keccak256, Address, Bytes, Log as PrimitiveLog, B256};
 use serde::Deserialize;
@@ -309,24 +309,24 @@ impl EventDecoder {
                     None => continue,
                 };
 
-                let raw_data = log.data.data.clone();
+                let raw_data = Bytes::from(log.data.data.clone().to_vec());
                 let decoded = self.decode_log(event_abi, topics, raw_data.as_ref());
 
-                results.push(StoredEvent {
-                    contract: self.contract,
-                    event_name: event_abi.name.clone(),
+                results.push(StoredEvent::from_decoded_log(
+                    self.contract,
+                    &event_abi.name,
                     topic0,
-                    block_number: block_num,
+                    block_num,
                     block_hash,
                     tx_hash,
-                    tx_index: tx_idx as u64,
+                    tx_idx as u64,
                     log_index,
-                    raw_topics: topics.to_vec(),
-                    raw_data: Bytes::from(raw_data.to_vec()),
+                    topics,
+                    &raw_data,
                     decoded,
-                    source: "era1".to_string(),
+                    "era1",
                     timestamp,
-                });
+                ));
             }
         }
 
@@ -514,7 +514,7 @@ mod era1_tests {
 
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].event_name, "Transfer");
-        assert_eq!(stored[0].tx_hash, tx_hash);
+        assert_eq!(stored[0].tx_hash, tx_hash.to_string());
         assert_eq!(stored[0].tx_index, 0);
         assert_eq!(stored[0].log_index, 0);
         assert_eq!(stored[0].source, "era1");
