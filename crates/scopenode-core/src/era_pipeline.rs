@@ -211,12 +211,13 @@ pub async fn run_era1_scopes(
 
             for idx in matching_scope_indices {
                 let scope = &scopes[idx];
-                let events = scope.decoder.extract_and_decode_era1(
+                let events = scope.decoder.extract_and_decode(
                     &receipts,
                     &tx_hashes,
                     header.number,
                     header.hash,
                     header.timestamp,
+                    "era1",
                 );
                 storage_events.extend(events);
             }
