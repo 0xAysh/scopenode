@@ -19,36 +19,41 @@
 //! are fetched, Merkle-verified (finding no relevant logs), and discarded.
 //! This is correct behaviour — never a missed event.
 
-use crate::types::BloomTarget;
 use alloy_primitives::{Address, Bloom, BloomInput, B256};
 
-/// Stateless bloom filter scanner.
+struct BloomTarget {
+    address_bytes: Vec<u8>,
+    topic_bytes: Vec<Vec<u8>>,
+}
+
+/// Bloom filter scanner for a specific (contract, events) combination.
 ///
-/// All methods are static (take no mutable state), so `BloomScanner` is purely
-/// a namespace for the bloom scanning functions. The actual bloom data lives in
-/// the stored headers.
-pub struct BloomScanner;
+/// Constructed once per contract scope with the precomputed targets, then used
+/// to quickly test each block header's `logsBloom`. Owning the targets means
+/// the pipeline never needs to carry `BloomTarget` as a separate concern.
+pub struct BloomScanner {
+    targets: Vec<BloomTarget>,
+}
 
 impl BloomScanner {
-    /// Build bloom filter targets for a set of event topic0 hashes and a contract address.
+    /// Build a scanner for a set of event topic0 hashes and a contract address.
     ///
-    /// Each [`BloomTarget`] represents one `(address, topic0)` pair to check.
-    /// We build one target per event so a single contract watching multiple events
-    /// generates multiple targets — the `matches` call returns true if ANY target
-    /// matches (i.e. we don't require ALL events to be present in the bloom).
-    pub fn build_targets(topic0s: &[B256], address: Address) -> Vec<BloomTarget> {
+    /// One [`BloomTarget`] is created per event so a single contract watching
+    /// multiple events generates multiple targets — `matches` returns `true`
+    /// if ANY target matches (we don't require ALL events to be present).
+    pub fn new(topic0s: &[B256], address: Address) -> Self {
         let address_bytes = address.as_slice().to_vec();
-
-        topic0s
+        let targets = topic0s
             .iter()
             .map(|t0| BloomTarget {
                 address_bytes: address_bytes.clone(),
                 topic_bytes: vec![t0.as_slice().to_vec()],
             })
-            .collect()
+            .collect();
+        Self { targets }
     }
 
-    /// Check whether a block's bloom filter might contain logs matching any of the targets.
+    /// Check whether a block's bloom filter might contain logs matching any target.
     ///
     /// Returns `true` if ANY target matches — meaning the contract address is
     /// present in the bloom AND at least one event topic0 is present.
@@ -59,21 +64,15 @@ impl BloomScanner {
     ///
     /// ~15% of returned `true` values will be false positives — those blocks are
     /// fetched and found empty after Merkle verification. This is acceptable.
-    pub fn matches(bloom: &Bloom, targets: &[BloomTarget]) -> bool {
-        for target in targets {
-            // First check: is the contract address present in the bloom?
-            // If not, this target can't match — skip to the next target.
-            // Checking address first is a cheap early exit since a block can only
+    pub fn matches(&self, bloom: &Bloom) -> bool {
+        for target in &self.targets {
+            // Checking address first is a cheap early exit: a block can only
             // contain our contract's logs if the address is in the bloom.
-            let address_present = bloom.contains_input(BloomInput::Raw(&target.address_bytes));
-            if !address_present {
+            if !bloom.contains_input(BloomInput::Raw(&target.address_bytes)) {
                 continue;
             }
-
-            // Second check: is at least one of our event topic0s present?
-            // topic0 must be present for our specific event type to appear in the block.
-            // Both address AND topic0 must be set — address alone could be a false positive
-            // from the contract being involved in a different event we don't care about.
+            // Both address AND topic0 must be set — address alone could be a
+            // false positive from the contract appearing in an unrelated event.
             for topic_bytes in &target.topic_bytes {
                 if bloom.contains_input(BloomInput::Raw(topic_bytes)) {
                     return true;
@@ -104,9 +103,9 @@ mod tests {
         let topic0 = keccak256(event_sig);
 
         let bloom = make_bloom_with(&[addr.as_slice(), topic0.as_slice()]);
-        let targets = BloomScanner::build_targets(&[topic0], addr);
+        let scanner = BloomScanner::new(&[topic0], addr);
 
-        assert!(BloomScanner::matches(&bloom, &targets));
+        assert!(scanner.matches(&bloom));
     }
 
     #[test]
@@ -115,11 +114,10 @@ mod tests {
         let other_addr = Address::repeat_byte(0xCD);
         let topic0 = keccak256(b"Swap(address)");
 
-        // Bloom only has other_addr, not addr
         let bloom = make_bloom_with(&[other_addr.as_slice(), topic0.as_slice()]);
-        let targets = BloomScanner::build_targets(&[topic0], addr);
+        let scanner = BloomScanner::new(&[topic0], addr);
 
-        assert!(!BloomScanner::matches(&bloom, &targets));
+        assert!(!scanner.matches(&bloom));
     }
 
     #[test]
@@ -128,10 +126,9 @@ mod tests {
         let topic0 = keccak256(b"Swap(address)");
         let other_topic = keccak256(b"Transfer(address,address,uint256)");
 
-        // Bloom has addr + other_topic but not our topic0
         let bloom = make_bloom_with(&[addr.as_slice(), other_topic.as_slice()]);
-        let targets = BloomScanner::build_targets(&[topic0], addr);
+        let scanner = BloomScanner::new(&[topic0], addr);
 
-        assert!(!BloomScanner::matches(&bloom, &targets));
+        assert!(!scanner.matches(&bloom));
     }
 }
