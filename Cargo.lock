@@ -3122,7 +3122,6 @@ dependencies = [
  "alloy-rlp",
  "alloy-trie",
  "async-trait",
- "indicatif",
  "scopenode-storage",
  "serde",
  "serde_json",

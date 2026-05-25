@@ -13,15 +13,30 @@ use crate::source::{
     decode_era1_header, decode_era1_receipts, decode_era1_tx_hashes, iter_era1_block_tuples,
     SourceFileManifest,
 };
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use scopenode_storage::Db;
 use tracing::warn;
+
+/// Sink for pipeline progress events. Implement to drive a terminal bar or suppress output.
+pub trait ProgressReporter {
+    fn set_total(&self, n: u64);
+    fn inc(&self);
+    fn finish(&self, msg: &str);
+}
+
+/// No-op reporter for tests and programmatic callers that don't need progress output.
+pub struct NullReporter;
+
+impl ProgressReporter for NullReporter {
+    fn set_total(&self, _n: u64) {}
+    fn inc(&self) {}
+    fn finish(&self, _msg: &str) {}
+}
 
 struct PreparedScope {
     name: String,
     from: u64,
     to: u64,
-    targets: Vec<crate::types::BloomTarget>,
+    scanner: BloomScanner,
     decoder: EventDecoder,
 }
 
@@ -29,7 +44,7 @@ impl PreparedScope {
     async fn new(contract: &ContractConfig, abi_cache: &mut AbiCache) -> Result<Self, CoreError> {
         let events = abi_cache.get_or_fetch(contract).await?;
         let topic0s: Vec<_> = events.iter().map(|e| e.topic0()).collect();
-        let targets = BloomScanner::build_targets(&topic0s, contract.address);
+        let scanner = BloomScanner::new(&topic0s, contract.address);
         let decoder = EventDecoder::new(&events, contract.address)?;
         let to = contract.to_block.ok_or_else(|| {
             CoreError::Internal("ERA1 scope requires to_block — live sync not yet supported".into())
@@ -42,7 +57,7 @@ impl PreparedScope {
                 .unwrap_or_else(|| contract.address.to_checksum(None)),
             from: contract.from_block,
             to,
-            targets,
+            scanner,
             decoder,
         })
     }
@@ -70,14 +85,14 @@ pub async fn run_era1_scope(
     contract: &ContractConfig,
     abi_cache: &mut AbiCache,
     db: &Db,
-    progress: &MultiProgress,
+    reporter: &dyn ProgressReporter,
 ) -> Result<(), CoreError> {
     run_era1_scopes(
         files,
         std::slice::from_ref(contract),
         abi_cache,
         db,
-        progress,
+        reporter,
     )
     .await
 }
@@ -92,7 +107,7 @@ pub async fn run_era1_scopes(
     contracts: &[ContractConfig],
     abi_cache: &mut AbiCache,
     db: &Db,
-    progress: &MultiProgress,
+    reporter: &dyn ProgressReporter,
 ) -> Result<(), CoreError> {
     let mut scopes = Vec::new();
     for contract in contracts {
@@ -120,14 +135,7 @@ pub async fn run_era1_scopes(
         .map(|r| r.to_block.saturating_sub(r.from_block) + 1)
         .sum();
 
-    let pb = progress.add(ProgressBar::new(total_blocks.max(1)));
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("ERA1 index     {bar:20.cyan/blue}  {pos:>7} / {len:<7}  {msg}")
-            .unwrap_or_else(|_| ProgressStyle::default_bar())
-            .progress_chars("█░"),
-    );
-    pb.set_message("scanning...");
+    reporter.set_total(total_blocks.max(1));
 
     let mut total_events = 0usize;
 
@@ -158,7 +166,7 @@ pub async fn run_era1_scopes(
                 }
             };
 
-            pb.inc(1);
+            reporter.inc();
 
             let matching_scope_indices_by_range: Vec<usize> = active_scope_indices
                 .iter()
@@ -179,7 +187,7 @@ pub async fn run_era1_scopes(
 
             let matching_scope_indices: Vec<usize> = matching_scope_indices_by_range
                 .into_iter()
-                .filter(|idx| BloomScanner::matches(&header.logs_bloom, &scopes[*idx].targets))
+                .filter(|idx| scopes[*idx].scanner.matches(&header.logs_bloom))
                 .collect();
             if matching_scope_indices.is_empty() {
                 continue;
@@ -203,12 +211,13 @@ pub async fn run_era1_scopes(
 
             for idx in matching_scope_indices {
                 let scope = &scopes[idx];
-                let events = scope.decoder.extract_and_decode_era1(
+                let events = scope.decoder.extract_and_decode(
                     &receipts,
                     &tx_hashes,
                     header.number,
                     header.hash,
                     header.timestamp,
+                    "era1",
                 );
                 storage_events.extend(events);
             }
@@ -228,7 +237,7 @@ pub async fn run_era1_scopes(
         .map(|scope| scope.name.as_str())
         .collect::<Vec<_>>()
         .join(", ");
-    pb.finish_with_message(format!("done ({total_events} events across {scope_names})"));
+    reporter.finish(&format!("done ({total_events} events across {scope_names})"));
     Ok(())
 }
 

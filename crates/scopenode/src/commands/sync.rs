@@ -1,12 +1,29 @@
 //! `sync` command — indexes contract events from local ERA1 files.
 
 use anyhow::{Context, Result};
-use indicatif::{MultiProgress, ProgressDrawTarget};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use scopenode_core::{
-    abi::AbiCache, config::Config, era_pipeline::run_era1_scopes, source::scan_era1_source,
+    abi::AbiCache,
+    config::Config,
+    era_pipeline::{run_era1_scopes, ProgressReporter},
+    source::scan_era1_source,
 };
 use scopenode_storage::Db;
 use std::path::PathBuf;
+
+struct IndicatifReporter(ProgressBar);
+
+impl ProgressReporter for IndicatifReporter {
+    fn set_total(&self, n: u64) {
+        self.0.set_length(n);
+    }
+    fn inc(&self) {
+        self.0.inc(1);
+    }
+    fn finish(&self, msg: &str) {
+        self.0.finish_with_message(msg.to_owned());
+    }
+}
 
 /// Run the `sync` command.
 pub async fn run(config: Config, db: Db, dry_run: bool, quiet: bool) -> Result<()> {
@@ -43,10 +60,18 @@ pub async fn run(config: Config, db: Db, dry_run: bool, quiet: bool) -> Result<(
     let scan = scan_era1_source(&era_dir, None, union_from, union_to)
         .with_context(|| format!("Failed to scan ERA1 source: {}", era_dir.display()))?;
 
-    let progress = MultiProgress::new();
+    let mp = MultiProgress::new();
     if quiet {
-        progress.set_draw_target(ProgressDrawTarget::hidden());
+        mp.set_draw_target(ProgressDrawTarget::hidden());
     }
+    let pb = mp.add(ProgressBar::new(0));
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("ERA1 index     {bar:20.cyan/blue}  {pos:>7} / {len:<7}  {msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_bar())
+            .progress_chars("█░"),
+    );
+    let reporter = IndicatifReporter(pb);
 
     let mut abi_cache = AbiCache::new(db.clone());
 
@@ -55,7 +80,7 @@ pub async fn run(config: Config, db: Db, dry_run: bool, quiet: bool) -> Result<(
         &config.contracts,
         &mut abi_cache,
         &db,
-        &progress,
+        &reporter,
     )
     .await
     .context("ERA1 sync failed")?;

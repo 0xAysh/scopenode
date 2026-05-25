@@ -48,10 +48,10 @@ fn bloom_scan_finds_uniswap_swap_in_block() {
 
     let logs_bloom = load_block().expect("block fixture");
     let swap_topic0 = keccak256(b"Swap(address,address,int256,int256,uint160,uint128,int24)");
-    let targets = BloomScanner::build_targets(&[swap_topic0], UNISWAP_V3_POOL);
+    let scanner = BloomScanner::new(&[swap_topic0], UNISWAP_V3_POOL);
 
     assert!(
-        BloomScanner::matches(&logs_bloom, &targets),
+        scanner.matches(&logs_bloom),
         "BloomScanner::matches returned false for block {BLOCK_NUMBER}."
     );
 }
@@ -65,9 +65,9 @@ fn bloom_scan_rejects_absent_address() {
     let logs_bloom = load_block().expect("block fixture");
     let absent_address = Address::ZERO;
     let swap_topic0 = keccak256(b"Swap(address,address,int256,int256,uint160,uint128,int24)");
-    let targets = BloomScanner::build_targets(&[swap_topic0], absent_address);
+    let scanner = BloomScanner::new(&[swap_topic0], absent_address);
 
-    let matches = BloomScanner::matches(&logs_bloom, &targets);
+    let matches = scanner.matches(&logs_bloom);
     if matches {
         eprintln!(
             "[bloom_scan_rejects_absent_address] Address::ZERO appeared in bloom — \

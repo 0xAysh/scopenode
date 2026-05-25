@@ -1,8 +1,8 @@
 //! Shared data types used across the core pipeline.
 //!
-//! These types are the common language between the network layer, ABI decoder,
-//! bloom scanner, and storage layer. They represent Ethereum concepts — headers,
-//! logs, bloom filters — in a form that is convenient for the pipeline stages.
+//! These types are the common language between the ABI decoder, pipeline stages,
+//! and storage layer. They represent Ethereum concepts — headers, logs — in a
+//! form that is convenient for the pipeline stages.
 
 use alloy_primitives::{Bloom, B256};
 
@@ -48,28 +48,6 @@ pub struct ScopeHeader {
     /// London hard fork introduced the base fee mechanism. Pre-London blocks
     /// do not have this field, so it is represented as `None` here.
     pub base_fee_per_gas: Option<u128>,
-}
-
-/// Bloom filter inputs for a single (contract, event) pair.
-///
-/// Used to check whether a block's `logsBloom` might contain logs from our
-/// contract for a specific event. Both the address AND the topic0 must be
-/// present in the bloom — if either is missing the block definitely has no
-/// matching logs (zero false negatives guarantee).
-#[derive(Debug, Clone)]
-pub struct BloomTarget {
-    /// Raw bytes of the contract address, used as the bloom filter input.
-    ///
-    /// The Ethereum bloom filter operates on raw byte slices; the 20-byte
-    /// address is passed directly without any hashing by the caller.
-    pub address_bytes: Vec<u8>,
-
-    /// Raw bytes of each event's topic0 (keccak256 of the event signature).
-    ///
-    /// A `Vec` so one `BloomTarget` can cover multiple events for the same contract.
-    /// Each entry is 32 bytes (a keccak256 digest). The bloom check passes if
-    /// ANY of these topic0 bytes are present together with the address bytes.
-    pub topic_bytes: Vec<Vec<u8>>,
 }
 
 /// Summary row for `scopenode status` output.

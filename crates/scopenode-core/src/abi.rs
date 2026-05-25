@@ -5,7 +5,7 @@
 //!
 //! # Decoding pipeline
 //! 1. [`EventAbi::topic0`] — compute keccak256 of the event signature
-//! 2. [`EventDecoder::extract_and_decode_era1`] — scan receipts, match logs by topic0
+//! 2. [`EventDecoder::extract_and_decode`] — scan receipts, match logs by topic0
 //! 3. [`EventDecoder::decode_log`] — split indexed (topics) vs non-indexed (data)
 //! 4. [`decode_indexed_param`] / [`decode_abi_data`] — decode each parameter
 //! 5. [`dyn_sol_value_to_json`] — convert to JSON for SQLite storage
@@ -277,14 +277,14 @@ impl EventDecoder {
         })
     }
 
-    /// ERA1 variant: takes consensus `ReceiptEnvelope<PrimitiveLog>` directly.
-    pub fn extract_and_decode_era1(
+    pub fn extract_and_decode(
         &self,
         receipts: &[ReceiptEnvelope<PrimitiveLog>],
         tx_hashes: &[B256],
         block_num: u64,
         block_hash: B256,
         timestamp: u64,
+        source: &str,
     ) -> Vec<StoredEvent> {
         let mut results = Vec::new();
         let mut cumulative_log_index: u64 = 0;
@@ -324,7 +324,7 @@ impl EventDecoder {
                     topics,
                     &raw_data,
                     decoded,
-                    "era1",
+                    source,
                     timestamp,
                 ));
             }
@@ -459,7 +459,7 @@ mod era1_tests {
     }
 
     #[test]
-    fn extract_and_decode_era1_finds_matching_log() {
+    fn extract_and_decode_finds_matching_log() {
         let contract = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
         let topic0 = keccak256(b"Transfer(address,address,uint256)");
 
@@ -510,7 +510,7 @@ mod era1_tests {
 
         let decoder = EventDecoder::new(&events, contract).unwrap();
         let stored =
-            decoder.extract_and_decode_era1(&receipts, &tx_hashes, 100, B256::ZERO, 1_000_000);
+            decoder.extract_and_decode(&receipts, &tx_hashes, 100, B256::ZERO, 1_000_000, "era1");
 
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].event_name, "Transfer");
