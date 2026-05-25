@@ -76,7 +76,7 @@ impl Db {
             let mut builder: QueryBuilder<Sqlite> = QueryBuilder::new(
                 "INSERT OR IGNORE INTO events \
                  (contract, event_name, topic0, block_number, block_hash, \
-                  tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source) ",
+                  tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source, timestamp) ",
             );
             builder.push_values(chunk, |mut row, e| {
                 row.push_bind(&e.contract)
@@ -90,7 +90,8 @@ impl Db {
                     .push_bind(&e.raw_topics)
                     .push_bind(&e.raw_data)
                     .push_bind(&e.decoded)
-                    .push_bind(&e.source);
+                    .push_bind(&e.source)
+                    .push_bind(e.timestamp);
             });
             builder
                 .build()
@@ -330,42 +331,15 @@ impl Db {
         let from = from_block.unwrap_or(0) as i64;
         let to = to_block.map(|b| b as i64).unwrap_or(i64::MAX);
 
-        let mut conditions: Vec<&str> = Vec::new();
-        if contract.is_some() {
-            conditions.push("contract = ?");
-        }
-        if event_name.is_some() {
-            conditions.push("event_name = ?");
-        }
-        if topic0.is_some() {
-            conditions.push("topic0 = ?");
-        }
-        conditions.extend(["block_number >= ?", "block_number <= ?"]);
-
-        let where_clause = if conditions.is_empty() {
-            "1=1".to_string()
-        } else {
-            conditions.join(" AND ")
-        };
-
         let sql = format!(
-            "SELECT contract, event_name, topic0, block_number, block_hash, \
-             tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source \
-             FROM events WHERE {} \
-             ORDER BY block_number ASC, log_index ASC LIMIT ? OFFSET ?",
-            where_clause
+            "{} LIMIT ? OFFSET ?",
+            filter_sql_base(contract.is_some(), event_name.is_some(), topic0.is_some())
         );
 
         let mut q = sqlx::query_as::<_, StoredEvent>(&sql);
-        if let Some(c) = contract {
-            q = q.bind(c);
-        }
-        if let Some(e) = event_name {
-            q = q.bind(e);
-        }
-        if let Some(t) = topic0 {
-            q = q.bind(t);
-        }
+        if let Some(c) = contract { q = q.bind(c); }
+        if let Some(e) = event_name { q = q.bind(e); }
+        if let Some(t) = topic0 { q = q.bind(t); }
         q = q.bind(from).bind(to).bind(limit as i64).bind(offset as i64);
 
         q.fetch_all(&self.pool)
@@ -385,17 +359,11 @@ impl Db {
         let from = from_block.unwrap_or(0) as i64;
         let to = to_block.map(|b| b as i64).unwrap_or(i64::MAX);
 
-        let sql = stream_events_sql(contract.is_some(), event_name.is_some(), topic0.is_some());
+        let sql = filter_sql_base(contract.is_some(), event_name.is_some(), topic0.is_some());
         let mut q = sqlx::query_as::<_, StoredEvent>(sql);
-        if let Some(c) = contract {
-            q = q.bind(c);
-        }
-        if let Some(e) = event_name {
-            q = q.bind(e);
-        }
-        if let Some(t) = topic0 {
-            q = q.bind(t);
-        }
+        if let Some(c) = contract { q = q.bind(c); }
+        if let Some(e) = event_name { q = q.bind(e); }
+        if let Some(t) = topic0 { q = q.bind(t); }
         q = q.bind(from).bind(to);
 
         sqlx_stream_to_db_stream(q.fetch(&self.pool))
@@ -430,57 +398,35 @@ impl Db {
     }
 }
 
-fn stream_events_sql(has_contract: bool, has_event_name: bool, has_topic0: bool) -> &'static str {
-    match (has_contract, has_event_name, has_topic0) {
-        (false, false, false) => concat!(
-            "SELECT contract, event_name, topic0, block_number, block_hash, \
-             tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source \
-             FROM events WHERE block_number >= ? AND block_number <= ?",
-            " ORDER BY block_number ASC, log_index ASC"
-        ),
-        (true, false, false) => concat!(
-            "SELECT contract, event_name, topic0, block_number, block_hash, \
-             tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source \
-             FROM events WHERE contract = ? AND block_number >= ? AND block_number <= ?",
-            " ORDER BY block_number ASC, log_index ASC"
-        ),
-        (false, true, false) => concat!(
-            "SELECT contract, event_name, topic0, block_number, block_hash, \
-             tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source \
-             FROM events WHERE event_name = ? AND block_number >= ? AND block_number <= ?",
-            " ORDER BY block_number ASC, log_index ASC"
-        ),
-        (false, false, true) => concat!(
-            "SELECT contract, event_name, topic0, block_number, block_hash, \
-             tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source \
-             FROM events WHERE topic0 = ? AND block_number >= ? AND block_number <= ?",
-            " ORDER BY block_number ASC, log_index ASC"
-        ),
-        (true, true, false) => concat!(
-            "SELECT contract, event_name, topic0, block_number, block_hash, \
-             tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source \
-             FROM events WHERE contract = ? AND event_name = ? AND block_number >= ? AND block_number <= ?",
-            " ORDER BY block_number ASC, log_index ASC"
-        ),
-        (true, false, true) => concat!(
-            "SELECT contract, event_name, topic0, block_number, block_hash, \
-             tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source \
-             FROM events WHERE contract = ? AND topic0 = ? AND block_number >= ? AND block_number <= ?",
-            " ORDER BY block_number ASC, log_index ASC"
-        ),
-        (false, true, true) => concat!(
-            "SELECT contract, event_name, topic0, block_number, block_hash, \
-             tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source \
-             FROM events WHERE event_name = ? AND topic0 = ? AND block_number >= ? AND block_number <= ?",
-            " ORDER BY block_number ASC, log_index ASC"
-        ),
-        (true, true, true) => concat!(
-            "SELECT contract, event_name, topic0, block_number, block_hash, \
-             tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source \
-             FROM events WHERE contract = ? AND event_name = ? AND topic0 = ? AND block_number >= ? AND block_number <= ?",
-            " ORDER BY block_number ASC, log_index ASC"
-        ),
-    }
+/// Build and cache the base filter SQL for the 8 possible (contract, event_name, topic0) flag
+/// combinations. Both the paginated and streaming query paths share this single source of truth —
+/// adding a new filter dimension means editing this function only.
+///
+/// Results are cached in a `OnceLock` array (one slot per 3-bit flag combination) so each unique
+/// SQL string is built once and lives for `'static`.
+fn filter_sql_base(has_contract: bool, has_event_name: bool, has_topic0: bool) -> &'static str {
+    static CACHE: [std::sync::OnceLock<String>; 8] =
+        [const { std::sync::OnceLock::new() }; 8];
+
+    let idx = (has_contract as usize)
+        | ((has_event_name as usize) << 1)
+        | ((has_topic0 as usize) << 2);
+
+    CACHE[idx]
+        .get_or_init(|| {
+            let mut conditions: Vec<&str> = Vec::new();
+            if has_contract   { conditions.push("contract = ?"); }
+            if has_event_name { conditions.push("event_name = ?"); }
+            if has_topic0     { conditions.push("topic0 = ?"); }
+            conditions.extend(["block_number >= ?", "block_number <= ?"]);
+            format!(
+                "SELECT contract, event_name, topic0, block_number, block_hash, \
+                 tx_hash, tx_index, log_index, raw_topics, raw_data, decoded, source, timestamp \
+                 FROM events WHERE {} ORDER BY block_number ASC, log_index ASC",
+                conditions.join(" AND "),
+            )
+        })
+        .as_str()
 }
 
 // ─── Stream adapter ──────────────────────────────────────────────────────────
@@ -543,6 +489,7 @@ mod tests {
             raw_data: "00".to_string(),
             decoded: "{}".to_string(),
             source: "era1".to_string(),
+            timestamp: 0,
         }
     }
 

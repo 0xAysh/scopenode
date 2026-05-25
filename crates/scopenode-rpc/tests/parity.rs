@@ -53,6 +53,7 @@ fn make_row(block_number: i64, log_index: i64, topic0: &str) -> StoredRow {
         raw_data: "00".to_string(),
         decoded: "{}".to_string(),
         source: "era1".to_string(),
+        timestamp: 0,
     }
 }
 

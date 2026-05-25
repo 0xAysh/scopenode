@@ -4,9 +4,7 @@
 //! bloom scanner, and storage layer. They represent Ethereum concepts — headers,
 //! logs, bloom filters — in a form that is convenient for the pipeline stages.
 
-use alloy_primitives::{Address, Bloom, Bytes, B256};
-#[allow(unused_imports)]
-use serde::{Deserialize, Serialize};
+use alloy_primitives::{Bloom, B256};
 
 /// A minimal Ethereum block header with the fields scopenode needs.
 ///
@@ -50,76 +48,6 @@ pub struct ScopeHeader {
     /// London hard fork introduced the base fee mechanism. Pre-London blocks
     /// do not have this field, so it is represented as `None` here.
     pub base_fee_per_gas: Option<u128>,
-}
-
-/// A fully decoded Ethereum event ready to be persisted to SQLite.
-///
-/// Contains both the raw on-chain representation (topics, data hex) and the
-/// human-readable decoded form. Keeping both lets us re-decode if the ABI changes,
-/// and lets consumers either work with the structured data or the raw bytes.
-#[derive(Debug, Clone)]
-pub struct StoredEvent {
-    /// The contract address that emitted this event.
-    pub contract: Address,
-
-    /// Human-readable event name (e.g. `'Swap'`, `'Transfer'`).
-    pub event_name: String,
-
-    /// keccak256(event_signature) — the first topic of every event log.
-    ///
-    /// Used to identify which event type a log belongs to. For example,
-    /// `Transfer(address,address,uint256)` hashes to `0xddf252...`.
-    /// Every ERC-20 Transfer event in existence shares this same topic0.
-    pub topic0: B256,
-
-    /// Block number this event was emitted in.
-    pub block_number: u64,
-
-    /// Hash of the block — stored for reorg tracking (Phase 3a).
-    ///
-    /// If a reorg replaces this block, we can set `reorged = 1` on all
-    /// events with this block_hash without touching events in other blocks.
-    pub block_hash: B256,
-
-    /// Hash of the transaction that emitted this event.
-    pub tx_hash: B256,
-
-    /// Position of the transaction within the block (0-indexed).
-    pub tx_index: u64,
-
-    /// Position of this log within the block (0-indexed, globally unique per block).
-    ///
-    /// The `(tx_hash, log_index)` pair is used as the deduplication key in SQLite.
-    pub log_index: u64,
-
-    /// All raw topics from the log.
-    ///
-    /// `topics[0]` = topic0 (event selector), `topics[1..]` = indexed parameters
-    /// zero-padded to 32 bytes. There can be at most 4 topics total (EVM constraint).
-    pub raw_topics: Vec<B256>,
-
-    /// Raw ABI-encoded non-indexed parameters from the log's data field.
-    ///
-    /// Indexed parameters are stored in topics; all other parameters are
-    /// ABI-encoded as a packed tuple and placed in the `data` field.
-    pub raw_data: Bytes,
-
-    /// ABI-decoded named fields as a JSON object.
-    ///
-    /// Example: `{"sender":"0x...","amount0":"-1000","sqrtPriceX96":"..."}`.
-    /// U256 values are stored as decimal strings for JavaScript precision
-    /// (JS `Number` loses precision above 2^53, which is well below uint256's max).
-    pub decoded: serde_json::Value,
-
-    /// Data source tag.
-    ///
-    /// - `"devp2p"` — Phase 1 (RPC proxy) and future Phase 2 (real devp2p)
-    /// - `"era1"` — ERA1 archive fallback (Phase 2)
-    /// - `"rpc"` — last-resort fallback RPC (receipts still Merkle-verified)
-    pub source: String,
-
-    /// Unix timestamp of the block this event was emitted in (seconds since epoch).
-    pub timestamp: u64,
 }
 
 /// Bloom filter inputs for a single (contract, event) pair.

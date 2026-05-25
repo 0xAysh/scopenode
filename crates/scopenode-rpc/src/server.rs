@@ -190,6 +190,7 @@ mod tests {
             raw_data: "00".into(),
             decoded: "{}".into(),
             source: "era1".into(),
+            timestamp: 0,
         };
         let log = row_to_log(&row).unwrap();
         assert_eq!(log.block_number, Some(100));

@@ -61,6 +61,7 @@ struct EventResponse {
     log_index: i64,
     decoded: serde_json::Value,
     source: String,
+    timestamp: i64,
 }
 
 impl From<&scopenode_storage::models::StoredEvent> for EventResponse {
@@ -76,6 +77,7 @@ impl From<&scopenode_storage::models::StoredEvent> for EventResponse {
             log_index: e.log_index,
             decoded: serde_json::from_str(&e.decoded).unwrap_or(serde_json::Value::Null),
             source: e.source.clone(),
+            timestamp: e.timestamp,
         }
     }
 }
