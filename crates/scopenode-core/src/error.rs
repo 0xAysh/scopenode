@@ -47,6 +47,10 @@ pub enum AbiError {
     /// Error reading a local `abi_override` file.
     #[error("I/O error reading ABI override: {0}")]
     Io(#[from] std::io::Error),
+
+    /// Error interacting with the ABI cache backend.
+    #[error("ABI cache error: {0}")]
+    Cache(String),
 }
 
 /// Errors from Merkle Patricia Trie verification of receipts.

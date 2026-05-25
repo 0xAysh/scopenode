@@ -16,9 +16,11 @@ use alloy_consensus::ReceiptEnvelope;
 use scopenode_storage::models::StoredEvent;
 use alloy_dyn_abi::{DynSolType, DynSolValue};
 use alloy_primitives::{keccak256, Address, Bytes, Log as PrimitiveLog, B256};
+use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tracing::warn;
 
 /// A single input parameter definition from a Solidity event ABI.
@@ -109,24 +111,34 @@ fn parse_events_from_abi(address: Address, abi_array: &[Value]) -> Result<Vec<Ev
     Ok(events)
 }
 
-/// Caches contract ABIs in SQLite to avoid re-loading the override file every sync.
+/// Seam between ABI caching logic and its storage backend.
+///
+/// Implement this to provide a cache for ABI JSON strings. The two-method
+/// interface keeps `AbiCache` free of any storage-crate dependency.
+#[async_trait]
+pub trait AbiStore: Send + Sync {
+    async fn load(&self, address: &str) -> Result<Option<String>, AbiError>;
+    async fn save(&self, address: &str, name: Option<&str>, abi_json: &str) -> Result<(), AbiError>;
+}
+
+/// Caches contract ABIs to avoid re-loading the override file every sync.
 pub struct AbiCache {
-    db: scopenode_storage::Db,
+    store: Arc<dyn AbiStore>,
 }
 
 impl AbiCache {
-    pub fn new(db: scopenode_storage::Db) -> Self {
-        Self { db }
+    pub fn new(store: Arc<dyn AbiStore>) -> Self {
+        Self { store }
     }
 
-    /// Get the event ABIs for a contract, loading from SQLite cache or `abi_override`.
+    /// Get the event ABIs for a contract, loading from the cache or `abi_override`.
     ///
     /// Returns [`AbiError::AbiRequired`] if `abi_override` is not set.
     pub async fn get_or_fetch(&self, contract: &ContractConfig) -> Result<Vec<EventAbi>, AbiError> {
         let addr_str = contract.address.to_checksum(None);
 
-        // Fast path: ABI already in SQLite from a previous run.
-        if let Ok(Some(cached)) = self.db.get_contract_abi(&addr_str).await {
+        // Fast path: ABI already cached from a previous run.
+        if let Ok(Some(cached)) = self.store.load(&addr_str).await {
             let all_events = parse_cached_events(contract.address, &cached)?;
             return filter_events(all_events, &contract.events, contract.address);
         }
@@ -154,10 +166,7 @@ impl AbiCache {
         )
         .unwrap_or_default();
 
-        let _ = self
-            .db
-            .upsert_contract(&addr_str, contract.name.as_deref(), &abi_json)
-            .await;
+        let _ = self.store.save(&addr_str, contract.name.as_deref(), &abi_json).await;
 
         filter_events(all_events, &contract.events, contract.address)
     }

@@ -13,6 +13,7 @@ scopenode-storage = { workspace = true }
 scopenode-rpc     = { workspace = true }
 tokio             = { workspace = true }
 anyhow            = { workspace = true }
+async-trait       = { workspace = true }
 clap              = { workspace = true }
 tracing           = { workspace = true }
 tracing-subscriber = { workspace = true }
