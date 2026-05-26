@@ -5,17 +5,32 @@ use alloy_primitives::{
 };
 use alloy_rlp::{Encodable, Header as RlpHeader};
 use alloy_trie::{HashBuilder, Nibbles};
+use async_trait::async_trait;
 use scopenode_core::{
-    abi::AbiCache,
+    abi::{AbiCache, AbiStore},
     config::{Config, ContractConfig, NodeConfig},
     era_pipeline::{run_era1_scope, run_era1_scopes, NullReporter},
+    error::AbiError,
     source::{ChecksumStatus, RangeCompleteness, SourceFileManifest, SourceRangeManifest},
 };
 use scopenode_storage::Db;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use tempfile::tempdir;
+
+struct DbAbiStore(Db);
+
+#[async_trait]
+impl AbiStore for DbAbiStore {
+    async fn load(&self, address: &str) -> Result<Option<String>, AbiError> {
+        self.0.get_contract_abi(address).await.map_err(|e| AbiError::Cache(e.to_string()))
+    }
+    async fn save(&self, address: &str, name: Option<&str>, abi_json: &str) -> Result<(), AbiError> {
+        self.0.upsert_contract(address, name, abi_json).await.map_err(|e| AbiError::Cache(e.to_string()))
+    }
+}
 
 fn unique_db_path() -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -327,7 +342,7 @@ async fn era1_pipeline_indexes_transfer_event() {
 
     let config = test_config(contract);
     let contract_cfg = &config.contracts[0];
-    let mut abi_cache = AbiCache::new(db.clone());
+    let mut abi_cache = AbiCache::new(Arc::new(DbAbiStore(db.clone())));
 
     run_era1_scope(&files, contract_cfg, &mut abi_cache, &db, &NullReporter)
         .await
@@ -409,7 +424,7 @@ async fn era1_pipeline_indexes_multiple_contracts_in_one_scope_pass() {
         test_config(first).contracts.remove(0),
         test_config(second).contracts.remove(0),
     ];
-    let mut abi_cache = AbiCache::new(db.clone());
+    let mut abi_cache = AbiCache::new(Arc::new(DbAbiStore(db.clone())));
 
     run_era1_scopes(&files, &contracts, &mut abi_cache, &db, &NullReporter)
         .await

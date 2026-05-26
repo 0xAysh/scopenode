@@ -13,12 +13,13 @@
 use crate::config::ContractConfig;
 use crate::error::AbiError;
 use alloy_consensus::ReceiptEnvelope;
-use scopenode_storage::models::StoredEvent;
 use alloy_dyn_abi::{DynSolType, DynSolValue};
 use alloy_primitives::{keccak256, Address, Bytes, Log as PrimitiveLog, B256};
+use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tracing::warn;
 
 /// A single input parameter definition from a Solidity event ABI.
@@ -109,24 +110,34 @@ fn parse_events_from_abi(address: Address, abi_array: &[Value]) -> Result<Vec<Ev
     Ok(events)
 }
 
-/// Caches contract ABIs in SQLite to avoid re-loading the override file every sync.
+/// Seam between ABI caching logic and its storage backend.
+///
+/// Implement this to provide a cache for ABI JSON strings. The two-method
+/// interface keeps `AbiCache` free of any storage-crate dependency.
+#[async_trait]
+pub trait AbiStore: Send + Sync {
+    async fn load(&self, address: &str) -> Result<Option<String>, AbiError>;
+    async fn save(&self, address: &str, name: Option<&str>, abi_json: &str) -> Result<(), AbiError>;
+}
+
+/// Caches contract ABIs to avoid re-loading the override file every sync.
 pub struct AbiCache {
-    db: scopenode_storage::Db,
+    store: Arc<dyn AbiStore>,
 }
 
 impl AbiCache {
-    pub fn new(db: scopenode_storage::Db) -> Self {
-        Self { db }
+    pub fn new(store: Arc<dyn AbiStore>) -> Self {
+        Self { store }
     }
 
-    /// Get the event ABIs for a contract, loading from SQLite cache or `abi_override`.
+    /// Get the event ABIs for a contract, loading from the cache or `abi_override`.
     ///
     /// Returns [`AbiError::AbiRequired`] if `abi_override` is not set.
     pub async fn get_or_fetch(&self, contract: &ContractConfig) -> Result<Vec<EventAbi>, AbiError> {
         let addr_str = contract.address.to_checksum(None);
 
-        // Fast path: ABI already in SQLite from a previous run.
-        if let Ok(Some(cached)) = self.db.get_contract_abi(&addr_str).await {
+        // Fast path: ABI already cached from a previous run.
+        if let Ok(Some(cached)) = self.store.load(&addr_str).await {
             let all_events = parse_cached_events(contract.address, &cached)?;
             return filter_events(all_events, &contract.events, contract.address);
         }
@@ -154,10 +165,7 @@ impl AbiCache {
         )
         .unwrap_or_default();
 
-        let _ = self
-            .db
-            .upsert_contract(&addr_str, contract.name.as_deref(), &abi_json)
-            .await;
+        let _ = self.store.save(&addr_str, contract.name.as_deref(), &abi_json).await;
 
         filter_events(all_events, &contract.events, contract.address)
     }
@@ -215,6 +223,27 @@ fn filter_events(
     Ok(result)
 }
 
+/// A fully-decoded event log carrying native Ethereum types.
+///
+/// Produced by [`EventDecoder::extract_and_decode`]. Callers that need to
+/// persist events convert this to `StoredEvent` via a storage-layer adapter.
+#[derive(Debug, Clone)]
+pub struct DecodedEvent {
+    pub contract: Address,
+    pub event_name: String,
+    pub topic0: B256,
+    pub block_number: u64,
+    pub block_hash: B256,
+    pub tx_hash: B256,
+    pub tx_index: u64,
+    pub log_index: u64,
+    pub raw_topics: Vec<B256>,
+    pub raw_data: Bytes,
+    pub decoded: serde_json::Value,
+    pub source: String,
+    pub timestamp: u64,
+}
+
 /// Precomputed decode metadata for one Solidity event.
 struct CompiledEvent {
     name: String,
@@ -259,7 +288,7 @@ impl CompiledEvent {
     }
 }
 
-/// Decodes raw Ethereum log data into named [`StoredEvent`] values.
+/// Decodes raw Ethereum log data into named [`DecodedEvent`] values.
 pub struct EventDecoder {
     events: HashMap<B256, CompiledEvent>,
     contract: Address,
@@ -285,7 +314,7 @@ impl EventDecoder {
         block_hash: B256,
         timestamp: u64,
         source: &str,
-    ) -> Vec<StoredEvent> {
+    ) -> Vec<DecodedEvent> {
         let mut results = Vec::new();
         let mut cumulative_log_index: u64 = 0;
 
@@ -312,21 +341,21 @@ impl EventDecoder {
                 let raw_data = Bytes::from(log.data.data.clone().to_vec());
                 let decoded = self.decode_log(event_abi, topics, raw_data.as_ref());
 
-                results.push(StoredEvent::from_decoded_log(
-                    self.contract,
-                    &event_abi.name,
+                results.push(DecodedEvent {
+                    contract: self.contract,
+                    event_name: event_abi.name.clone(),
                     topic0,
-                    block_num,
+                    block_number: block_num,
                     block_hash,
                     tx_hash,
-                    tx_idx as u64,
+                    tx_index: tx_idx as u64,
                     log_index,
-                    topics,
-                    &raw_data,
+                    raw_topics: topics.to_vec(),
+                    raw_data,
                     decoded,
-                    source,
+                    source: source.to_owned(),
                     timestamp,
-                ));
+                });
             }
         }
 
@@ -509,15 +538,17 @@ mod era1_tests {
         }];
 
         let decoder = EventDecoder::new(&events, contract).unwrap();
-        let stored =
+        let decoded =
             decoder.extract_and_decode(&receipts, &tx_hashes, 100, B256::ZERO, 1_000_000, "era1");
 
-        assert_eq!(stored.len(), 1);
-        assert_eq!(stored[0].event_name, "Transfer");
-        assert_eq!(stored[0].tx_hash, tx_hash.to_string());
-        assert_eq!(stored[0].tx_index, 0);
-        assert_eq!(stored[0].log_index, 0);
-        assert_eq!(stored[0].source, "era1");
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].event_name, "Transfer");
+        assert_eq!(decoded[0].tx_hash, tx_hash);
+        assert_eq!(decoded[0].tx_index, 0);
+        assert_eq!(decoded[0].log_index, 0);
+        assert_eq!(decoded[0].source, "era1");
+        assert_eq!(decoded[0].block_number, 100);
+        assert_eq!(decoded[0].contract, contract);
     }
 }
 

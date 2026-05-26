@@ -4,7 +4,7 @@
 //! per ERA1 file: bloom-check each header, decode receipts for hits, verify
 //! the receipt Merkle root, ABI-decode matching logs, and store events.
 
-use crate::abi::{AbiCache, EventDecoder};
+use crate::abi::{AbiCache, DecodedEvent, EventDecoder};
 use crate::config::ContractConfig;
 use crate::error::CoreError;
 use crate::headers::BloomScanner;
@@ -13,7 +13,7 @@ use crate::source::{
     decode_era1_header, decode_era1_receipts, decode_era1_tx_hashes, iter_era1_block_tuples,
     SourceFileManifest,
 };
-use scopenode_storage::Db;
+use scopenode_storage::{models::StoredEvent, Db};
 use tracing::warn;
 
 /// Sink for pipeline progress events. Implement to drive a terminal bar or suppress output.
@@ -71,6 +71,24 @@ impl PreparedScope {
     fn contains_block(&self, block_number: u64) -> bool {
         block_number >= self.from && block_number <= self.to
     }
+}
+
+fn to_stored(e: DecodedEvent) -> StoredEvent {
+    StoredEvent::from_decoded_log(
+        e.contract,
+        &e.event_name,
+        e.topic0,
+        e.block_number,
+        e.block_hash,
+        e.tx_hash,
+        e.tx_index,
+        e.log_index,
+        &e.raw_topics,
+        &e.raw_data,
+        e.decoded,
+        &e.source,
+        e.timestamp,
+    )
 }
 
 /// Run the ERA1 indexing pipeline for one contract scope.
@@ -219,7 +237,7 @@ pub async fn run_era1_scopes(
                     header.timestamp,
                     "era1",
                 );
-                storage_events.extend(events);
+                storage_events.extend(events.into_iter().map(to_stored));
             }
 
             if !storage_events.is_empty() {
@@ -239,5 +257,73 @@ pub async fn run_era1_scopes(
         .join(", ");
     reporter.finish(&format!("done ({total_events} events across {scope_names})"));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::{address, bytes, B256};
+    use serde_json::json;
+
+    fn make_decoded_event() -> DecodedEvent {
+        DecodedEvent {
+            contract: address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+            event_name: "Transfer".to_string(),
+            topic0: B256::from([0x11u8; 32]),
+            block_number: 18_000_000,
+            block_hash: B256::from([0x22u8; 32]),
+            tx_hash: B256::from([0x33u8; 32]),
+            tx_index: 5,
+            log_index: 12,
+            raw_topics: vec![B256::from([0x11u8; 32]), B256::from([0x44u8; 32])],
+            raw_data: bytes!("deadbeef"),
+            decoded: json!({"from": "0xabc", "to": "0xdef", "value": "1000"}),
+            source: "era1".to_string(),
+            timestamp: 1_700_000_000,
+        }
+    }
+
+    #[test]
+    fn to_stored_serialises_address_as_checksum() {
+        let e = make_decoded_event();
+        let contract = e.contract;
+        let stored = to_stored(e);
+        assert_eq!(stored.contract, contract.to_checksum(None));
+    }
+
+    #[test]
+    fn to_stored_serialises_raw_data_as_hex() {
+        let e = make_decoded_event();
+        let stored = to_stored(e);
+        assert_eq!(stored.raw_data, "deadbeef");
+    }
+
+    #[test]
+    fn to_stored_casts_indices_to_i64() {
+        let e = make_decoded_event();
+        let stored = to_stored(e);
+        assert_eq!(stored.block_number, 18_000_000_i64);
+        assert_eq!(stored.tx_index, 5_i64);
+        assert_eq!(stored.log_index, 12_i64);
+    }
+
+    #[test]
+    fn to_stored_serialises_hashes_as_strings() {
+        let e = make_decoded_event();
+        let tx_hash = e.tx_hash;
+        let block_hash = e.block_hash;
+        let stored = to_stored(e);
+        assert_eq!(stored.tx_hash, tx_hash.to_string());
+        assert_eq!(stored.block_hash, block_hash.to_string());
+    }
+
+    #[test]
+    fn to_stored_preserves_scalar_fields() {
+        let e = make_decoded_event();
+        let stored = to_stored(e);
+        assert_eq!(stored.event_name, "Transfer");
+        assert_eq!(stored.source, "era1");
+        assert_eq!(stored.timestamp, 1_700_000_000_i64);
+    }
 }
 

@@ -1,15 +1,37 @@
 //! `sync` command — indexes contract events from local ERA1 files.
 
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use scopenode_core::{
-    abi::AbiCache,
+    abi::{AbiCache, AbiStore},
     config::Config,
     era_pipeline::{run_era1_scopes, ProgressReporter},
+    error::AbiError,
     source::scan_era1_source,
 };
 use scopenode_storage::Db;
 use std::path::PathBuf;
+use std::sync::Arc;
+
+struct DbAbiStore(Db);
+
+#[async_trait]
+impl AbiStore for DbAbiStore {
+    async fn load(&self, address: &str) -> Result<Option<String>, AbiError> {
+        self.0
+            .get_contract_abi(address)
+            .await
+            .map_err(|e| AbiError::Cache(e.to_string()))
+    }
+
+    async fn save(&self, address: &str, name: Option<&str>, abi_json: &str) -> Result<(), AbiError> {
+        self.0
+            .upsert_contract(address, name, abi_json)
+            .await
+            .map_err(|e| AbiError::Cache(e.to_string()))
+    }
+}
 
 struct IndicatifReporter(ProgressBar);
 
@@ -73,7 +95,7 @@ pub async fn run(config: Config, db: Db, dry_run: bool, quiet: bool) -> Result<(
     );
     let reporter = IndicatifReporter(pb);
 
-    let mut abi_cache = AbiCache::new(db.clone());
+    let mut abi_cache = AbiCache::new(Arc::new(DbAbiStore(db.clone())));
 
     run_era1_scopes(
         &scan.files,

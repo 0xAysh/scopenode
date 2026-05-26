@@ -25,6 +25,7 @@ impl StoredEvent {
     ///
     /// Handles all serialisation (checksumming, hex encoding, JSON) so callers
     /// work with native Ethereum types and never touch string formats.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_decoded_log(
         contract: Address,
         event_name: &str,
