@@ -315,7 +315,7 @@ async fn era1_pipeline_indexes_transfer_event() {
     let db_path = unique_db_path();
     let db = Db::open(db_path.clone()).await.unwrap();
 
-    // Pre-cache ABI (skips Sourcify fetch)
+    // Pre-cache ABI so the test does not need a local override file.
     let addr_str = contract.to_checksum(None);
     db.upsert_contract(&addr_str, Some("USDT"), &transfer_abi_json())
         .await
