@@ -4,6 +4,7 @@
 
 mod cli;
 mod commands;
+mod runtime;
 
 use anyhow::Result;
 use clap::Parser;

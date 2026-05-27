@@ -6,13 +6,11 @@
 
 use crate::abi::{AbiCache, DecodedEvent, EventDecoder};
 use crate::config::ContractConfig;
+use crate::era1_reader::{iter_era1_block_facts, Era1BlockFacts};
 use crate::error::{CoreError, VerifyError};
 use crate::headers::BloomScanner;
 use crate::receipts::verify_era1_receipts;
-use crate::source::{
-    decode_era1_header, decode_era1_receipts, decode_era1_tx_hashes, iter_era1_block_tuples,
-    Era1BlockTuple, SourceFileManifest,
-};
+use crate::source::SourceFileManifest;
 use alloy_consensus::ReceiptEnvelope;
 use alloy_primitives::{Log as PrimitiveLog, B256};
 use async_trait::async_trait;
@@ -146,14 +144,13 @@ impl PreparedScope {
 
 /// Encapsulates all per-block processing for the ERA1 pipeline.
 ///
-/// Given one `Era1BlockTuple`, `process()` performs in order: block range
-/// filtering against all scopes, header decoding, Bloom pre-screening, receipt
-/// decoding, Merkle root verification (via the injected [`ReceiptVerifier`]),
-/// transaction hash extraction, and per-scope event extraction.
+/// Given one `Era1BlockFacts`, `process()` performs in order: block range
+/// filtering against all scopes, Bloom pre-screening, Merkle root verification
+/// (via the injected [`ReceiptVerifier`]), and per-scope event extraction.
 ///
 /// Returns an empty `Vec` for blocks that produce no events — whether because
-/// no scope's range matches, no Bloom hit, or a decode/verify failure. The
-/// outer file-iteration loop is the only caller; it stays thin and free of
+/// no scope's range matches, no Bloom hit, or a verify failure. The outer
+/// file-iteration loop is the only caller; it stays thin and free of
 /// decoding logic.
 struct BlockPipeline {
     scopes: Vec<PreparedScope>,
@@ -173,54 +170,40 @@ impl BlockPipeline {
         Self { scopes, verifier }
     }
 
-    fn process(&self, tuple: &Era1BlockTuple) -> Vec<DecodedEvent> {
+    fn process(&self, facts: &Era1BlockFacts) -> Vec<DecodedEvent> {
         let in_range: Vec<&PreparedScope> = self
             .scopes
             .iter()
-            .filter(|s| s.contains_block(tuple.block_number))
+            .filter(|s| s.contains_block(facts.block_number))
             .collect();
         if in_range.is_empty() {
             return vec![];
         }
 
-        let header = match decode_era1_header(&tuple.compressed_header) {
-            Ok(h) => h,
-            Err(e) => {
-                warn!(block = tuple.block_number, err = %e, "Header decode failed — skipping");
-                return vec![];
-            }
-        };
-
         let bloom_matches: Vec<&PreparedScope> = in_range
             .into_iter()
-            .filter(|s| s.scanner.matches(&header.logs_bloom))
+            .filter(|s| s.scanner.matches(&facts.header.logs_bloom))
             .collect();
         if bloom_matches.is_empty() {
             return vec![];
         }
 
-        let receipts = match decode_era1_receipts(&tuple.compressed_receipts) {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(block = header.number, err = %e, "Receipt decode failed — skipping");
-                return vec![];
-            }
-        };
-
-        if let Err(e) = self.verifier.verify(&receipts, header.receipts_root, header.number) {
-            warn!(block = header.number, err = %e, "Receipt Merkle verify failed — skipping");
+        if let Err(e) = self
+            .verifier
+            .verify(&facts.receipts, facts.header.receipts_root, facts.header.number)
+        {
+            warn!(block = facts.header.number, err = %e, "Receipt Merkle verify failed — skipping");
             return vec![];
         }
 
-        let tx_hashes = decode_era1_tx_hashes(&tuple.compressed_body).unwrap_or_default();
         let mut events = Vec::new();
         for scope in bloom_matches {
             events.extend(scope.decoder.extract_and_decode(
-                &receipts,
-                &tx_hashes,
-                header.number,
-                header.hash,
-                header.timestamp,
+                &facts.receipts,
+                &facts.tx_hashes,
+                facts.header.number,
+                facts.header.hash,
+                facts.header.timestamp,
                 "era1",
             ));
         }
@@ -297,7 +280,7 @@ pub async fn run_era1_scopes(
     let mut total_events = 0usize;
 
     for file in &covering {
-        let tuples = match iter_era1_block_tuples(&file.path) {
+        let facts_iter = match iter_era1_block_facts(&file.path) {
             Ok(it) => it,
             Err(e) => {
                 warn!(path = %file.path.display(), err = %e, "Failed to open ERA1 file — skipping");
@@ -305,9 +288,9 @@ pub async fn run_era1_scopes(
             }
         };
 
-        for tuple_result in tuples {
-            let tuple = match tuple_result {
-                Ok(t) => t,
+        for facts_result in facts_iter {
+            let facts = match facts_result {
+                Ok(f) => f,
                 Err(e) => {
                     warn!(err = %e, "ERA1 read error — skipping block");
                     continue;
@@ -316,11 +299,12 @@ pub async fn run_era1_scopes(
 
             reporter.inc();
 
-            let block_events = pipeline.process(&tuple);
+            let block_number = facts.block_number;
+            let block_events = pipeline.process(&facts);
             if !block_events.is_empty() {
                 match sink.store(block_events).await {
                     Ok(n) => total_events += n,
-                    Err(e) => warn!(block = tuple.block_number, err = %e, "Event insert failed"),
+                    Err(e) => warn!(block = block_number, err = %e, "Event insert failed"),
                 }
             }
         }
@@ -337,20 +321,8 @@ pub async fn run_era1_scopes(
 mod tests {
     use super::*;
     use crate::abi::{EventAbi, EventDecoder};
+    use crate::types::ScopeHeader;
     use alloy_primitives::{address, keccak256, Address, Bloom, BloomInput, B256};
-    use alloy_rlp::Encodable;
-
-    fn snappy_compress(data: &[u8]) -> Vec<u8> {
-        use snap::write::FrameEncoder;
-        use std::io::Write;
-        let mut out = Vec::new();
-        {
-            let mut enc = FrameEncoder::new(&mut out);
-            enc.write_all(data).unwrap();
-            enc.flush().unwrap();
-        }
-        out
-    }
 
     fn make_scope(from: u64, to: u64) -> PreparedScope {
         let addr = address!("0000000000000000000000000000000000000001");
@@ -373,27 +345,22 @@ mod tests {
         }
     }
 
-    fn empty_tuple(block_number: u64) -> Era1BlockTuple {
-        Era1BlockTuple {
+    fn empty_facts(block_number: u64) -> Era1BlockFacts {
+        Era1BlockFacts {
             block_number,
-            compressed_header: vec![],
-            compressed_body: vec![],
-            compressed_receipts: vec![],
-            total_difficulty: vec![],
+            header: ScopeHeader {
+                number: block_number,
+                hash: B256::ZERO,
+                parent_hash: B256::ZERO,
+                timestamp: 0,
+                receipts_root: B256::ZERO,
+                logs_bloom: Bloom::default(),
+                gas_used: 0,
+                base_fee_per_gas: None,
+            },
+            receipts: vec![],
+            tx_hashes: vec![],
         }
-    }
-
-    fn make_compressed_header(block_number: u64, bloom: Bloom, receipts_root: B256) -> Vec<u8> {
-        use alloy_consensus::Header;
-        let header = Header {
-            number: block_number,
-            logs_bloom: bloom,
-            receipts_root,
-            ..Default::default()
-        };
-        let mut rlp = Vec::new();
-        header.encode(&mut rlp);
-        snappy_compress(&rlp)
     }
 
     #[test]
@@ -409,19 +376,8 @@ mod tests {
     #[test]
     fn block_out_of_range_returns_empty() {
         let pipeline = BlockPipeline::new(vec![make_scope(100, 200)]);
-        assert!(pipeline.process(&empty_tuple(99)).is_empty());
-        assert!(pipeline.process(&empty_tuple(201)).is_empty());
-    }
-
-    #[test]
-    fn malformed_header_returns_empty() {
-        let pipeline = BlockPipeline::new(vec![make_scope(100, 200)]);
-        let tuple = Era1BlockTuple {
-            block_number: 150,
-            compressed_header: vec![0xAA, 0xBB, 0xCC],
-            ..empty_tuple(150)
-        };
-        assert!(pipeline.process(&tuple).is_empty());
+        assert!(pipeline.process(&empty_facts(99)).is_empty());
+        assert!(pipeline.process(&empty_facts(201)).is_empty());
     }
 
     #[test]
@@ -431,19 +387,13 @@ mod tests {
         let pipeline =
             BlockPipeline::new(vec![make_scope_with_target(100, 200, addr, topic0)]);
 
-        // Header with empty bloom — scanner's address/topic0 are not present.
-        let compressed_header =
-            make_compressed_header(150, Bloom::default(), B256::ZERO);
-        let tuple = Era1BlockTuple {
-            block_number: 150,
-            compressed_header,
-            ..empty_tuple(150)
-        };
-        assert!(pipeline.process(&tuple).is_empty());
+        // Facts with empty bloom — scanner's address/topic0 are not present.
+        let facts = empty_facts(150);
+        assert!(pipeline.process(&facts).is_empty());
     }
 
     #[test]
-    fn receipt_decode_failure_returns_empty() {
+    fn bloom_match_with_empty_receipts_returns_empty() {
         let addr = Address::repeat_byte(0xAB);
         let topic0 = keccak256(b"Transfer(address,address,uint256)");
         let pipeline =
@@ -452,15 +402,18 @@ mod tests {
         let mut bloom = Bloom::default();
         bloom.accrue(BloomInput::Raw(addr.as_slice()));
         bloom.accrue(BloomInput::Raw(topic0.as_slice()));
-        let compressed_header = make_compressed_header(150, bloom, B256::ZERO);
 
-        let tuple = Era1BlockTuple {
-            block_number: 150,
-            compressed_header,
-            compressed_receipts: vec![0xFF, 0xFE, 0xFD], // garbage
-            ..empty_tuple(150)
+        let facts = Era1BlockFacts {
+            header: ScopeHeader {
+                logs_bloom: bloom,
+                ..empty_facts(150).header
+            },
+            ..empty_facts(150)
         };
-        assert!(pipeline.process(&tuple).is_empty());
+        // Empty receipts list → no events extracted (Merkle verify passes for empty list
+        // only if receipts_root matches — MerkleVerifier may reject; either way, no events).
+        // The important thing is: no panic, and result is empty.
+        assert!(pipeline.process(&facts).is_empty());
     }
 
     #[test]
@@ -477,35 +430,27 @@ mod tests {
         bloom.accrue(BloomInput::Raw(addr.as_slice()));
         bloom.accrue(BloomInput::Raw(topic0.as_slice()));
 
-        // Header with wrong receipts_root — mismatches the receipts below.
-        let wrong_root = B256::from([0xAA; 32]);
-        let compressed_header = make_compressed_header(150, bloom, wrong_root);
-
-        let receipt = ReceiptWithBloom::<Receipt<PrimitiveLog>> {
+        let receipt = ReceiptEnvelope::Legacy(ReceiptWithBloom::<Receipt<PrimitiveLog>> {
             receipt: Receipt {
                 status: Eip658Value::Eip658(true),
                 cumulative_gas_used: 21_000,
                 logs: vec![],
             },
             logs_bloom: Bloom::default(),
-        };
-        let mut receipt_rlp = Vec::new();
-        receipt.encode(&mut receipt_rlp);
-        let outer = alloy_rlp::Header {
-            list: true,
-            payload_length: receipt_rlp.len(),
-        };
-        let mut receipts_buf = Vec::new();
-        outer.encode(&mut receipts_buf);
-        receipts_buf.extend_from_slice(&receipt_rlp);
+        });
 
-        let tuple = Era1BlockTuple {
-            block_number: 150,
-            compressed_header,
-            compressed_receipts: snappy_compress(&receipts_buf),
-            ..empty_tuple(150)
+        // Wrong receipts_root — will not match what MerkleVerifier computes.
+        let wrong_root = B256::from([0xAA; 32]);
+        let facts = Era1BlockFacts {
+            header: ScopeHeader {
+                logs_bloom: bloom,
+                receipts_root: wrong_root,
+                ..empty_facts(150).header
+            },
+            receipts: vec![receipt],
+            ..empty_facts(150)
         };
-        assert!(pipeline.process(&tuple).is_empty());
+        assert!(pipeline.process(&facts).is_empty());
     }
 
     #[test]
@@ -523,39 +468,31 @@ mod tests {
         let mut bloom = Bloom::default();
         bloom.accrue(BloomInput::Raw(addr.as_slice()));
         bloom.accrue(BloomInput::Raw(topic0.as_slice()));
-        let compressed_header = make_compressed_header(150, bloom, B256::ZERO);
 
-        let receipt = ReceiptWithBloom::<Receipt<PrimitiveLog>> {
+        let receipt = ReceiptEnvelope::Legacy(ReceiptWithBloom::<Receipt<PrimitiveLog>> {
             receipt: Receipt {
                 status: Eip658Value::Eip658(true),
                 cumulative_gas_used: 21_000,
                 logs: vec![],
             },
             logs_bloom: Bloom::default(),
-        };
-        let mut receipt_rlp = Vec::new();
-        receipt.encode(&mut receipt_rlp);
-        let outer = alloy_rlp::Header {
-            list: true,
-            payload_length: receipt_rlp.len(),
-        };
-        let mut receipts_buf = Vec::new();
-        outer.encode(&mut receipts_buf);
-        receipts_buf.extend_from_slice(&receipt_rlp);
+        });
 
-        let tuple = Era1BlockTuple {
-            block_number: 150,
-            compressed_header,
-            compressed_receipts: snappy_compress(&receipts_buf),
-            ..empty_tuple(150)
+        let facts = Era1BlockFacts {
+            header: ScopeHeader {
+                logs_bloom: bloom,
+                ..empty_facts(150).header
+            },
+            receipts: vec![receipt],
+            ..empty_facts(150)
         };
-        assert!(pipeline.process(&tuple).is_empty());
+        assert!(pipeline.process(&facts).is_empty());
     }
 
     #[test]
     fn no_scopes_returns_empty() {
         let pipeline = BlockPipeline::new(vec![]);
-        assert!(pipeline.process(&empty_tuple(100)).is_empty());
+        assert!(pipeline.process(&empty_facts(100)).is_empty());
     }
 
     #[test]

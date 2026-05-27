@@ -7,6 +7,7 @@
 
 pub mod abi;
 pub mod config;
+pub mod era1_reader;
 pub mod era_pipeline;
 pub mod error;
 pub mod headers;

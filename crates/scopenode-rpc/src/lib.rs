@@ -7,6 +7,7 @@
 
 #![deny(warnings)]
 
+pub mod projection;
 pub mod rest;
 pub mod server;
 

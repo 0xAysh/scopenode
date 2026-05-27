@@ -5,6 +5,8 @@ use scopenode_core::config::Config;
 use scopenode_storage::Db;
 use std::path::PathBuf;
 
+use crate::runtime::RuntimeContext;
+
 pub async fn run(config: Config, db: Db) -> Result<()> {
     let port = config.node.port;
     let rest_port = config.node.rest_port;
@@ -34,38 +36,6 @@ pub async fn run(config: Config, db: Db) -> Result<()> {
 
 /// Entry point called from main.rs — loads config, opens DB, calls run().
 pub async fn execute(config_path: PathBuf) -> Result<()> {
-    let config = Config::from_file(&config_path).context("Failed to load config")?;
-
-    let data_dir = expand_tilde(
-        config
-            .node
-            .data_dir
-            .clone()
-            .unwrap_or_else(default_data_dir),
-    );
-    std::fs::create_dir_all(&data_dir)
-        .with_context(|| format!("Failed to create data dir: {}", data_dir.display()))?;
-
-    let db = Db::open(data_dir.join("scopenode.db"))
-        .await
-        .context("Failed to open database")?;
-
-    run(config, db).await
-}
-
-fn default_data_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".scopenode")
-}
-
-fn expand_tilde(path: PathBuf) -> PathBuf {
-    if let Some(s) = path.to_str() {
-        if let Some(stripped) = s.strip_prefix("~/") {
-            if let Some(home) = dirs::home_dir() {
-                return home.join(stripped);
-            }
-        }
-    }
-    path
+    let ctx = RuntimeContext::load(config_path).await?;
+    run(ctx.config, ctx.db).await
 }
