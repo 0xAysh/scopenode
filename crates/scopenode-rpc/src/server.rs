@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::types::ErrorObject;
-use scopenode_storage::{Db, DbError, EventFilter};
+use scopenode_storage::{Db, EventFilter};
 #[rpc(server, namespace = "net")]
 pub trait NetApi {
     #[method(name = "peerCount")]
@@ -82,20 +82,25 @@ impl EthApiServer for EthApiImpl {
             offset: 0,
         };
 
-        let rows = self
+        let result = self
             .db
             .query_events_for_filter(&event_filter)
             .await
-            .map_err(|e| match e {
-                DbError::TooManyResults { .. } => ErrorObject::owned(
-                    -32005,
-                    "result set exceeds 10,000 rows — narrow your filter (smaller block range or add address/topic filter)",
-                    None::<()>,
-                ),
-                other => internal_error(&other.to_string()),
-            })?;
+            .map_err(|e| internal_error(&e.to_string()))?;
 
-        let logs = rows.into_iter().filter_map(|row| row_to_log(&row)).collect();
+        if result.is_capped() {
+            return Err(ErrorObject::owned(
+                -32005,
+                "result set exceeds 10,000 rows — narrow your filter (smaller block range or add address/topic filter)",
+                None::<()>,
+            ));
+        }
+
+        let logs = result
+            .into_results()
+            .into_iter()
+            .filter_map(|row| row_to_log(&row))
+            .collect();
         Ok(logs)
     }
 

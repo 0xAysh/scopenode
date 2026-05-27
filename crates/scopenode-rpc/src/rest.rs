@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
 use tracing::info;
 
-use scopenode_storage::{Db, DbError, EventFilter};
+use scopenode_storage::{Db, EventFilter};
 
 #[derive(Clone)]
 struct AppState {
@@ -122,19 +122,20 @@ async fn get_events(
         offset: q.offset.unwrap_or(0),
     };
 
-    let rows = state
+    let result = state
         .db
         .query_events_for_filter(&filter)
         .await
-        .map_err(|e| match e {
-            DbError::TooManyResults { .. } => (
-                axum::http::StatusCode::BAD_REQUEST,
-                "result set exceeds 10,000 rows — narrow your filter (smaller block range or add address/topic filter)".into(),
-            ),
-            other => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
-        })?;
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let events: Vec<EventResponse> = rows.iter().map(EventResponse::from).collect();
+    if result.is_capped() {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "result set exceeds 10,000 rows — narrow your filter (smaller block range or add address/topic filter)".into(),
+        ));
+    }
+
+    let events: Vec<EventResponse> = result.into_results().iter().map(EventResponse::from).collect();
     let count = events.len();
     Ok(Json(EventsResponse { events, count }))
 }

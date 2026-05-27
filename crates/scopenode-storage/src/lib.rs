@@ -11,4 +11,4 @@ pub mod types;
 pub use db::Db;
 pub use error::DbError;
 pub use sink::DbEventSink;
-pub use types::EventFilter;
+pub use types::{EventFilter, QueryResult};

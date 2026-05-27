@@ -6,13 +6,15 @@
 
 use crate::abi::{AbiCache, DecodedEvent, EventDecoder};
 use crate::config::ContractConfig;
-use crate::error::CoreError;
+use crate::error::{CoreError, VerifyError};
 use crate::headers::BloomScanner;
 use crate::receipts::verify_era1_receipts;
 use crate::source::{
     decode_era1_header, decode_era1_receipts, decode_era1_tx_hashes, iter_era1_block_tuples,
     Era1BlockTuple, SourceFileManifest,
 };
+use alloy_consensus::ReceiptEnvelope;
+use alloy_primitives::{Log as PrimitiveLog, B256};
 use async_trait::async_trait;
 use tracing::warn;
 
@@ -39,6 +41,66 @@ impl ProgressReporter for NullReporter {
     fn set_total(&self, _n: u64) {}
     fn inc(&self) {}
     fn finish(&self, _msg: &str) {}
+}
+
+/// Pluggable Merkle receipt verification strategy for `BlockPipeline`.
+///
+/// The production pipeline uses [`MerkleVerifier`] which calls the real
+/// `verify_era1_receipts` function. Tests inject [`NoopVerifier`] or
+/// [`AlwaysFailVerifier`] to exercise recovery paths without ERA1 files.
+pub trait ReceiptVerifier: Send + Sync {
+    fn verify(
+        &self,
+        receipts: &[ReceiptEnvelope<PrimitiveLog>],
+        expected_root: B256,
+        block_num: u64,
+    ) -> Result<(), VerifyError>;
+}
+
+/// Production verifier — delegates to the Merkle Patricia Trie implementation.
+pub struct MerkleVerifier;
+
+impl ReceiptVerifier for MerkleVerifier {
+    fn verify(
+        &self,
+        receipts: &[ReceiptEnvelope<PrimitiveLog>],
+        expected_root: B256,
+        block_num: u64,
+    ) -> Result<(), VerifyError> {
+        verify_era1_receipts(receipts, expected_root, block_num)
+    }
+}
+
+/// Test verifier — always succeeds without checking the Merkle root.
+pub struct NoopVerifier;
+
+impl ReceiptVerifier for NoopVerifier {
+    fn verify(
+        &self,
+        _receipts: &[ReceiptEnvelope<PrimitiveLog>],
+        _expected_root: B256,
+        _block_num: u64,
+    ) -> Result<(), VerifyError> {
+        Ok(())
+    }
+}
+
+/// Test verifier — always fails, simulating a corrupt or tampered receipt set.
+pub struct AlwaysFailVerifier;
+
+impl ReceiptVerifier for AlwaysFailVerifier {
+    fn verify(
+        &self,
+        _receipts: &[ReceiptEnvelope<PrimitiveLog>],
+        _expected_root: B256,
+        block_num: u64,
+    ) -> Result<(), VerifyError> {
+        Err(VerifyError::RootMismatch {
+            block_num,
+            expected: B256::ZERO,
+            computed: B256::from([0xAA; 32]),
+        })
+    }
 }
 
 struct PreparedScope {
@@ -86,8 +148,8 @@ impl PreparedScope {
 ///
 /// Given one `Era1BlockTuple`, `process()` performs in order: block range
 /// filtering against all scopes, header decoding, Bloom pre-screening, receipt
-/// decoding, Merkle root verification, transaction hash extraction, and
-/// per-scope event extraction.
+/// decoding, Merkle root verification (via the injected [`ReceiptVerifier`]),
+/// transaction hash extraction, and per-scope event extraction.
 ///
 /// Returns an empty `Vec` for blocks that produce no events — whether because
 /// no scope's range matches, no Bloom hit, or a decode/verify failure. The
@@ -95,11 +157,20 @@ impl PreparedScope {
 /// decoding logic.
 struct BlockPipeline {
     scopes: Vec<PreparedScope>,
+    verifier: Box<dyn ReceiptVerifier>,
 }
 
 impl BlockPipeline {
     fn new(scopes: Vec<PreparedScope>) -> Self {
-        Self { scopes }
+        Self {
+            scopes,
+            verifier: Box::new(MerkleVerifier),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_verifier(scopes: Vec<PreparedScope>, verifier: Box<dyn ReceiptVerifier>) -> Self {
+        Self { scopes, verifier }
     }
 
     fn process(&self, tuple: &Era1BlockTuple) -> Vec<DecodedEvent> {
@@ -136,7 +207,7 @@ impl BlockPipeline {
             }
         };
 
-        if let Err(e) = verify_era1_receipts(&receipts, header.receipts_root, header.number) {
+        if let Err(e) = self.verifier.verify(&receipts, header.receipts_root, header.number) {
             warn!(block = header.number, err = %e, "Receipt Merkle verify failed — skipping");
             return vec![];
         }
@@ -409,6 +480,50 @@ mod tests {
         // Header with wrong receipts_root — mismatches the receipts below.
         let wrong_root = B256::from([0xAA; 32]);
         let compressed_header = make_compressed_header(150, bloom, wrong_root);
+
+        let receipt = ReceiptWithBloom::<Receipt<PrimitiveLog>> {
+            receipt: Receipt {
+                status: Eip658Value::Eip658(true),
+                cumulative_gas_used: 21_000,
+                logs: vec![],
+            },
+            logs_bloom: Bloom::default(),
+        };
+        let mut receipt_rlp = Vec::new();
+        receipt.encode(&mut receipt_rlp);
+        let outer = alloy_rlp::Header {
+            list: true,
+            payload_length: receipt_rlp.len(),
+        };
+        let mut receipts_buf = Vec::new();
+        outer.encode(&mut receipts_buf);
+        receipts_buf.extend_from_slice(&receipt_rlp);
+
+        let tuple = Era1BlockTuple {
+            block_number: 150,
+            compressed_header,
+            compressed_receipts: snappy_compress(&receipts_buf),
+            ..empty_tuple(150)
+        };
+        assert!(pipeline.process(&tuple).is_empty());
+    }
+
+    #[test]
+    fn always_fail_verifier_returns_empty_for_in_range_bloom_hit() {
+        use alloy_consensus::{Eip658Value, Receipt, ReceiptWithBloom};
+        use alloy_primitives::Log as PrimitiveLog;
+
+        let addr = Address::repeat_byte(0xAB);
+        let topic0 = keccak256(b"Transfer(address,address,uint256)");
+        let pipeline = BlockPipeline::with_verifier(
+            vec![make_scope_with_target(100, 200, addr, topic0)],
+            Box::new(AlwaysFailVerifier),
+        );
+
+        let mut bloom = Bloom::default();
+        bloom.accrue(BloomInput::Raw(addr.as_slice()));
+        bloom.accrue(BloomInput::Raw(topic0.as_slice()));
+        let compressed_header = make_compressed_header(150, bloom, B256::ZERO);
 
         let receipt = ReceiptWithBloom::<Receipt<PrimitiveLog>> {
             receipt: Receipt {

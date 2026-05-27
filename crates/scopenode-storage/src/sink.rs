@@ -18,24 +18,6 @@ impl DbEventSink {
     }
 }
 
-fn to_stored(e: DecodedEvent) -> StoredEvent {
-    StoredEvent::from_decoded_log(
-        e.contract,
-        &e.event_name,
-        e.topic0,
-        e.block_number,
-        e.block_hash,
-        e.tx_hash,
-        e.tx_index,
-        e.log_index,
-        &e.raw_topics,
-        &e.raw_data,
-        e.decoded,
-        &e.source,
-        e.timestamp,
-    )
-}
-
 #[async_trait]
 impl EventSink for DbEventSink {
     async fn store(&self, events: Vec<DecodedEvent>) -> Result<usize, CoreError> {
@@ -43,7 +25,7 @@ impl EventSink for DbEventSink {
             return Ok(0);
         }
         let count = events.len();
-        let stored: Vec<StoredEvent> = events.into_iter().map(to_stored).collect();
+        let stored: Vec<StoredEvent> = events.into_iter().map(Into::into).collect();
         self.db
             .insert_events(&stored)
             .await
@@ -76,49 +58,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn to_stored_serialises_address_as_checksum() {
-        let e = make_decoded_event();
-        let contract = e.contract;
-        let stored = to_stored(e);
-        assert_eq!(stored.contract, contract.to_checksum(None));
-    }
-
-    #[test]
-    fn to_stored_serialises_raw_data_as_hex() {
-        let e = make_decoded_event();
-        let stored = to_stored(e);
-        assert_eq!(stored.raw_data, "deadbeef");
-    }
-
-    #[test]
-    fn to_stored_casts_indices_to_i64() {
-        let e = make_decoded_event();
-        let stored = to_stored(e);
-        assert_eq!(stored.block_number, 18_000_000_i64);
-        assert_eq!(stored.tx_index, 5_i64);
-        assert_eq!(stored.log_index, 12_i64);
-    }
-
-    #[test]
-    fn to_stored_serialises_hashes_as_strings() {
-        let e = make_decoded_event();
-        let tx_hash = e.tx_hash;
-        let block_hash = e.block_hash;
-        let stored = to_stored(e);
-        assert_eq!(stored.tx_hash, tx_hash.to_string());
-        assert_eq!(stored.block_hash, block_hash.to_string());
-    }
-
-    #[test]
-    fn to_stored_preserves_scalar_fields() {
-        let e = make_decoded_event();
-        let stored = to_stored(e);
-        assert_eq!(stored.event_name, "Transfer");
-        assert_eq!(stored.source, "era1");
-        assert_eq!(stored.timestamp, 1_700_000_000_i64);
-    }
-
     #[tokio::test]
     async fn db_event_sink_store_inserts_events() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -136,5 +75,16 @@ mod tests {
 
         let count = db.count_events_for_contract(&addr_str).await.unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn db_event_sink_store_empty_returns_zero() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let (file, path) = tmp.into_parts();
+        drop(file);
+        let db = Db::open(path.to_path_buf()).await.unwrap();
+        let sink = DbEventSink::new(db);
+        let n = sink.store(vec![]).await.unwrap();
+        assert_eq!(n, 0);
     }
 }

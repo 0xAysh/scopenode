@@ -13,7 +13,7 @@
 
 use crate::error::DbError;
 use crate::models::{ContractRow, StoredEvent};
-use crate::types::EventFilter;
+use crate::types::{EventFilter, QueryResult};
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 use std::path::PathBuf;
 use tracing::info;
@@ -318,13 +318,12 @@ impl Db {
     /// Query events with the given filter.
     ///
     /// When `filter.limit > 0` the storage layer queries `limit + 1` rows
-    /// internally. If the result exceeds `limit`, returns
-    /// [`DbError::TooManyResults`] so API layers can surface a consistent error
-    /// without duplicating the sentinel logic.
+    /// internally. Returns [`QueryResult::Capped`] when the result exceeds
+    /// `limit`; [`QueryResult::Results`] otherwise.
     pub async fn query_events_for_filter(
         &self,
         filter: &EventFilter,
-    ) -> Result<Vec<StoredEvent>, DbError> {
+    ) -> Result<QueryResult, DbError> {
         let from = filter.from_block.unwrap_or(0) as i64;
         let to = filter.to_block.map(|b| b as i64).unwrap_or(i64::MAX);
         let has_contract = filter.contract.is_some();
@@ -350,10 +349,10 @@ impl Db {
 
         if filter.limit > 0 && rows.len() as u64 > filter.limit {
             rows.truncate(filter.limit as usize);
-            return Err(DbError::TooManyResults { limit: filter.limit });
+            return Ok(QueryResult::Capped { results: rows, cap: filter.limit });
         }
 
-        Ok(rows)
+        Ok(QueryResult::Results(rows))
     }
 
     /// Stream events matching the given filter, row by row (no result cap).
@@ -554,7 +553,7 @@ mod tests {
             .await
             .unwrap();
 
-        let rows = db
+        let result = db
             .query_events_for_filter(&EventFilter {
                 contract: Some(contract.to_string()),
                 limit: 100,
@@ -562,7 +561,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(rows.len(), 1);
+        assert_eq!(result.into_results().len(), 1);
     }
 
     #[tokio::test]
@@ -609,13 +608,14 @@ mod tests {
                 ..EventFilter::default()
             })
             .await
-            .unwrap();
+            .unwrap()
+            .into_results();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].topic0, transfer_topic0);
     }
 
     #[tokio::test]
-    async fn query_events_for_filter_returns_too_many_results_when_cap_exceeded() {
+    async fn query_events_for_filter_returns_capped_when_cap_exceeded() {
         let (db, _guard) = open_test_db().await;
         let contract = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
         db.upsert_contract(contract, None, "[]").await.unwrap();
@@ -630,11 +630,60 @@ mod tests {
                 limit: 3,
                 ..EventFilter::default()
             })
-            .await;
+            .await
+            .unwrap();
 
         assert!(
-            matches!(result, Err(DbError::TooManyResults { limit: 3 })),
-            "expected TooManyResults, got: {:?}",
+            matches!(&result, QueryResult::Capped { results, cap: 3 } if results.len() == 3),
+            "expected Capped with 3 rows, got: {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn query_events_for_filter_returns_results_when_under_cap() {
+        let (db, _guard) = open_test_db().await;
+        let contract = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
+        db.upsert_contract(contract, None, "[]").await.unwrap();
+        let events: Vec<_> = (0..3)
+            .map(|i| make_event(contract, 100 + i, &format!("0x{:04x}", i), &format!("0x{:04x}", i), 0))
+            .collect();
+        db.insert_events(&events).await.unwrap();
+
+        let result = db
+            .query_events_for_filter(&EventFilter {
+                contract: Some(contract.to_string()),
+                limit: 10,
+                ..EventFilter::default()
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(&result, QueryResult::Results(rows) if rows.len() == 3),
+            "expected Results with 3 rows, got: {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn query_events_for_filter_returns_results_when_empty() {
+        let (db, _guard) = open_test_db().await;
+        let contract = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
+        db.upsert_contract(contract, None, "[]").await.unwrap();
+
+        let result = db
+            .query_events_for_filter(&EventFilter {
+                contract: Some(contract.to_string()),
+                limit: 10,
+                ..EventFilter::default()
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(&result, QueryResult::Results(rows) if rows.is_empty()),
+            "expected empty Results, got: {:?}",
             result
         );
     }
