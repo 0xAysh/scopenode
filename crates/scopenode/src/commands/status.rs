@@ -1,30 +1,16 @@
 //! `status` command — summarize what the local scopenode database contains.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use scopenode_core::config::Config;
 use scopenode_storage::Db;
 use std::path::{Path, PathBuf};
 
+use crate::runtime::RuntimeContext;
+
 /// Entry point called from main.rs — loads config, opens DB, prints status.
 pub async fn execute(config_path: PathBuf) -> Result<()> {
-    let config = Config::from_file(&config_path).context("Failed to load config")?;
-
-    let data_dir = expand_tilde(
-        config
-            .node
-            .data_dir
-            .clone()
-            .unwrap_or_else(default_data_dir),
-    );
-    let db_path = data_dir.join("scopenode.db");
-    std::fs::create_dir_all(&data_dir)
-        .with_context(|| format!("Failed to create data dir: {}", data_dir.display()))?;
-
-    let db = Db::open(db_path.clone())
-        .await
-        .context("Failed to open database")?;
-
-    print_status(&config, &db, &db_path).await
+    let ctx = RuntimeContext::load(config_path).await?;
+    print_status(&ctx.config, &ctx.db, &ctx.db_path).await
 }
 
 async fn print_status(config: &Config, db: &Db, db_path: &Path) -> Result<()> {
@@ -70,23 +56,6 @@ async fn print_status(config: &Config, db: &Db, db_path: &Path) -> Result<()> {
     }
 
     Ok(())
-}
-
-fn default_data_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".scopenode")
-}
-
-fn expand_tilde(path: PathBuf) -> PathBuf {
-    if let Some(s) = path.to_str() {
-        if let Some(stripped) = s.strip_prefix("~/") {
-            if let Some(home) = dirs::home_dir() {
-                return home.join(stripped);
-            }
-        }
-    }
-    path
 }
 
 fn human_bytes(bytes: u64) -> String {
