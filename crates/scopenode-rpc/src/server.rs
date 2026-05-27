@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::types::ErrorObject;
-use scopenode_storage::Db;
+use scopenode_storage::{Db, DbError, EventFilter};
 #[rpc(server, namespace = "net")]
 pub trait NetApi {
     #[method(name = "peerCount")]
@@ -68,44 +68,34 @@ impl EthApiServer for EthApiImpl {
             return Err(not_indexed_error());
         }
 
-        let contract_str: Option<String> = address.map(|a: Address| a.to_checksum(None));
-        let from_block = filter.get_from_block();
-        let to_block = filter.get_to_block();
-
-        let topic0_str: Option<String> = filter
-            .topics
-            .first()
-            .and_then(|t| t.iter().next())
-            .map(|t| format!("{:?}", t));
+        let event_filter = EventFilter {
+            contract: address.map(|a| a.to_checksum(None)),
+            event_name: None,
+            topic0: filter
+                .topics
+                .first()
+                .and_then(|t| t.iter().next())
+                .map(|t| format!("{:?}", t)),
+            from_block: filter.get_from_block(),
+            to_block: filter.get_to_block(),
+            limit: 10_000,
+            offset: 0,
+        };
 
         let rows = self
             .db
-            .query_events_for_filter(
-                contract_str.as_deref(),
-                None,
-                topic0_str.as_deref(),
-                from_block,
-                to_block,
-                10_001,
-                0,
-            )
+            .query_events_for_filter(&event_filter)
             .await
-            .map_err(|e| internal_error(&e.to_string()))?;
+            .map_err(|e| match e {
+                DbError::TooManyResults { .. } => ErrorObject::owned(
+                    -32005,
+                    "result set exceeds 10,000 rows — narrow your filter (smaller block range or add address/topic filter)",
+                    None::<()>,
+                ),
+                other => internal_error(&other.to_string()),
+            })?;
 
-        if rows.len() > 10_000 {
-            return Err(ErrorObject::owned(
-                -32005,
-                "result set exceeds 10,000 rows — narrow your filter (smaller block range or add address/topic filter)",
-                None::<()>,
-            ));
-        }
-
-        let logs = rows
-            .into_iter()
-            .take(10_000)
-            .filter_map(|row| row_to_log(&row))
-            .collect();
-
+        let logs = rows.into_iter().filter_map(|row| row_to_log(&row)).collect();
         Ok(logs)
     }
 

@@ -1,8 +1,7 @@
 //! Error types for the storage layer.
 //!
 //! [`DbError`] is the single error type returned by all `Db` methods. It is
-//! re-exported at the crate root (`scopenode_storage::DbError`) and wrapped by
-//! `CoreError::Storage` in the pipeline so `?` works without manual conversion.
+//! re-exported at the crate root (`scopenode_storage::DbError`).
 
 use thiserror::Error;
 
@@ -35,4 +34,11 @@ pub enum DbError {
     /// programming error in the query string.
     #[error("Query failed: {0}")]
     Query(String),
+
+    /// The query returned more rows than the requested limit.
+    ///
+    /// Callers should map this to their wire error format (HTTP 400 or JSON-RPC
+    /// error code -32005) with a message that advises narrowing the filter.
+    #[error("result set exceeds {limit} rows")]
+    TooManyResults { limit: u64 },
 }
