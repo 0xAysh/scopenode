@@ -28,22 +28,18 @@ pub async fn execute(config_path: PathBuf) -> Result<()> {
 }
 
 async fn print_status(config: &Config, db: &Db, db_path: &Path) -> Result<()> {
-    let event_count = db.count_all_events().await?;
-    let contract_count = db.count_contracts().await?;
-    let db_size = db.db_size_bytes().await?;
-    let block_range = db.indexed_block_range().await?;
-    let contracts = db.contracts_with_event_counts().await?;
+    let summary = db.status_summary().await?;
 
     println!("scopenode status");
     println!();
     println!("Database:");
     println!("  path: {}", db_path.display());
-    println!("  size: {}", human_bytes(db_size));
+    println!("  size: {}", human_bytes(summary.db_size_bytes));
     println!();
     println!("Indexed data:");
-    println!("  contracts: {contract_count}");
-    println!("  events: {event_count}");
-    match block_range {
+    println!("  contracts: {}", summary.contract_count);
+    println!("  events: {}", summary.event_count);
+    match summary.block_range {
         Some((from, to)) => println!("  block range: {from} -> {to}"),
         None => println!("  block range: none"),
     }
@@ -54,21 +50,20 @@ async fn print_status(config: &Config, db: &Db, db_path: &Path) -> Result<()> {
     println!();
 
     println!("Contracts:");
-    if contracts.is_empty() {
+    if summary.contracts.is_empty() {
         println!("  none");
         return Ok(());
     }
 
-    for (contract, total) in contracts {
+    for contract in &summary.contracts {
         let label = contract.name.as_deref().unwrap_or("Unnamed contract");
         println!("  {label}");
         println!("    address: {}", contract.address);
-        println!("    events: {total}");
+        println!("    events: {}", contract.total_events);
 
-        let breakdown = db.event_counts_for_contract(&contract.address).await?;
-        if !breakdown.is_empty() {
+        if !contract.event_breakdown.is_empty() {
             println!("    event breakdown:");
-            for (name, count) in breakdown {
+            for (name, count) in &contract.event_breakdown {
                 println!("      {name}: {count}");
             }
         }

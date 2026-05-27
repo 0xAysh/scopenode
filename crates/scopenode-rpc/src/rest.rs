@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
 use tracing::info;
 
-use scopenode_storage::{Db, EventFilter};
+use scopenode_storage::{Db, EventQuery, EventQueryOutcome};
 
 #[derive(Clone)]
 struct AppState {
@@ -112,7 +112,7 @@ async fn get_events(
     Query(q): Query<EventsQuery>,
 ) -> Result<Json<EventsResponse>, (axum::http::StatusCode, String)> {
     let limit = q.limit.unwrap_or(100).min(10_000) as u64;
-    let filter = EventFilter {
+    let query = EventQuery {
         contract: q.contract,
         event_name: q.event,
         topic0: q.topic0,
@@ -122,22 +122,25 @@ async fn get_events(
         offset: q.offset.unwrap_or(0),
     };
 
-    let result = state
+    match state
         .db
-        .query_events_for_filter(&filter)
+        .query_events(&query)
         .await
-        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    if result.is_capped() {
-        return Err((
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    {
+        EventQueryOutcome::Capped { .. } => Err((
             axum::http::StatusCode::BAD_REQUEST,
             "result set exceeds 10,000 rows — narrow your filter (smaller block range or add address/topic filter)".into(),
-        ));
+        )),
+        EventQueryOutcome::NotIndexed | EventQueryOutcome::Empty => {
+            Ok(Json(EventsResponse { events: vec![], count: 0 }))
+        }
+        EventQueryOutcome::Results(rows) => {
+            let events: Vec<EventResponse> = rows.iter().map(EventResponse::from).collect();
+            let count = events.len();
+            Ok(Json(EventsResponse { events, count }))
+        }
     }
-
-    let events: Vec<EventResponse> = result.into_results().iter().map(EventResponse::from).collect();
-    let count = events.len();
-    Ok(Json(EventsResponse { events, count }))
 }
 
 async fn get_status(
