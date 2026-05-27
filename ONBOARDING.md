@@ -100,9 +100,9 @@ scopenode restore [--label]     # restore from snapshot
 Ethereum mainnet peers
 (GetBlockHeaders + GetReceipts)
       |
-      | HTTPS (once per contract, cached)
+      | local file read (once per contract, cached)
       v
-Sourcify API  (fetch contract ABI)
+ABI override file  (load contract ABI)
 ```
 
 ### Four Rust crates (workspaces)
@@ -122,7 +122,7 @@ Sourcify API  (fetch contract ABI)
 | `bloom_candidates` | Blocks that matched bloom filter; `fetched`/`pending_retry` flags |
 | `events` | Decoded events: address, name, block, tx hash, decoded JSON, `reorged` |
 | `sync_cursor` | Per-contract progress: how far each pipeline stage has gotten |
-| `contracts` | Registry + cached ABI JSON from Sourcify |
+| `contracts` | Registry + cached ABI JSON from local ABI overrides |
 
 ---
 
@@ -141,7 +141,7 @@ Sourcify API  (fetch contract ABI)
 | **Merkle Patricia Trie** | A hash tree where recomputing the root proves a set of values hasn't been tampered with. Ethereum commits receipts, transactions, and state into tries. |
 | **devp2p** | Ethereum's peer-to-peer network. Peers discover each other via `discv4` (UDP Kademlia DHT) and exchange data over RLPx (TCP, ECIES-encrypted). `reth-network` handles this. |
 | **ETH wire protocol** | Application-layer protocol within devp2p. scopenode uses two messages: `GetBlockHeaders` and `GetReceipts`. |
-| **ABI** | Application Binary Interface — the schema for a smart contract. Defines each event's name, params, types. Fetched from Sourcify (a public ABI registry). |
+| **ABI** | Application Binary Interface — the schema for a smart contract. Defines each event's name, params, types. Loaded from the configured local `abi_override` file. |
 | **topic0** | `keccak256("EventName(type1,type2,...)")` — the first topic in every log. Identifies which event type a log is. scopenode checks bloom filters for `(address, topic0)` pairs. |
 | **Snap sync** | Most mainnet peers only store recent state, not historical receipts. scopenode must find an archive peer that has old receipt data. |
 | **Reorg** | When the canonical chain switches to a longer fork, old blocks become orphaned. Events from those blocks are marked `reorged = 1` (never deleted). |
@@ -191,7 +191,7 @@ Pipeline::run(dry_run, progress)  [pipeline.rs]
     Stage 1: ABI
       AbiCache::get_or_fetch()
         check contracts table → if cached, done
-        else: GET Sourcify API
+        else: read local abi_override file
         parse event sigs, compute topic0 hashes
         cache in SQLite contracts table
     Stage 2: Header sync
@@ -386,19 +386,19 @@ like `.for_each()`.
 Checks a config file before committing to a sync.
 
 **What it does:** Loads the config (which already validates field types via
-`serde`), then checks that each contract address is reachable on Sourcify and
-that the requested event names exist in the ABI. Reports issues before the user
-starts a multi-hour sync.
+`serde`), then checks that each contract has a local `abi_override` and that the
+requested event names exist in the ABI. Reports issues before the user starts a
+multi-hour sync.
 
 ---
 
 #### `src/commands/abi.rs`
 
-Fetches and pretty-prints a contract's available events from Sourcify.
+Reads and pretty-prints a contract's available events from a local ABI file.
 
-**What it does:** Calls `SourcifyClient::fetch_events()` directly (no DB
-involved) and prints event names with their parameter types. Useful for finding
-the exact event names to put in your config.
+**What it does:** Parses the configured ABI JSON directly (no DB involved) and
+prints event names with their parameter types. Useful for finding the exact event
+names to put in your config.
 
 ---
 
@@ -652,9 +652,9 @@ This is a hand-coded subset of Ethereum's RLP spec for integer encoding.
 ABI fetching, caching, and event log decoding.
 
 **What it does:** Three main things:
-1. `SourcifyClient` — HTTP client that fetches contract metadata from
-   `sourcify.dev` (Ethereum Foundation's ABI registry, no API key required)
-2. `AbiCache` — wraps `SourcifyClient` with SQLite caching so we don't re-fetch
+1. ABI override loading — reads contract event metadata from the configured
+   local ABI JSON file
+2. `AbiCache` — wraps local ABI loading with SQLite caching so we don't re-read
    on every `scopenode sync` run
 3. `EventDecoder` — takes a list of `EventAbi` and decodes matching logs
 

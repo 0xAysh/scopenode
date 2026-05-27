@@ -59,6 +59,6 @@ pub struct ContractStatus {
     /// Human-readable label from the config file.
     pub name: Option<String>,
 
-    /// Cached ABI JSON string from Sourcify. Avoids re-fetching on every sync.
+    /// Cached ABI JSON string from the local ABI override.
     pub abi_json: Option<String>,
 }
