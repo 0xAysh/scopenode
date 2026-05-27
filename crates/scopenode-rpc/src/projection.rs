@@ -7,9 +7,8 @@
 //! - raw-data hex decoding
 //! - field mapping onto [`Log`] / [`EventResponse`]
 //!
-//! Neither `server.rs` nor `rest.rs` are changed by this module; they still own
-//! their own call sites. Issue #32 will migrate those call sites to use these
-//! functions.
+//! Both `server.rs` and `rest.rs` delegate all row-to-response conversion to
+//! this module.
 
 use alloy::primitives::{Address, Bytes, LogData, B256};
 use alloy::rpc::types::Log;
@@ -20,10 +19,7 @@ use scopenode_storage::models::StoredEvent;
 // Public types
 // ---------------------------------------------------------------------------
 
-/// REST-layer shape for a single event row.
-///
-/// Mirrors the private `EventResponse` in `rest.rs` field-for-field so that
-/// both representations are always in sync. Issue #32 will unify them.
+/// REST-layer shape for a single event row, shared by the REST adapter.
 #[derive(Debug, Serialize)]
 pub struct EventResponse {
     pub contract: String,

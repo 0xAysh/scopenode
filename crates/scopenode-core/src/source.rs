@@ -389,7 +389,7 @@ impl Iterator for Era1BlockIter {
 ///
 /// The block index at the end of the file is read first to determine `from_block`,
 /// then the file is rewound to the beginning for the sequential one-pass read.
-pub fn iter_era1_block_tuples(path: impl AsRef<Path>) -> Result<Era1BlockIter, SourceError> {
+pub(crate) fn iter_era1_block_tuples(path: impl AsRef<Path>) -> Result<Era1BlockIter, SourceError> {
     let path = path.as_ref();
     let range = read_era1_block_index_range(path)?.ok_or_else(|| SourceError::InvalidE2Store {
         path: path.to_owned(),
@@ -438,7 +438,7 @@ pub fn decode_era1_header(compressed_header: &[u8]) -> Result<ScopeHeader, Sourc
     })
 }
 
-pub fn decode_era1_receipts(
+pub(crate) fn decode_era1_receipts(
     compressed: &[u8],
 ) -> Result<Vec<ReceiptEnvelope<PrimitiveLog>>, SourceError> {
     let mut raw = Vec::new();
@@ -514,7 +514,7 @@ pub fn decode_era1_receipts(
     Ok(receipts)
 }
 
-pub fn decode_era1_tx_hashes(
+pub(crate) fn decode_era1_tx_hashes(
     compressed: &[u8],
 ) -> Result<Vec<alloy_primitives::B256>, SourceError> {
     let mut raw = Vec::new();
