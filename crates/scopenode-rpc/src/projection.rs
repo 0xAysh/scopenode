@@ -211,4 +211,80 @@ mod tests {
         let resp = project_rest_event(&row);
         assert_eq!(resp.decoded, serde_json::Value::Null);
     }
+
+    // ------------------------------------------------------------------
+    // Additional malformed-row tests (issue #33)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn project_log_invalid_block_hash_returns_none() {
+        // block_hash cannot be parsed as B256 — the `?` on `parse().ok()?`
+        // propagates None, so the entire projection fails.
+        let row = StoredEvent {
+            block_hash: "not_a_hash".into(),
+            ..make_valid_stored_event()
+        };
+        assert!(project_log(&row).is_none());
+    }
+
+    #[test]
+    fn project_log_empty_raw_topics_array_produces_log() {
+        // An empty JSON array is valid for raw_topics. LogData accepts zero
+        // topics, so the projection should succeed and return Some(Log).
+        let row = StoredEvent {
+            raw_topics: "[]".into(),
+            ..make_valid_stored_event()
+        };
+        let log = project_log(&row).expect("empty topics array should still produce Some(Log)");
+        assert!(log.inner.data.topics().is_empty());
+    }
+
+    #[test]
+    fn project_log_invalid_raw_data_hex_falls_back_to_empty_bytes() {
+        // alloy_primitives::hex::decode returns Err for non-hex input.
+        // The implementation calls .unwrap_or_default() which yields an empty
+        // Vec, so the log is still produced (Some) but with zero data bytes.
+        let row = StoredEvent {
+            raw_data: "not_hex!!!".into(),
+            ..make_valid_stored_event()
+        };
+        let log = project_log(&row).expect("invalid hex raw_data should still produce Some(Log)");
+        assert_eq!(
+            log.inner.data.data.len(),
+            0,
+            "data bytes should be empty when raw_data is not valid hex"
+        );
+    }
+
+    #[test]
+    fn project_rest_event_null_decoded_json_falls_back_to_null() {
+        // The JSON literal "null" is valid JSON: serde_json::from_str("null")
+        // parses successfully as Value::Null. The result must be Value::Null,
+        // not a parse error, confirming the pass-through behaviour is stable.
+        let row = StoredEvent {
+            decoded: "null".into(),
+            ..make_valid_stored_event()
+        };
+        let resp = project_rest_event(&row);
+        assert_eq!(resp.decoded, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn project_rest_event_nested_object_decoded_preserves_structure() {
+        // U256 amounts are stored as JSON strings to avoid JavaScript precision
+        // loss. The projection must preserve the string type exactly — not
+        // coerce "1000000000000000000" into a JSON number.
+        let row = StoredEvent {
+            decoded: "{\"amount\":\"1000000000000000000\"}".into(),
+            ..make_valid_stored_event()
+        };
+        let resp = project_rest_event(&row);
+        let obj = resp.decoded.as_object().expect("decoded should be a JSON object");
+        let amount = obj.get("amount").expect("key \"amount\" must be present");
+        assert_eq!(
+            amount.as_str(),
+            Some("1000000000000000000"),
+            "U256 value must remain a string, not be coerced to a JSON number"
+        );
+    }
 }
