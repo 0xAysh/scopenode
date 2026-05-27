@@ -11,7 +11,7 @@ use crate::headers::BloomScanner;
 use crate::receipts::verify_era1_receipts;
 use crate::source::{
     decode_era1_header, decode_era1_receipts, decode_era1_tx_hashes, iter_era1_block_tuples,
-    SourceFileManifest,
+    Era1BlockTuple, SourceFileManifest,
 };
 use async_trait::async_trait;
 use tracing::warn;
@@ -82,6 +82,81 @@ impl PreparedScope {
     }
 }
 
+/// Encapsulates all per-block processing for the ERA1 pipeline.
+///
+/// Given one `Era1BlockTuple`, `process()` performs in order: block range
+/// filtering against all scopes, header decoding, Bloom pre-screening, receipt
+/// decoding, Merkle root verification, transaction hash extraction, and
+/// per-scope event extraction.
+///
+/// Returns an empty `Vec` for blocks that produce no events — whether because
+/// no scope's range matches, no Bloom hit, or a decode/verify failure. The
+/// outer file-iteration loop is the only caller; it stays thin and free of
+/// decoding logic.
+struct BlockPipeline {
+    scopes: Vec<PreparedScope>,
+}
+
+impl BlockPipeline {
+    fn new(scopes: Vec<PreparedScope>) -> Self {
+        Self { scopes }
+    }
+
+    fn process(&self, tuple: &Era1BlockTuple) -> Vec<DecodedEvent> {
+        let in_range: Vec<&PreparedScope> = self
+            .scopes
+            .iter()
+            .filter(|s| s.contains_block(tuple.block_number))
+            .collect();
+        if in_range.is_empty() {
+            return vec![];
+        }
+
+        let header = match decode_era1_header(&tuple.compressed_header) {
+            Ok(h) => h,
+            Err(e) => {
+                warn!(block = tuple.block_number, err = %e, "Header decode failed — skipping");
+                return vec![];
+            }
+        };
+
+        let bloom_matches: Vec<&PreparedScope> = in_range
+            .into_iter()
+            .filter(|s| s.scanner.matches(&header.logs_bloom))
+            .collect();
+        if bloom_matches.is_empty() {
+            return vec![];
+        }
+
+        let receipts = match decode_era1_receipts(&tuple.compressed_receipts) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(block = header.number, err = %e, "Receipt decode failed — skipping");
+                return vec![];
+            }
+        };
+
+        if let Err(e) = verify_era1_receipts(&receipts, header.receipts_root, header.number) {
+            warn!(block = header.number, err = %e, "Receipt Merkle verify failed — skipping");
+            return vec![];
+        }
+
+        let tx_hashes = decode_era1_tx_hashes(&tuple.compressed_body).unwrap_or_default();
+        let mut events = Vec::new();
+        for scope in bloom_matches {
+            events.extend(scope.decoder.extract_and_decode(
+                &receipts,
+                &tx_hashes,
+                header.number,
+                header.hash,
+                header.timestamp,
+                "era1",
+            ));
+        }
+        events
+    }
+}
+
 /// Run the ERA1 indexing pipeline for one contract scope.
 ///
 /// `files` must be the manifest entries from the source scan. Only files whose
@@ -146,18 +221,11 @@ pub async fn run_era1_scopes(
 
     reporter.set_total(total_blocks.max(1));
 
+    let scope_names: Vec<String> = scopes.iter().map(|s| s.name.clone()).collect();
+    let pipeline = BlockPipeline::new(scopes);
     let mut total_events = 0usize;
 
     for file in &covering {
-        let active_scope_indices: Vec<usize> = scopes
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, scope)| scope.overlaps_file(file).then_some(idx))
-            .collect();
-        if active_scope_indices.is_empty() {
-            continue;
-        }
-
         let tuples = match iter_era1_block_tuples(&file.path) {
             Ok(it) => it,
             Err(e) => {
@@ -177,76 +245,211 @@ pub async fn run_era1_scopes(
 
             reporter.inc();
 
-            let matching_scope_indices_by_range: Vec<usize> = active_scope_indices
-                .iter()
-                .copied()
-                .filter(|idx| scopes[*idx].contains_block(tuple.block_number))
-                .collect();
-            if matching_scope_indices_by_range.is_empty() {
-                continue;
-            }
-
-            let header = match decode_era1_header(&tuple.compressed_header) {
-                Ok(h) => h,
-                Err(e) => {
-                    warn!(block = tuple.block_number, err = %e, "Header decode failed — skipping");
-                    continue;
-                }
-            };
-
-            let matching_scope_indices: Vec<usize> = matching_scope_indices_by_range
-                .into_iter()
-                .filter(|idx| scopes[*idx].scanner.matches(&header.logs_bloom))
-                .collect();
-            if matching_scope_indices.is_empty() {
-                continue;
-            }
-
-            let receipts = match decode_era1_receipts(&tuple.compressed_receipts) {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!(block = header.number, err = %e, "Receipt decode failed — skipping");
-                    continue;
-                }
-            };
-
-            if let Err(e) = verify_era1_receipts(&receipts, header.receipts_root, header.number) {
-                warn!(block = header.number, err = %e, "Receipt Merkle verify failed — skipping");
-                continue;
-            }
-
-            let tx_hashes = decode_era1_tx_hashes(&tuple.compressed_body).unwrap_or_default();
-            let mut block_events = Vec::new();
-
-            for idx in matching_scope_indices {
-                let scope = &scopes[idx];
-                let events = scope.decoder.extract_and_decode(
-                    &receipts,
-                    &tx_hashes,
-                    header.number,
-                    header.hash,
-                    header.timestamp,
-                    "era1",
-                );
-                block_events.extend(events);
-            }
-
+            let block_events = pipeline.process(&tuple);
             if !block_events.is_empty() {
                 match sink.store(block_events).await {
                     Ok(n) => total_events += n,
-                    Err(e) => warn!(block = header.number, err = %e, "Event insert failed"),
+                    Err(e) => warn!(block = tuple.block_number, err = %e, "Event insert failed"),
                 }
             }
         }
     }
 
-    let scope_names = scopes
-        .iter()
-        .map(|scope| scope.name.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    reporter.finish(&format!("done ({total_events} events across {scope_names})"));
+    reporter.finish(&format!(
+        "done ({total_events} events across {})",
+        scope_names.join(", ")
+    ));
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::abi::{EventAbi, EventDecoder};
+    use alloy_primitives::{address, keccak256, Address, Bloom, BloomInput, B256};
+    use alloy_rlp::Encodable;
 
+    fn snappy_compress(data: &[u8]) -> Vec<u8> {
+        use snap::write::FrameEncoder;
+        use std::io::Write;
+        let mut out = Vec::new();
+        {
+            let mut enc = FrameEncoder::new(&mut out);
+            enc.write_all(data).unwrap();
+            enc.flush().unwrap();
+        }
+        out
+    }
+
+    fn make_scope(from: u64, to: u64) -> PreparedScope {
+        let addr = address!("0000000000000000000000000000000000000001");
+        PreparedScope {
+            name: "test".to_string(),
+            from,
+            to,
+            scanner: BloomScanner::new(&[], addr),
+            decoder: EventDecoder::new(&[], addr).unwrap(),
+        }
+    }
+
+    fn make_scope_with_target(from: u64, to: u64, addr: Address, topic0: B256) -> PreparedScope {
+        PreparedScope {
+            name: "test".to_string(),
+            from,
+            to,
+            scanner: BloomScanner::new(&[topic0], addr),
+            decoder: EventDecoder::new(&[], addr).unwrap(),
+        }
+    }
+
+    fn empty_tuple(block_number: u64) -> Era1BlockTuple {
+        Era1BlockTuple {
+            block_number,
+            compressed_header: vec![],
+            compressed_body: vec![],
+            compressed_receipts: vec![],
+            total_difficulty: vec![],
+        }
+    }
+
+    fn make_compressed_header(block_number: u64, bloom: Bloom, receipts_root: B256) -> Vec<u8> {
+        use alloy_consensus::Header;
+        let header = Header {
+            number: block_number,
+            logs_bloom: bloom,
+            receipts_root,
+            ..Default::default()
+        };
+        let mut rlp = Vec::new();
+        header.encode(&mut rlp);
+        snappy_compress(&rlp)
+    }
+
+    #[test]
+    fn prepared_scope_contains_block_boundary() {
+        let scope = make_scope(100, 200);
+        assert!(!scope.contains_block(99));
+        assert!(scope.contains_block(100));
+        assert!(scope.contains_block(150));
+        assert!(scope.contains_block(200));
+        assert!(!scope.contains_block(201));
+    }
+
+    #[test]
+    fn block_out_of_range_returns_empty() {
+        let pipeline = BlockPipeline::new(vec![make_scope(100, 200)]);
+        assert!(pipeline.process(&empty_tuple(99)).is_empty());
+        assert!(pipeline.process(&empty_tuple(201)).is_empty());
+    }
+
+    #[test]
+    fn malformed_header_returns_empty() {
+        let pipeline = BlockPipeline::new(vec![make_scope(100, 200)]);
+        let tuple = Era1BlockTuple {
+            block_number: 150,
+            compressed_header: vec![0xAA, 0xBB, 0xCC],
+            ..empty_tuple(150)
+        };
+        assert!(pipeline.process(&tuple).is_empty());
+    }
+
+    #[test]
+    fn bloom_no_match_returns_empty() {
+        let addr = Address::repeat_byte(0xAB);
+        let topic0 = keccak256(b"Transfer(address,address,uint256)");
+        let pipeline =
+            BlockPipeline::new(vec![make_scope_with_target(100, 200, addr, topic0)]);
+
+        // Header with empty bloom — scanner's address/topic0 are not present.
+        let compressed_header =
+            make_compressed_header(150, Bloom::default(), B256::ZERO);
+        let tuple = Era1BlockTuple {
+            block_number: 150,
+            compressed_header,
+            ..empty_tuple(150)
+        };
+        assert!(pipeline.process(&tuple).is_empty());
+    }
+
+    #[test]
+    fn receipt_decode_failure_returns_empty() {
+        let addr = Address::repeat_byte(0xAB);
+        let topic0 = keccak256(b"Transfer(address,address,uint256)");
+        let pipeline =
+            BlockPipeline::new(vec![make_scope_with_target(100, 200, addr, topic0)]);
+
+        let mut bloom = Bloom::default();
+        bloom.accrue(BloomInput::Raw(addr.as_slice()));
+        bloom.accrue(BloomInput::Raw(topic0.as_slice()));
+        let compressed_header = make_compressed_header(150, bloom, B256::ZERO);
+
+        let tuple = Era1BlockTuple {
+            block_number: 150,
+            compressed_header,
+            compressed_receipts: vec![0xFF, 0xFE, 0xFD], // garbage
+            ..empty_tuple(150)
+        };
+        assert!(pipeline.process(&tuple).is_empty());
+    }
+
+    #[test]
+    fn merkle_verify_failure_returns_empty() {
+        use alloy_consensus::{Eip658Value, Receipt, ReceiptWithBloom};
+        use alloy_primitives::Log as PrimitiveLog;
+
+        let addr = Address::repeat_byte(0xAB);
+        let topic0 = keccak256(b"Transfer(address,address,uint256)");
+        let pipeline =
+            BlockPipeline::new(vec![make_scope_with_target(100, 200, addr, topic0)]);
+
+        let mut bloom = Bloom::default();
+        bloom.accrue(BloomInput::Raw(addr.as_slice()));
+        bloom.accrue(BloomInput::Raw(topic0.as_slice()));
+
+        // Header with wrong receipts_root — mismatches the receipts below.
+        let wrong_root = B256::from([0xAA; 32]);
+        let compressed_header = make_compressed_header(150, bloom, wrong_root);
+
+        let receipt = ReceiptWithBloom::<Receipt<PrimitiveLog>> {
+            receipt: Receipt {
+                status: Eip658Value::Eip658(true),
+                cumulative_gas_used: 21_000,
+                logs: vec![],
+            },
+            logs_bloom: Bloom::default(),
+        };
+        let mut receipt_rlp = Vec::new();
+        receipt.encode(&mut receipt_rlp);
+        let outer = alloy_rlp::Header {
+            list: true,
+            payload_length: receipt_rlp.len(),
+        };
+        let mut receipts_buf = Vec::new();
+        outer.encode(&mut receipts_buf);
+        receipts_buf.extend_from_slice(&receipt_rlp);
+
+        let tuple = Era1BlockTuple {
+            block_number: 150,
+            compressed_header,
+            compressed_receipts: snappy_compress(&receipts_buf),
+            ..empty_tuple(150)
+        };
+        assert!(pipeline.process(&tuple).is_empty());
+    }
+
+    #[test]
+    fn no_scopes_returns_empty() {
+        let pipeline = BlockPipeline::new(vec![]);
+        assert!(pipeline.process(&empty_tuple(100)).is_empty());
+    }
+
+    #[test]
+    fn event_abi_with_empty_inputs_constructs_decoder() {
+        let addr = address!("0000000000000000000000000000000000000001");
+        let events = vec![EventAbi {
+            name: "Transfer".to_string(),
+            inputs: vec![],
+        }];
+        assert!(EventDecoder::new(&events, addr).is_ok());
+    }
+}
