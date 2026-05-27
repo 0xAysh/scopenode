@@ -270,4 +270,120 @@ mod tests {
         let result = iter_era1_block_facts("/nonexistent/path/that/does/not/exist.era1");
         assert!(result.is_err(), "expected Err for missing file, got Ok");
     }
+
+    /// Build a multi-block ERA1 binary with the given block numbers (must be
+    /// sequential), each with a valid but empty header/body/receipts.
+    ///
+    /// The block index format requires:
+    ///   starting_block_number: u64 LE
+    ///   offset_0 … offset_{N-1}: i64 LE each (offsets are not used by the
+    ///     sequential iterator — only `from_block` and `count` matter there)
+    ///   count: i64 LE
+    fn build_multi_block_era1(block_numbers: &[u64]) -> Vec<u8> {
+        assert!(!block_numbers.is_empty(), "need at least one block");
+        let starting = block_numbers[0];
+
+        let mut file = Vec::new();
+        file.extend(e2store_entry([0x65, 0x32], &[])); // version
+
+        for &n in block_numbers {
+            let header = Header { number: n, ..Default::default() };
+            file.extend(e2store_entry([0x03, 0x00], &encode_header(&header)));
+            file.extend(e2store_entry([0x04, 0x00], &encode_empty_body()));
+            file.extend(e2store_entry([0x05, 0x00], &encode_empty_receipts()));
+            file.extend(e2store_entry([0x06, 0x00], &0u64.to_le_bytes()));
+        }
+
+        // Block index: starting_number + one i64 offset per block (all 0 —
+        // the sequential iterator ignores them) + count.
+        let mut index_data = Vec::new();
+        index_data.extend_from_slice(&starting.to_le_bytes());
+        for _ in block_numbers {
+            index_data.extend_from_slice(&0i64.to_le_bytes());
+        }
+        index_data.extend_from_slice(&(block_numbers.len() as i64).to_le_bytes());
+        file.extend(e2store_entry([0x66, 0x32], &index_data));
+
+        file
+    }
+
+    /// A 3-block ERA1 file must yield exactly 3 `Era1BlockFacts` items, all
+    /// `Ok`, with sequential `block_number` values matching what was encoded.
+    ///
+    /// This verifies that `iter_era1_block_facts` advances past the first block
+    /// and correctly tracks `from_block + block_index` across the full file.
+    #[test]
+    fn iter_block_facts_multi_block_file_yields_all_blocks() {
+        let block_numbers = [100_u64, 101, 102];
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mainnet-00000-deadbeef.era1");
+        std::fs::write(&path, build_multi_block_era1(&block_numbers)).unwrap();
+
+        let facts: Vec<_> = iter_era1_block_facts(&path)
+            .expect("iter construction failed")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("iterator yielded Err");
+
+        assert_eq!(facts.len(), 3, "expected 3 facts, got {}", facts.len());
+        for (i, f) in facts.iter().enumerate() {
+            assert_eq!(
+                f.block_number, block_numbers[i],
+                "block_number mismatch at index {i}"
+            );
+            assert_eq!(
+                f.header.number, block_numbers[i],
+                "header.number mismatch at index {i}"
+            );
+            assert!(f.tx_hashes.is_empty(), "expected empty tx_hashes at index {i}");
+            assert!(f.receipts.is_empty(), "expected empty receipts at index {i}");
+        }
+    }
+
+    /// An ERA1 entry with a valid header and valid empty receipts (`0xC0`) but
+    /// a garbage body (4 bytes of `0xDE 0xAD 0xBE 0xEF` that are not valid
+    /// snappy data) must yield `Ok(Era1BlockFacts { tx_hashes: vec![], … })`
+    /// rather than `Err`.
+    ///
+    /// This locks down the `unwrap_or_default()` call in `iter_era1_block_facts`
+    /// that makes tx-hash decode failures non-fatal.
+    #[test]
+    fn iter_block_facts_bad_tx_body_yields_ok_with_empty_tx_hashes() {
+        let block_number = 77_u64;
+        let header = Header { number: block_number, ..Default::default() };
+        let compressed_header = encode_header(&header);
+        let compressed_receipts = encode_empty_receipts();
+        let garbage_body: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF];
+        let td = 0u64.to_le_bytes();
+
+        let mut index_data = Vec::new();
+        index_data.extend_from_slice(&block_number.to_le_bytes());
+        index_data.extend_from_slice(&0i64.to_le_bytes());
+        index_data.extend_from_slice(&1i64.to_le_bytes());
+
+        let mut file_bytes = Vec::new();
+        file_bytes.extend(e2store_entry([0x65, 0x32], &[]));
+        file_bytes.extend(e2store_entry([0x03, 0x00], &compressed_header));
+        file_bytes.extend(e2store_entry([0x04, 0x00], garbage_body)); // bad body
+        file_bytes.extend(e2store_entry([0x05, 0x00], &compressed_receipts));
+        file_bytes.extend(e2store_entry([0x06, 0x00], &td));
+        file_bytes.extend(e2store_entry([0x66, 0x32], &index_data));
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mainnet-00000-deadbeef.era1");
+        std::fs::write(&path, file_bytes).unwrap();
+
+        let mut iter = iter_era1_block_facts(&path).expect("iter construction failed");
+        let result = iter.next().expect("iterator should yield one item");
+
+        let facts = result.expect("expected Ok, got Err — bad body should be non-fatal");
+        assert_eq!(facts.block_number, block_number);
+        assert!(
+            facts.tx_hashes.is_empty(),
+            "expected empty tx_hashes when body is garbage, got {:?}",
+            facts.tx_hashes
+        );
+        // Receipts should still be decoded correctly from the valid receipts entry.
+        assert!(facts.receipts.is_empty());
+    }
 }
