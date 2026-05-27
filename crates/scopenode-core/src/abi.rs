@@ -320,49 +320,73 @@ impl EventDecoder {
 
         for (tx_idx, receipt) in receipts.iter().enumerate() {
             let tx_hash = tx_hashes.get(tx_idx).copied().unwrap_or_default();
-
             for log in receipt.logs() {
                 let log_index = cumulative_log_index;
                 cumulative_log_index += 1;
-
-                if log.address != self.contract {
-                    continue;
-                }
-                let topics = log.topics();
-                let topic0 = match topics.first() {
-                    Some(t) => *t,
-                    None => continue,
-                };
-                let event_abi = match self.events.get(&topic0) {
-                    Some(e) => e,
-                    None => continue,
-                };
-
-                let raw_data = Bytes::from(log.data.data.clone().to_vec());
-                let decoded = self.decode_log(event_abi, topics, raw_data.as_ref());
-
-                results.push(DecodedEvent {
-                    contract: self.contract,
-                    event_name: event_abi.name.clone(),
-                    topic0,
-                    block_number: block_num,
+                if let Some(event) = self.decode_log(
+                    log,
+                    block_num,
                     block_hash,
                     tx_hash,
-                    tx_index: tx_idx as u64,
+                    tx_idx as u64,
                     log_index,
-                    raw_topics: topics.to_vec(),
-                    raw_data,
-                    decoded,
-                    source: source.to_owned(),
                     timestamp,
-                });
+                    source,
+                ) {
+                    results.push(event);
+                }
             }
         }
 
         results
     }
 
-    fn decode_log(&self, event: &CompiledEvent, topics: &[B256], data: &[u8]) -> Value {
+    /// Decode a single raw log into a `DecodedEvent`, or `None` if the log does
+    /// not match this decoder's contract address and configured event signatures.
+    ///
+    /// This is the primary public entry point for log decoding. It can be called
+    /// in tests with a synthetic `PrimitiveLog` and known block context to verify
+    /// the full decode chain without constructing a receipt list.
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_log(
+        &self,
+        log: &PrimitiveLog,
+        block_number: u64,
+        block_hash: B256,
+        tx_hash: B256,
+        tx_index: u64,
+        log_index: u64,
+        timestamp: u64,
+        source: &str,
+    ) -> Option<DecodedEvent> {
+        if log.address != self.contract {
+            return None;
+        }
+        let topics = log.topics();
+        let topic0 = *topics.first()?;
+        let event_abi = self.events.get(&topic0)?;
+
+        let raw_data = Bytes::from(log.data.data.clone().to_vec());
+        let decoded = self.decode_fields(event_abi, topics, &raw_data);
+
+        Some(DecodedEvent {
+            contract: self.contract,
+            event_name: event_abi.name.clone(),
+            topic0,
+            block_number,
+            block_hash,
+            tx_hash,
+            tx_index,
+            log_index,
+            raw_topics: topics.to_vec(),
+            raw_data,
+            decoded,
+            source: source.to_owned(),
+            timestamp,
+        })
+    }
+
+    fn decode_fields(&self, event: &CompiledEvent, topics: &[B256], data: &[u8]) -> Value {
         let mut obj = serde_json::Map::new();
 
         for (i, input) in event.indexed_inputs.iter().enumerate() {
@@ -466,6 +490,94 @@ mod era1_tests {
     use super::*;
     use alloy_consensus::{Eip658Value, Receipt, ReceiptEnvelope, ReceiptWithBloom};
     use alloy_primitives::{address, keccak256, Bloom, Bytes, Log as PrimitiveLog, LogData, B256};
+
+    #[test]
+    fn decode_log_returns_decoded_event_for_matching_log() {
+        let contract = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let topic0 = keccak256(b"Transfer(address,address,uint256)");
+
+        let events = vec![EventAbi {
+            name: "Transfer".into(),
+            inputs: vec![
+                EventInput { name: "from".into(), ty: "address".into(), indexed: true, components: vec![] },
+                EventInput { name: "to".into(), ty: "address".into(), indexed: true, components: vec![] },
+                EventInput { name: "value".into(), ty: "uint256".into(), indexed: false, components: vec![] },
+            ],
+        }];
+        let decoder = EventDecoder::new(&events, contract).unwrap();
+
+        let from_topic = B256::from([0x11u8; 32]);
+        let to_topic = B256::from([0x22u8; 32]);
+        let value_bytes = {
+            let mut b = [0u8; 32];
+            b[31] = 42;
+            Bytes::from(b.to_vec())
+        };
+        let log = PrimitiveLog {
+            address: contract,
+            data: LogData::new_unchecked(
+                vec![topic0, from_topic, to_topic],
+                value_bytes,
+            ),
+        };
+
+        let result = decoder.decode_log(
+            &log,
+            18_000_000,
+            B256::from([0xAA; 32]),
+            B256::from([0xBB; 32]),
+            3,
+            7,
+            1_700_000_000,
+            "era1",
+        );
+
+        let event = result.expect("matching log must decode to Some");
+        assert_eq!(event.event_name, "Transfer");
+        assert_eq!(event.block_number, 18_000_000);
+        assert_eq!(event.tx_index, 3);
+        assert_eq!(event.log_index, 7);
+        assert_eq!(event.source, "era1");
+        assert!(event.decoded.get("from").is_some());
+        assert!(event.decoded.get("to").is_some());
+        assert!(event.decoded.get("value").is_some());
+    }
+
+    #[test]
+    fn decode_log_returns_none_for_wrong_contract() {
+        let contract = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let other = address!("dAC17F958D2ee523a2206206994597C13D831ec7");
+        let topic0 = keccak256(b"Transfer(address,address,uint256)");
+
+        let events = vec![EventAbi {
+            name: "Transfer".into(),
+            inputs: vec![],
+        }];
+        let decoder = EventDecoder::new(&events, contract).unwrap();
+
+        let log = PrimitiveLog {
+            address: other,
+            data: LogData::new_unchecked(vec![topic0], Bytes::new()),
+        };
+        assert!(decoder.decode_log(&log, 0, B256::ZERO, B256::ZERO, 0, 0, 0, "era1").is_none());
+    }
+
+    #[test]
+    fn decode_log_returns_none_for_unknown_topic0() {
+        let contract = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let topic0 = keccak256(b"Transfer(address,address,uint256)");
+        let unknown = keccak256(b"Unknown(address)");
+
+        let events = vec![EventAbi { name: "Transfer".into(), inputs: vec![] }];
+        let decoder = EventDecoder::new(&events, contract).unwrap();
+
+        let log = PrimitiveLog {
+            address: contract,
+            data: LogData::new_unchecked(vec![unknown], Bytes::new()),
+        };
+        let _ = topic0; // used above to construct decoder
+        assert!(decoder.decode_log(&log, 0, B256::ZERO, B256::ZERO, 0, 0, 0, "era1").is_none());
+    }
 
     #[test]
     fn event_decoder_rejects_invalid_non_indexed_type_at_construction() {
