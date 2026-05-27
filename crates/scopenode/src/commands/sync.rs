@@ -14,6 +14,8 @@ use scopenode_storage::Db;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::runtime::RuntimeContext;
+
 struct DbAbiStore(Db);
 
 #[async_trait]
@@ -49,7 +51,7 @@ impl ProgressReporter for IndicatifReporter {
 
 /// Run the `sync` command.
 pub async fn run(config: Config, db: Db, dry_run: bool, quiet: bool) -> Result<()> {
-    let era_dir = expand_tilde(config.node.era_dir.clone());
+    let era_dir = crate::runtime::expand_tilde(config.node.era_dir.clone());
 
     if dry_run {
         println!("ERA1 source: {}", era_dir.display());
@@ -114,38 +116,6 @@ pub async fn run(config: Config, db: Db, dry_run: bool, quiet: bool) -> Result<(
 
 /// Entry point called from main.rs — loads config, opens DB, calls run().
 pub async fn execute(config_path: PathBuf, dry_run: bool, quiet: bool) -> Result<()> {
-    let config = Config::from_file(&config_path).context("Failed to load config")?;
-
-    let data_dir = expand_tilde(
-        config
-            .node
-            .data_dir
-            .clone()
-            .unwrap_or_else(default_data_dir),
-    );
-    std::fs::create_dir_all(&data_dir)
-        .with_context(|| format!("Failed to create data dir: {}", data_dir.display()))?;
-
-    let db = Db::open(data_dir.join("scopenode.db"))
-        .await
-        .context("Failed to open database")?;
-
-    run(config, db, dry_run, quiet).await
-}
-
-fn default_data_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".scopenode")
-}
-
-fn expand_tilde(path: PathBuf) -> PathBuf {
-    if let Some(s) = path.to_str() {
-        if let Some(stripped) = s.strip_prefix("~/") {
-            if let Some(home) = dirs::home_dir() {
-                return home.join(stripped);
-            }
-        }
-    }
-    path
+    let ctx = RuntimeContext::load(config_path).await?;
+    run(ctx.config, ctx.db, dry_run, quiet).await
 }
