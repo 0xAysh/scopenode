@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
 use tracing::info;
 
-use scopenode_storage::Db;
+use scopenode_storage::{Db, DbError, EventFilter};
 
 #[derive(Clone)]
 struct AppState {
@@ -111,32 +111,30 @@ async fn get_events(
     State(state): State<Arc<AppState>>,
     Query(q): Query<EventsQuery>,
 ) -> Result<Json<EventsResponse>, (axum::http::StatusCode, String)> {
-    let limit = q.limit.unwrap_or(100).min(10_000);
-    let query_limit = if limit == 10_000 { 10_001 } else { limit };
-    let offset = q.offset.unwrap_or(0);
+    let limit = q.limit.unwrap_or(100).min(10_000) as u64;
+    let filter = EventFilter {
+        contract: q.contract,
+        event_name: q.event,
+        topic0: q.topic0,
+        from_block: q.from_block,
+        to_block: q.to_block,
+        limit,
+        offset: q.offset.unwrap_or(0),
+    };
 
     let rows = state
         .db
-        .query_events_for_filter(
-            q.contract.as_deref(),
-            q.event.as_deref(),
-            q.topic0.as_deref(),
-            q.from_block,
-            q.to_block,
-            query_limit,
-            offset,
-        )
+        .query_events_for_filter(&filter)
         .await
-        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| match e {
+            DbError::TooManyResults { .. } => (
+                axum::http::StatusCode::BAD_REQUEST,
+                "result set exceeds 10,000 rows — narrow your filter (smaller block range or add address/topic filter)".into(),
+            ),
+            other => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+        })?;
 
-    if rows.len() > 10_000 {
-        return Err((
-            axum::http::StatusCode::BAD_REQUEST,
-            "result set exceeds 10,000 rows — narrow your filter (smaller block range or add address/topic filter)".into(),
-        ));
-    }
-
-    let events: Vec<EventResponse> = rows.iter().take(limit).map(EventResponse::from).collect();
+    let events: Vec<EventResponse> = rows.iter().map(EventResponse::from).collect();
     let count = events.len();
     Ok(Json(EventsResponse { events, count }))
 }

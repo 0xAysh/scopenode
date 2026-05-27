@@ -13,6 +13,7 @@
 
 use crate::error::DbError;
 use crate::models::{ContractRow, StoredEvent};
+use crate::types::EventFilter;
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 use std::path::PathBuf;
 use tracing::info;
@@ -314,56 +315,67 @@ impl Db {
 
     // ─── Queries ──────────────────────────────────────────────────────────────
 
-    /// Query events with optional filters.
+    /// Query events with the given filter.
     ///
-    /// `limit` caps the result set; `offset` supports pagination.
-    #[allow(clippy::too_many_arguments)]
+    /// When `filter.limit > 0` the storage layer queries `limit + 1` rows
+    /// internally. If the result exceeds `limit`, returns
+    /// [`DbError::TooManyResults`] so API layers can surface a consistent error
+    /// without duplicating the sentinel logic.
     pub async fn query_events_for_filter(
         &self,
-        contract: Option<&str>,
-        event_name: Option<&str>,
-        topic0: Option<&str>,
-        from_block: Option<u64>,
-        to_block: Option<u64>,
-        limit: usize,
-        offset: u64,
+        filter: &EventFilter,
     ) -> Result<Vec<StoredEvent>, DbError> {
-        let from = from_block.unwrap_or(0) as i64;
-        let to = to_block.map(|b| b as i64).unwrap_or(i64::MAX);
+        let from = filter.from_block.unwrap_or(0) as i64;
+        let to = filter.to_block.map(|b| b as i64).unwrap_or(i64::MAX);
+        let has_contract = filter.contract.is_some();
+        let has_event_name = filter.event_name.is_some();
+        let has_topic0 = filter.topic0.is_some();
 
+        let query_limit = if filter.limit > 0 { filter.limit + 1 } else { i64::MAX as u64 };
         let sql = format!(
             "{} LIMIT ? OFFSET ?",
-            filter_sql_base(contract.is_some(), event_name.is_some(), topic0.is_some())
+            filter_sql_base(has_contract, has_event_name, has_topic0)
         );
 
         let mut q = sqlx::query_as::<_, StoredEvent>(&sql);
-        if let Some(c) = contract { q = q.bind(c); }
-        if let Some(e) = event_name { q = q.bind(e); }
-        if let Some(t) = topic0 { q = q.bind(t); }
-        q = q.bind(from).bind(to).bind(limit as i64).bind(offset as i64);
+        if let Some(c) = &filter.contract { q = q.bind(c.as_str()); }
+        if let Some(e) = &filter.event_name { q = q.bind(e.as_str()); }
+        if let Some(t) = &filter.topic0 { q = q.bind(t.as_str()); }
+        q = q.bind(from).bind(to).bind(query_limit as i64).bind(filter.offset as i64);
 
-        q.fetch_all(&self.pool)
+        let mut rows = q
+            .fetch_all(&self.pool)
             .await
-            .map_err(|e| DbError::Query(e.to_string()))
+            .map_err(|e| DbError::Query(e.to_string()))?;
+
+        if filter.limit > 0 && rows.len() as u64 > filter.limit {
+            rows.truncate(filter.limit as usize);
+            return Err(DbError::TooManyResults { limit: filter.limit });
+        }
+
+        Ok(rows)
     }
 
-    /// Stream events with optional filters, row by row.
+    /// Stream events matching the given filter, row by row (no result cap).
+    ///
+    /// `filter.limit` and `filter.offset` are ignored — all matching rows are
+    /// streamed.
     pub fn stream_events_for_filter<'a>(
         &'a self,
-        contract: Option<&'a str>,
-        event_name: Option<&'a str>,
-        topic0: Option<&'a str>,
-        from_block: Option<u64>,
-        to_block: Option<u64>,
+        filter: &'a EventFilter,
     ) -> impl futures_core::Stream<Item = Result<StoredEvent, DbError>> + 'a {
-        let from = from_block.unwrap_or(0) as i64;
-        let to = to_block.map(|b| b as i64).unwrap_or(i64::MAX);
+        let from = filter.from_block.unwrap_or(0) as i64;
+        let to = filter.to_block.map(|b| b as i64).unwrap_or(i64::MAX);
 
-        let sql = filter_sql_base(contract.is_some(), event_name.is_some(), topic0.is_some());
+        let sql = filter_sql_base(
+            filter.contract.is_some(),
+            filter.event_name.is_some(),
+            filter.topic0.is_some(),
+        );
         let mut q = sqlx::query_as::<_, StoredEvent>(sql);
-        if let Some(c) = contract { q = q.bind(c); }
-        if let Some(e) = event_name { q = q.bind(e); }
-        if let Some(t) = topic0 { q = q.bind(t); }
+        if let Some(c) = &filter.contract { q = q.bind(c.as_str()); }
+        if let Some(e) = &filter.event_name { q = q.bind(e.as_str()); }
+        if let Some(t) = &filter.topic0 { q = q.bind(t.as_str()); }
         q = q.bind(from).bind(to);
 
         sqlx_stream_to_db_stream(q.fetch(&self.pool))
@@ -543,7 +555,11 @@ mod tests {
             .unwrap();
 
         let rows = db
-            .query_events_for_filter(Some(contract), None, None, None, None, 100, 0)
+            .query_events_for_filter(&EventFilter {
+                contract: Some(contract.to_string()),
+                limit: 100,
+                ..EventFilter::default()
+            })
             .await
             .unwrap();
         assert_eq!(rows.len(), 1);
@@ -561,7 +577,8 @@ mod tests {
         db.insert_events(&[e3, e1, e2]).await.unwrap();
 
         use futures_util::StreamExt;
-        let stream = db.stream_events_for_filter(None, None, None, None, None);
+        let filter = EventFilter::default();
+        let stream = db.stream_events_for_filter(&filter);
         let rows: Vec<StoredEvent> = stream
             .collect::<Vec<_>>()
             .await
@@ -586,11 +603,40 @@ mod tests {
             .unwrap();
 
         let rows = db
-            .query_events_for_filter(None, None, Some(transfer_topic0), None, None, 100, 0)
+            .query_events_for_filter(&EventFilter {
+                topic0: Some(transfer_topic0.to_string()),
+                limit: 100,
+                ..EventFilter::default()
+            })
             .await
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].topic0, transfer_topic0);
+    }
+
+    #[tokio::test]
+    async fn query_events_for_filter_returns_too_many_results_when_cap_exceeded() {
+        let (db, _guard) = open_test_db().await;
+        let contract = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
+        db.upsert_contract(contract, None, "[]").await.unwrap();
+        let events: Vec<_> = (0..5)
+            .map(|i| make_event(contract, 100 + i, &format!("0x{:04x}", i), &format!("0x{:04x}", i), 0))
+            .collect();
+        db.insert_events(&events).await.unwrap();
+
+        let result = db
+            .query_events_for_filter(&EventFilter {
+                contract: Some(contract.to_string()),
+                limit: 3,
+                ..EventFilter::default()
+            })
+            .await;
+
+        assert!(
+            matches!(result, Err(DbError::TooManyResults { limit: 3 })),
+            "expected TooManyResults, got: {:?}",
+            result
+        );
     }
 
     #[tokio::test]
