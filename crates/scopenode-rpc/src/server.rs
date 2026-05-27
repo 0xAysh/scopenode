@@ -7,7 +7,6 @@
 //! - `net_peerCount` — always `"0x0"` (ERA1-only; no live peers)
 
 use alloy::rpc::types::{Filter, Log};
-use alloy_primitives::{Address, Bytes, B256};
 use async_trait::async_trait;
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::proc_macros::rpc;
@@ -85,7 +84,7 @@ impl EthApiServer for EthApiImpl {
             )),
             EventQueryOutcome::Empty => Ok(vec![]),
             EventQueryOutcome::Results(rows) => {
-                Ok(rows.iter().filter_map(row_to_log).collect())
+                Ok(rows.iter().filter_map(crate::projection::project_log).collect())
             }
         }
     }
@@ -116,47 +115,12 @@ fn internal_error(msg: &str) -> ErrorObject<'static> {
     ErrorObject::owned(-32603, format!("Internal error: {msg}"), None::<()>)
 }
 
-fn row_to_log(row: &scopenode_storage::models::StoredEvent) -> Option<Log> {
-    use alloy::primitives::LogData;
-
-    let address: Address = row.contract.parse().ok()?;
-    let tx_hash: B256 = row.tx_hash.parse().ok()?;
-    let block_hash: B256 = row.block_hash.parse().ok()?;
-
-    let topics: Vec<B256> = serde_json::from_str::<Vec<String>>(&row.raw_topics)
-        .ok()?
-        .iter()
-        .filter_map(|t| t.parse().ok())
-        .collect();
-
-    let data_bytes = alloy_primitives::hex::decode(&row.raw_data).unwrap_or_default();
-    let data = Bytes::from(data_bytes);
-
-    let log_data = LogData::new(topics, data)?;
-
-    let inner_log = alloy::primitives::Log {
-        address,
-        data: log_data,
-    };
-
-    Some(Log {
-        inner: inner_log,
-        block_hash: Some(block_hash),
-        block_number: Some(row.block_number as u64),
-        block_timestamp: None,
-        transaction_hash: Some(tx_hash),
-        transaction_index: Some(row.tx_index as u64),
-        log_index: Some(row.log_index as u64),
-        removed: false,
-    })
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::projection::project_log;
 
     #[test]
-    fn row_to_log_parses_valid_row() {
+    fn project_log_parses_valid_row() {
         let row = scopenode_storage::models::StoredEvent {
             contract: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".into(),
             event_name: "Transfer".into(),
@@ -173,7 +137,7 @@ mod tests {
             source: "era1".into(),
             timestamp: 0,
         };
-        let log = row_to_log(&row).unwrap();
+        let log = project_log(&row).unwrap();
         assert_eq!(log.block_number, Some(100));
         assert!(!log.removed);
     }

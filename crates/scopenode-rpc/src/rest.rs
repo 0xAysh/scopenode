@@ -30,6 +30,7 @@ use tower_http::cors::CorsLayer;
 use tracing::info;
 
 use scopenode_storage::{Db, EventQuery, EventQueryOutcome};
+use crate::projection::{project_rest_event, EventResponse};
 
 #[derive(Clone)]
 struct AppState {
@@ -47,39 +48,6 @@ struct EventsQuery {
     to_block: Option<u64>,
     limit: Option<usize>,
     offset: Option<u64>,
-}
-
-#[derive(Serialize)]
-struct EventResponse {
-    contract: String,
-    event_name: String,
-    topic0: String,
-    block_number: i64,
-    block_hash: String,
-    tx_hash: String,
-    tx_index: i64,
-    log_index: i64,
-    decoded: serde_json::Value,
-    source: String,
-    timestamp: i64,
-}
-
-impl From<&scopenode_storage::models::StoredEvent> for EventResponse {
-    fn from(e: &scopenode_storage::models::StoredEvent) -> Self {
-        Self {
-            contract: e.contract.clone(),
-            event_name: e.event_name.clone(),
-            topic0: e.topic0.clone(),
-            block_number: e.block_number,
-            block_hash: e.block_hash.clone(),
-            tx_hash: e.tx_hash.clone(),
-            tx_index: e.tx_index,
-            log_index: e.log_index,
-            decoded: serde_json::from_str(&e.decoded).unwrap_or(serde_json::Value::Null),
-            source: e.source.clone(),
-            timestamp: e.timestamp,
-        }
-    }
 }
 
 #[derive(Serialize)]
@@ -136,7 +104,7 @@ async fn get_events(
             Ok(Json(EventsResponse { events: vec![], count: 0 }))
         }
         EventQueryOutcome::Results(rows) => {
-            let events: Vec<EventResponse> = rows.iter().map(EventResponse::from).collect();
+            let events: Vec<EventResponse> = rows.iter().map(project_rest_event).collect();
             let count = events.len();
             Ok(Json(EventsResponse { events, count }))
         }
