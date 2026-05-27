@@ -96,12 +96,13 @@ pub async fn run(config: Config, db: Db, dry_run: bool, quiet: bool) -> Result<(
     let reporter = IndicatifReporter(pb);
 
     let mut abi_cache = AbiCache::new(Arc::new(DbAbiStore(db.clone())));
+    let sink = scopenode_storage::DbEventSink::new(db);
 
     run_era1_scopes(
         &scan.files,
         &config.contracts,
         &mut abi_cache,
-        &db,
+        &sink,
         &reporter,
     )
     .await

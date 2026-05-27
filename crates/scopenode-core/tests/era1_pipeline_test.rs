@@ -13,7 +13,7 @@ use scopenode_core::{
     error::AbiError,
     source::{ChecksumStatus, RangeCompleteness, SourceFileManifest, SourceRangeManifest},
 };
-use scopenode_storage::Db;
+use scopenode_storage::{Db, DbEventSink};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -343,8 +343,9 @@ async fn era1_pipeline_indexes_transfer_event() {
     let config = test_config(contract);
     let contract_cfg = &config.contracts[0];
     let mut abi_cache = AbiCache::new(Arc::new(DbAbiStore(db.clone())));
+    let sink = DbEventSink::new(db.clone());
 
-    run_era1_scope(&files, contract_cfg, &mut abi_cache, &db, &NullReporter)
+    run_era1_scope(&files, contract_cfg, &mut abi_cache, &sink, &NullReporter)
         .await
         .unwrap();
 
@@ -425,8 +426,9 @@ async fn era1_pipeline_indexes_multiple_contracts_in_one_scope_pass() {
         test_config(second).contracts.remove(0),
     ];
     let mut abi_cache = AbiCache::new(Arc::new(DbAbiStore(db.clone())));
+    let sink = DbEventSink::new(db.clone());
 
-    run_era1_scopes(&files, &contracts, &mut abi_cache, &db, &NullReporter)
+    run_era1_scopes(&files, &contracts, &mut abi_cache, &sink, &NullReporter)
         .await
         .unwrap();
 

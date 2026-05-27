@@ -13,7 +13,7 @@ use crate::source::{
     decode_era1_header, decode_era1_receipts, decode_era1_tx_hashes, iter_era1_block_tuples,
     SourceFileManifest,
 };
-use scopenode_storage::{models::StoredEvent, Db};
+use async_trait::async_trait;
 use tracing::warn;
 
 /// Sink for pipeline progress events. Implement to drive a terminal bar or suppress output.
@@ -21,6 +21,15 @@ pub trait ProgressReporter {
     fn set_total(&self, n: u64);
     fn inc(&self);
     fn finish(&self, msg: &str);
+}
+
+/// Sink that receives decoded events from the pipeline and persists them.
+///
+/// Implement this to store events (e.g., `DbEventSink` in `scopenode-storage`)
+/// or capture them in memory for testing.
+#[async_trait]
+pub trait EventSink: Send + Sync {
+    async fn store(&self, events: Vec<DecodedEvent>) -> Result<usize, CoreError>;
 }
 
 /// No-op reporter for tests and programmatic callers that don't need progress output.
@@ -73,24 +82,6 @@ impl PreparedScope {
     }
 }
 
-fn to_stored(e: DecodedEvent) -> StoredEvent {
-    StoredEvent::from_decoded_log(
-        e.contract,
-        &e.event_name,
-        e.topic0,
-        e.block_number,
-        e.block_hash,
-        e.tx_hash,
-        e.tx_index,
-        e.log_index,
-        &e.raw_topics,
-        &e.raw_data,
-        e.decoded,
-        &e.source,
-        e.timestamp,
-    )
-}
-
 /// Run the ERA1 indexing pipeline for one contract scope.
 ///
 /// `files` must be the manifest entries from the source scan. Only files whose
@@ -102,14 +93,14 @@ pub async fn run_era1_scope(
     files: &[SourceFileManifest],
     contract: &ContractConfig,
     abi_cache: &mut AbiCache,
-    db: &Db,
+    sink: &dyn EventSink,
     reporter: &dyn ProgressReporter,
 ) -> Result<(), CoreError> {
     run_era1_scopes(
         files,
         std::slice::from_ref(contract),
         abi_cache,
-        db,
+        sink,
         reporter,
     )
     .await
@@ -124,7 +115,7 @@ pub async fn run_era1_scopes(
     files: &[SourceFileManifest],
     contracts: &[ContractConfig],
     abi_cache: &mut AbiCache,
-    db: &Db,
+    sink: &dyn EventSink,
     reporter: &dyn ProgressReporter,
 ) -> Result<(), CoreError> {
     let mut scopes = Vec::new();
@@ -225,7 +216,7 @@ pub async fn run_era1_scopes(
             }
 
             let tx_hashes = decode_era1_tx_hashes(&tuple.compressed_body).unwrap_or_default();
-            let mut storage_events = Vec::new();
+            let mut block_events = Vec::new();
 
             for idx in matching_scope_indices {
                 let scope = &scopes[idx];
@@ -237,14 +228,13 @@ pub async fn run_era1_scopes(
                     header.timestamp,
                     "era1",
                 );
-                storage_events.extend(events.into_iter().map(to_stored));
+                block_events.extend(events);
             }
 
-            if !storage_events.is_empty() {
-                if let Err(e) = db.insert_events(&storage_events).await {
-                    warn!(block = header.number, err = %e, "Event insert failed");
-                } else {
-                    total_events += storage_events.len();
+            if !block_events.is_empty() {
+                match sink.store(block_events).await {
+                    Ok(n) => total_events += n,
+                    Err(e) => warn!(block = header.number, err = %e, "Event insert failed"),
                 }
             }
         }
@@ -259,71 +249,4 @@ pub async fn run_era1_scopes(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use alloy_primitives::{address, bytes, B256};
-    use serde_json::json;
-
-    fn make_decoded_event() -> DecodedEvent {
-        DecodedEvent {
-            contract: address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
-            event_name: "Transfer".to_string(),
-            topic0: B256::from([0x11u8; 32]),
-            block_number: 18_000_000,
-            block_hash: B256::from([0x22u8; 32]),
-            tx_hash: B256::from([0x33u8; 32]),
-            tx_index: 5,
-            log_index: 12,
-            raw_topics: vec![B256::from([0x11u8; 32]), B256::from([0x44u8; 32])],
-            raw_data: bytes!("deadbeef"),
-            decoded: json!({"from": "0xabc", "to": "0xdef", "value": "1000"}),
-            source: "era1".to_string(),
-            timestamp: 1_700_000_000,
-        }
-    }
-
-    #[test]
-    fn to_stored_serialises_address_as_checksum() {
-        let e = make_decoded_event();
-        let contract = e.contract;
-        let stored = to_stored(e);
-        assert_eq!(stored.contract, contract.to_checksum(None));
-    }
-
-    #[test]
-    fn to_stored_serialises_raw_data_as_hex() {
-        let e = make_decoded_event();
-        let stored = to_stored(e);
-        assert_eq!(stored.raw_data, "deadbeef");
-    }
-
-    #[test]
-    fn to_stored_casts_indices_to_i64() {
-        let e = make_decoded_event();
-        let stored = to_stored(e);
-        assert_eq!(stored.block_number, 18_000_000_i64);
-        assert_eq!(stored.tx_index, 5_i64);
-        assert_eq!(stored.log_index, 12_i64);
-    }
-
-    #[test]
-    fn to_stored_serialises_hashes_as_strings() {
-        let e = make_decoded_event();
-        let tx_hash = e.tx_hash;
-        let block_hash = e.block_hash;
-        let stored = to_stored(e);
-        assert_eq!(stored.tx_hash, tx_hash.to_string());
-        assert_eq!(stored.block_hash, block_hash.to_string());
-    }
-
-    #[test]
-    fn to_stored_preserves_scalar_fields() {
-        let e = make_decoded_event();
-        let stored = to_stored(e);
-        assert_eq!(stored.event_name, "Transfer");
-        assert_eq!(stored.source, "era1");
-        assert_eq!(stored.timestamp, 1_700_000_000_i64);
-    }
-}
 

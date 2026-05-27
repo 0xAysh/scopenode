@@ -16,7 +16,7 @@ pub enum CoreError {
     Config(#[from] ConfigError),
 
     #[error("Storage error: {0}")]
-    Storage(#[from] scopenode_storage::DbError),
+    Storage(String),
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
