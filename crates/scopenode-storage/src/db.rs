@@ -123,7 +123,7 @@ impl Db {
     }
 
     /// Check if a contract address has been indexed.
-    pub async fn is_contract_indexed(&self, address: &str) -> Result<bool, DbError> {
+    pub(crate) async fn is_contract_indexed(&self, address: &str) -> Result<bool, DbError> {
         #[derive(sqlx::FromRow)]
         struct Row {
             count: i64,
@@ -136,23 +136,6 @@ impl Db {
         .await
         .map_err(|e| DbError::Query(e.to_string()))?;
         Ok(row.count > 0)
-    }
-
-    /// Count events for a specific contract + event name combination.
-    pub async fn count_events(&self, contract: &str, event_name: &str) -> Result<i64, DbError> {
-        #[derive(sqlx::FromRow)]
-        struct Row {
-            count: i64,
-        }
-        let row = sqlx::query_as::<_, Row>(
-            r#"SELECT COUNT(*) as count FROM events WHERE contract = ? AND event_name = ?"#,
-        )
-        .bind(contract)
-        .bind(event_name)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| DbError::Query(e.to_string()))?;
-        Ok(row.count)
     }
 
     /// Count total events for a contract (across all event types).
@@ -171,7 +154,7 @@ impl Db {
     }
 
     /// Return per-event-name counts for a contract.
-    pub async fn event_counts_for_contract(
+    pub(crate) async fn event_counts_for_contract(
         &self,
         contract: &str,
     ) -> Result<Vec<(String, i64)>, DbError> {
@@ -196,7 +179,7 @@ impl Db {
     }
 
     /// Return the min/max block range for indexed events.
-    pub async fn indexed_block_range(&self) -> Result<Option<(u64, u64)>, DbError> {
+    pub(crate) async fn indexed_block_range(&self) -> Result<Option<(u64, u64)>, DbError> {
         #[derive(sqlx::FromRow)]
         struct Row {
             min_num: Option<i64>,
@@ -252,16 +235,6 @@ impl Db {
             .await
             .map_err(|e| DbError::Query(e.to_string()))?;
         Ok(row.and_then(|r| r.abi_json))
-    }
-
-    /// Return all indexed contracts ordered by address.
-    pub async fn get_all_contracts(&self) -> Result<Vec<ContractRow>, DbError> {
-        sqlx::query_as::<_, ContractRow>(
-            r#"SELECT address, name, abi_json FROM contracts ORDER BY address ASC"#,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| DbError::Query(e.to_string()))
     }
 
     /// Return all indexed contracts with their event count in one query.
@@ -320,7 +293,7 @@ impl Db {
     /// When `filter.limit > 0` the storage layer queries `limit + 1` rows
     /// internally. Returns [`QueryResult::Capped`] when the result exceeds
     /// `limit`; [`QueryResult::Results`] otherwise.
-    pub async fn query_events_for_filter(
+    pub(crate) async fn query_events_for_filter(
         &self,
         filter: &EventFilter,
     ) -> Result<QueryResult, DbError> {
@@ -355,31 +328,6 @@ impl Db {
         Ok(QueryResult::Results(rows))
     }
 
-    /// Stream events matching the given filter, row by row (no result cap).
-    ///
-    /// `filter.limit` and `filter.offset` are ignored — all matching rows are
-    /// streamed.
-    pub fn stream_events_for_filter<'a>(
-        &'a self,
-        filter: &'a EventFilter,
-    ) -> impl futures_core::Stream<Item = Result<StoredEvent, DbError>> + 'a {
-        let from = filter.from_block.unwrap_or(0) as i64;
-        let to = filter.to_block.map(|b| b as i64).unwrap_or(i64::MAX);
-
-        let sql = filter_sql_base(
-            filter.contract.is_some(),
-            filter.event_name.is_some(),
-            filter.topic0.is_some(),
-        );
-        let mut q = sqlx::query_as::<_, StoredEvent>(sql);
-        if let Some(c) = &filter.contract { q = q.bind(c.as_str()); }
-        if let Some(e) = &filter.event_name { q = q.bind(e.as_str()); }
-        if let Some(t) = &filter.topic0 { q = q.bind(t.as_str()); }
-        q = q.bind(from).bind(to);
-
-        sqlx_stream_to_db_stream(q.fetch(&self.pool))
-    }
-
     /// Count all events across all contracts.
     pub async fn count_all_events(&self) -> Result<i64, DbError> {
         #[derive(sqlx::FromRow)]
@@ -394,7 +342,7 @@ impl Db {
     }
 
     /// Return the on-disk size of the database in bytes.
-    pub async fn db_size_bytes(&self) -> Result<u64, DbError> {
+    pub(crate) async fn db_size_bytes(&self) -> Result<u64, DbError> {
         #[derive(sqlx::FromRow)]
         struct Row {
             size: i64,
@@ -410,7 +358,7 @@ impl Db {
 }
 
 /// Build and cache the base filter SQL for the 8 possible (contract, event_name, topic0) flag
-/// combinations. Both the paginated and streaming query paths share this single source of truth —
+/// combinations. Both callers of the paginated query path share this single source of truth —
 /// adding a new filter dimension means editing this function only.
 ///
 /// Results are cached in a `OnceLock` array (one slot per 3-bit flag combination) so each unique
@@ -438,32 +386,6 @@ fn filter_sql_base(has_contract: bool, has_event_name: bool, has_topic0: bool) -
             )
         })
         .as_str()
-}
-
-// ─── Stream adapter ──────────────────────────────────────────────────────────
-
-struct DbStream<'a, T> {
-    inner: futures_core::stream::BoxStream<'a, Result<T, sqlx::Error>>,
-}
-
-impl<T> futures_core::Stream for DbStream<'_, T> {
-    type Item = Result<T, DbError>;
-
-    fn poll_next(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        self.inner
-            .as_mut()
-            .poll_next(cx)
-            .map(|opt| opt.map(|r| r.map_err(|e| DbError::Query(e.to_string()))))
-    }
-}
-
-fn sqlx_stream_to_db_stream<'a, T>(
-    stream: futures_core::stream::BoxStream<'a, Result<T, sqlx::Error>>,
-) -> DbStream<'a, T> {
-    DbStream { inner: stream }
 }
 
 #[cfg(test)]
@@ -561,34 +483,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(result.into_results().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn stream_events_for_filter_returns_all_rows_ordered() {
-        let (db, _guard) = open_test_db().await;
-        let contract = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
-        db.upsert_contract(contract, None, "[]").await.unwrap();
-
-        let e3 = make_event(contract, 300, "0xcccc", "0xcccc", 0);
-        let e1 = make_event(contract, 100, "0xaaaa", "0xaaaa", 0);
-        let e2 = make_event(contract, 200, "0xbbbb", "0xbbbb", 0);
-        db.insert_events(&[e3, e1, e2]).await.unwrap();
-
-        use futures_util::StreamExt;
-        let filter = EventFilter::default();
-        let stream = db.stream_events_for_filter(&filter);
-        let rows: Vec<StoredEvent> = stream
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-
-        assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].block_number, 100);
-        assert_eq!(rows[1].block_number, 200);
-        assert_eq!(rows[2].block_number, 300);
+        assert!(matches!(result, QueryResult::Results(rows) if rows.len() == 1));
     }
 
     #[tokio::test]
@@ -601,15 +496,15 @@ mod tests {
             .await
             .unwrap();
 
-        let rows = db
+        let result = db
             .query_events_for_filter(&EventFilter {
                 topic0: Some(transfer_topic0.to_string()),
                 limit: 100,
                 ..EventFilter::default()
             })
             .await
-            .unwrap()
-            .into_results();
+            .unwrap();
+        let QueryResult::Results(rows) = result else { panic!("expected Results") };
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].topic0, transfer_topic0);
     }

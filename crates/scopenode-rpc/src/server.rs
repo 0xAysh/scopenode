@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::types::ErrorObject;
-use scopenode_storage::{Db, EventFilter};
+use scopenode_storage::{Db, EventQuery, EventQueryOutcome};
 #[rpc(server, namespace = "net")]
 pub trait NetApi {
     #[method(name = "peerCount")]
@@ -53,24 +53,13 @@ impl NetApiServer for EthApiImpl {
 #[async_trait]
 impl EthApiServer for EthApiImpl {
     async fn get_logs(&self, filter: Filter) -> RpcResult<Vec<Log>> {
-        let address: Option<Address> = filter.address.iter().next().copied();
-
-        let in_scope = if let Some(addr) = address {
-            self.db
-                .is_contract_indexed(&addr.to_checksum(None))
-                .await
-                .unwrap_or(false)
-        } else {
-            false
+        // JSON-RPC requires an address filter — protocol-level constraint.
+        let Some(addr) = filter.address.iter().next().copied() else {
+            return Err(not_indexed_error());
         };
 
-        if !in_scope {
-            return Err(not_indexed_error());
-        }
-
-        let event_filter = EventFilter {
-            contract: address.map(|a| a.to_checksum(None)),
-            event_name: None,
+        let query = EventQuery {
+            contract: Some(addr.to_checksum(None)),
             topic0: filter
                 .topics
                 .first()
@@ -79,29 +68,26 @@ impl EthApiServer for EthApiImpl {
             from_block: filter.get_from_block(),
             to_block: filter.get_to_block(),
             limit: 10_000,
-            offset: 0,
+            ..EventQuery::default()
         };
 
-        let result = self
+        match self
             .db
-            .query_events_for_filter(&event_filter)
+            .query_events(&query)
             .await
-            .map_err(|e| internal_error(&e.to_string()))?;
-
-        if result.is_capped() {
-            return Err(ErrorObject::owned(
+            .map_err(|e| internal_error(&e.to_string()))?
+        {
+            EventQueryOutcome::NotIndexed => Err(not_indexed_error()),
+            EventQueryOutcome::Capped { .. } => Err(ErrorObject::owned(
                 -32005,
                 "result set exceeds 10,000 rows — narrow your filter (smaller block range or add address/topic filter)",
                 None::<()>,
-            ));
+            )),
+            EventQueryOutcome::Empty => Ok(vec![]),
+            EventQueryOutcome::Results(rows) => {
+                Ok(rows.iter().filter_map(row_to_log).collect())
+            }
         }
-
-        let logs = result
-            .into_results()
-            .into_iter()
-            .filter_map(|row| row_to_log(&row))
-            .collect();
-        Ok(logs)
     }
 
     async fn block_number(&self) -> RpcResult<String> {
