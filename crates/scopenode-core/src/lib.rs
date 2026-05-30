@@ -6,6 +6,7 @@
 #![deny(warnings)]
 
 pub mod abi;
+pub use abi::AbiFetcher;
 pub mod config;
 pub mod era1_reader;
 pub mod era_pipeline;

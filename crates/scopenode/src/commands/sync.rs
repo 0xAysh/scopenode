@@ -97,7 +97,7 @@ pub async fn run(config: Config, db: Db, dry_run: bool, quiet: bool) -> Result<(
     );
     let reporter = IndicatifReporter(pb);
 
-    let mut abi_cache = AbiCache::new(Arc::new(DbAbiStore(db.clone())));
+    let mut abi_cache = AbiCache::new(Arc::new(DbAbiStore(db.clone())), None);
     let sink = scopenode_storage::DbEventSink::new(db);
 
     run_era1_scopes(

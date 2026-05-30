@@ -296,6 +296,7 @@ fn test_config(contract_address: Address) -> Config {
             from_block: 100,
             to_block: Some(100),
             abi_override: None,
+            impl_address: None,
         }],
     }
 }
@@ -342,7 +343,7 @@ async fn era1_pipeline_indexes_transfer_event() {
 
     let config = test_config(contract);
     let contract_cfg = &config.contracts[0];
-    let mut abi_cache = AbiCache::new(Arc::new(DbAbiStore(db.clone())));
+    let mut abi_cache = AbiCache::new(Arc::new(DbAbiStore(db.clone())), None);
     let sink = DbEventSink::new(db.clone());
 
     run_era1_scope(&files, contract_cfg, &mut abi_cache, &sink, &NullReporter)
@@ -425,7 +426,7 @@ async fn era1_pipeline_indexes_multiple_contracts_in_one_scope_pass() {
         test_config(first).contracts.remove(0),
         test_config(second).contracts.remove(0),
     ];
-    let mut abi_cache = AbiCache::new(Arc::new(DbAbiStore(db.clone())));
+    let mut abi_cache = AbiCache::new(Arc::new(DbAbiStore(db.clone())), None);
     let sink = DbEventSink::new(db.clone());
 
     run_era1_scopes(&files, &contracts, &mut abi_cache, &sink, &NullReporter)
