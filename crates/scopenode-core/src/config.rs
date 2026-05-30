@@ -87,8 +87,12 @@ pub struct ContractConfig {
     #[serde(deserialize_with = "deser_opt_block_number", default)]
     pub to_block: Option<u64>,
 
-    /// Path to a local ABI JSON file. Required — remote ABI fetching is not supported.
+    /// Path to a local ABI JSON file. When absent, the ABI fetch chain resolves the ABI.
     pub abi_override: Option<PathBuf>,
+
+    /// Implementation address for proxy contracts. Used by the ABI fetch chain to
+    /// resolve the ABI from the implementation rather than the proxy.
+    pub impl_address: Option<Address>,
 }
 
 impl Config {
@@ -103,9 +107,6 @@ impl Config {
 
     fn validate(&self) -> Result<(), ConfigError> {
         for c in &self.contracts {
-            if c.abi_override.is_none() {
-                return Err(ConfigError::AbiOverrideRequired(c.address));
-            }
             if c.to_block.is_none() {
                 return Err(ConfigError::ToBlockRequired(c.address));
             }
@@ -120,6 +121,10 @@ impl Config {
             }
             if c.events.is_empty() {
                 return Err(ConfigError::NoEvents(c.address));
+            }
+            let has_wildcard = c.events.iter().any(|e| e == "*");
+            if has_wildcard && c.events.len() > 1 {
+                return Err(ConfigError::WildcardMixed(c.address));
             }
         }
         Ok(())
@@ -377,16 +382,59 @@ mod tests {
     }
 
     #[test]
-    fn abi_override_required_in_validate() {
+    fn no_abi_override_is_valid() {
         let toml = format!(
             "[node]\n{}\n[[contracts]]\naddress = \"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48\"\nevents = [\"Transfer\"]\nfrom_block = 1\nto_block = 100\n",
             minimal_node_toml()
         );
         let cfg: Config = toml::from_str(&toml).unwrap();
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn impl_address_optional() {
+        let toml = format!(
+            "[node]\n{}\n[[contracts]]\naddress = \"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48\"\nevents = [\"Transfer\"]\nfrom_block = 1\nto_block = 100\nimpl_address = \"0xdAC17F958D2ee523a2206206994597C13D831ec7\"\n",
+            minimal_node_toml()
+        );
+        let cfg: Config = toml::from_str(&toml).unwrap();
+        assert!(cfg.contracts[0].impl_address.is_some());
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn impl_address_absent_is_valid() {
+        let toml = format!(
+            "[node]\n{}\n[[contracts]]\n{}\n",
+            minimal_node_toml(),
+            minimal_contract_toml()
+        );
+        let cfg: Config = toml::from_str(&toml).unwrap();
+        assert!(cfg.contracts[0].impl_address.is_none());
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn events_wildcard_alone_is_valid() {
+        let toml = format!(
+            "[node]\n{}\n[[contracts]]\naddress = \"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48\"\nevents = [\"*\"]\nfrom_block = 1\nto_block = 100\n",
+            minimal_node_toml()
+        );
+        let cfg: Config = toml::from_str(&toml).unwrap();
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn events_wildcard_mixed_errors() {
+        let toml = format!(
+            "[node]\n{}\n[[contracts]]\naddress = \"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48\"\nevents = [\"Transfer\", \"*\"]\nfrom_block = 1\nto_block = 100\n",
+            minimal_node_toml()
+        );
+        let cfg: Config = toml::from_str(&toml).unwrap();
         let err = cfg.validate().unwrap_err();
         assert!(
-            matches!(err, ConfigError::AbiOverrideRequired(_)),
-            "expected AbiOverrideRequired, got {err}"
+            matches!(err, ConfigError::WildcardMixed(_)),
+            "expected WildcardMixed, got {err}"
         );
     }
 

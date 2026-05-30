@@ -90,9 +90,9 @@ pub enum ConfigError {
     #[error("Contract {0} has no events configured")]
     NoEvents(Address),
 
-    #[error("Contract {0} requires abi_override — add abi_override = \"./path/to/abi.json\" to your contract config")]
-    AbiOverrideRequired(Address),
-
     #[error("Contract {0} requires to_block — ERA1 sync requires a bounded block range")]
     ToBlockRequired(Address),
+
+    #[error("Contract {0}: \"*\" wildcard must be the sole element in events")]
+    WildcardMixed(Address),
 }
