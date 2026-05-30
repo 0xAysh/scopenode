@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::runtime::RuntimeContext;
+use crate::sourcify::SourcifyClient;
 
 struct DbAbiStore(Db);
 
@@ -97,7 +98,16 @@ pub async fn run(config: Config, db: Db, dry_run: bool, quiet: bool) -> Result<(
     );
     let reporter = IndicatifReporter(pb);
 
-    let mut abi_cache = AbiCache::new(Arc::new(DbAbiStore(db.clone())), None);
+    let http_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .context("Failed to build HTTP client")?;
+    let sourcify = Arc::new(SourcifyClient::new(http_client));
+
+    let mut abi_cache = AbiCache::new(
+        Arc::new(DbAbiStore(db.clone())),
+        Some(sourcify),
+    );
     let sink = scopenode_storage::DbEventSink::new(db);
 
     run_era1_scopes(
