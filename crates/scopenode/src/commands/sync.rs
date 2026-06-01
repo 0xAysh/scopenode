@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use crate::runtime::RuntimeContext;
 use crate::sourcify::SourcifyClient;
+use crate::sync_plan::SyncPlan;
 
 struct DbAbiStore(Db);
 
@@ -28,7 +29,12 @@ impl AbiStore for DbAbiStore {
             .map_err(|e| AbiError::Cache(e.to_string()))
     }
 
-    async fn save(&self, address: &str, name: Option<&str>, abi_json: &str) -> Result<(), AbiError> {
+    async fn save(
+        &self,
+        address: &str,
+        name: Option<&str>,
+        abi_json: &str,
+    ) -> Result<(), AbiError> {
         self.0
             .upsert_contract(address, name, abi_json)
             .await
@@ -52,38 +58,32 @@ impl ProgressReporter for IndicatifReporter {
 
 /// Run the `sync` command.
 pub async fn run(config: Config, db: Db, dry_run: bool, quiet: bool) -> Result<()> {
-    let era_dir = crate::runtime::expand_tilde(config.node.era_dir.clone());
+    let plan = SyncPlan::from_config(&config);
 
     if dry_run {
-        println!("ERA1 source: {}", era_dir.display());
+        println!("ERA1 source: {}", plan.era_dir.display());
         println!("Contracts to sync:");
-        for c in &config.contracts {
+        for contract in &plan.contracts {
             println!(
                 "  {} blocks {}-{}",
-                c.name.as_deref().unwrap_or(&c.address.to_string()),
-                c.from_block,
-                c.to_block.unwrap_or(0),
+                contract
+                    .name
+                    .as_deref()
+                    .unwrap_or(&contract.address.to_string()),
+                contract.block_range.start(),
+                contract.block_range.end(),
             );
         }
         return Ok(());
     }
 
-    // Compute union range across all contracts so scan only SHA256-hashes in-range files.
-    let union_from = config
-        .contracts
-        .iter()
-        .map(|c| c.from_block)
-        .min()
-        .unwrap_or(0);
-    let union_to = config
-        .contracts
-        .iter()
-        .filter_map(|c| c.to_block)
-        .max()
-        .unwrap_or(u64::MAX);
-
-    let scan = scan_era1_source(&era_dir, None, union_from, union_to)
-        .with_context(|| format!("Failed to scan ERA1 source: {}", era_dir.display()))?;
+    let scan = scan_era1_source(
+        &plan.era_dir,
+        None,
+        *plan.block_range.start(),
+        *plan.block_range.end(),
+    )
+    .with_context(|| format!("Failed to scan ERA1 source: {}", plan.era_dir.display()))?;
 
     let mp = MultiProgress::new();
     if quiet {
@@ -104,10 +104,7 @@ pub async fn run(config: Config, db: Db, dry_run: bool, quiet: bool) -> Result<(
         .context("Failed to build HTTP client")?;
     let sourcify = Arc::new(SourcifyClient::new(http_client));
 
-    let mut abi_cache = AbiCache::new(
-        Arc::new(DbAbiStore(db.clone())),
-        Some(sourcify),
-    );
+    let mut abi_cache = AbiCache::new(Arc::new(DbAbiStore(db.clone())), Some(sourcify));
     let sink = scopenode_storage::DbEventSink::new(db);
 
     run_era1_scopes(
