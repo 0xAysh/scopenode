@@ -94,10 +94,11 @@ pub async fn run(config: Config, db: Db, dry_run: bool, quiet: bool) -> Result<(
 
     let mut abi_cache = AbiCache::new(Arc::new(DbAbiStore(db.clone())), Some(sourcify));
     let sink = scopenode_storage::DbEventSink::new(db);
+    let pipeline_contracts = plan.pipeline_contracts();
 
     run_era1_scopes(
         &scan.files,
-        &config.contracts,
+        &pipeline_contracts,
         &mut abi_cache,
         &sink,
         &reporter,
