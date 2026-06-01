@@ -1,5 +1,6 @@
 use alloy_primitives::Address;
 use scopenode_core::config::Config;
+use std::fmt::Write as _;
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
 
@@ -50,6 +51,30 @@ impl SyncPlan {
             contracts,
             block_range: union_from..=union_to,
         }
+    }
+
+    pub(crate) fn render_dry_run(&self) -> String {
+        let mut output = String::new();
+
+        writeln!(output, "ERA1 source: {}", self.era_dir.display())
+            .expect("writing to a String cannot fail");
+        writeln!(output, "Contracts to sync:").expect("writing to a String cannot fail");
+
+        for contract in &self.contracts {
+            writeln!(
+                output,
+                "  {} blocks {}-{}",
+                contract
+                    .name
+                    .as_deref()
+                    .unwrap_or(&contract.address.to_string()),
+                contract.block_range.start(),
+                contract.block_range.end()
+            )
+            .expect("writing to a String cannot fail");
+        }
+
+        output
     }
 }
 
@@ -196,5 +221,45 @@ mod tests {
         let plan = SyncPlan::from_config(&cfg);
 
         assert_eq!(plan.contracts[0].name, None);
+    }
+
+    #[test]
+    fn renders_dry_run_from_plan_facts() {
+        let address = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let plan = SyncPlan {
+            era_dir: PathBuf::from("/planned/era1"),
+            contracts: vec![crate::sync_plan::ContractScopePlan {
+                address,
+                name: Some("PlannedUSDC".to_owned()),
+                events: vec!["Transfer".to_owned()],
+                block_range: 123..=456,
+            }],
+            block_range: 100..=500,
+        };
+
+        assert_eq!(
+            plan.render_dry_run(),
+            "ERA1 source: /planned/era1\nContracts to sync:\n  PlannedUSDC blocks 123-456\n"
+        );
+    }
+
+    #[test]
+    fn renders_address_when_contract_name_is_missing() {
+        let address = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+        let plan = SyncPlan {
+            era_dir: PathBuf::from("/planned/era1"),
+            contracts: vec![crate::sync_plan::ContractScopePlan {
+                address,
+                name: None,
+                events: vec!["Transfer".to_owned()],
+                block_range: 123..=456,
+            }],
+            block_range: 123..=456,
+        };
+
+        assert_eq!(
+            plan.render_dry_run(),
+            format!("ERA1 source: /planned/era1\nContracts to sync:\n  {address} blocks 123-456\n")
+        );
     }
 }

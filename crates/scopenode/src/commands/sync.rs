@@ -61,19 +61,7 @@ pub async fn run(config: Config, db: Db, dry_run: bool, quiet: bool) -> Result<(
     let plan = SyncPlan::from_config(&config);
 
     if dry_run {
-        println!("ERA1 source: {}", plan.era_dir.display());
-        println!("Contracts to sync:");
-        for contract in &plan.contracts {
-            println!(
-                "  {} blocks {}-{}",
-                contract
-                    .name
-                    .as_deref()
-                    .unwrap_or(&contract.address.to_string()),
-                contract.block_range.start(),
-                contract.block_range.end(),
-            );
-        }
+        print!("{}", plan.render_dry_run());
         return Ok(());
     }
 
