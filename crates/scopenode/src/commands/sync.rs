@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use scopenode_core::{
-    abi::{AbiCache, AbiStore},
+    abi_resolution::{AbiResolver, AbiStore},
     config::Config,
     era_pipeline::{run_era1_scopes, ProgressReporter},
     error::AbiError,
@@ -92,14 +92,14 @@ pub async fn run(config: Config, db: Db, dry_run: bool, quiet: bool) -> Result<(
         .context("Failed to build HTTP client")?;
     let sourcify = Arc::new(SourcifyClient::new(http_client));
 
-    let mut abi_cache = AbiCache::new(Arc::new(DbAbiStore(db.clone())), Some(sourcify));
+    let abi_resolver = AbiResolver::new(Arc::new(DbAbiStore(db.clone())), Some(sourcify));
     let sink = scopenode_storage::DbEventSink::new(db);
     let pipeline_contracts = plan.pipeline_contracts();
 
     run_era1_scopes(
         &source,
         &pipeline_contracts,
-        &mut abi_cache,
+        &abi_resolver,
         &sink,
         &reporter,
     )

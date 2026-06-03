@@ -6,7 +6,8 @@
 #![deny(warnings)]
 
 pub mod abi;
-pub use abi::AbiFetcher;
+pub mod abi_resolution;
+pub use abi_resolution::AbiFetcher;
 pub mod config;
 pub mod decode_quality;
 pub mod era1_codec;

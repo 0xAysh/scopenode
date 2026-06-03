@@ -1103,6 +1103,23 @@ mod abi_cache_tests {
     }
 
     #[tokio::test]
+    async fn abi_resolver_exposes_resolution_interface_without_decoder_terms() {
+        let store = StubAbiStore::with_entry(&ADDR.to_checksum(None), &cached_transfer_json());
+        let resolver = crate::abi_resolution::AbiResolver::new(
+            store,
+            Some(Arc::new(PanicFetcher) as Arc<dyn crate::abi_resolution::AbiFetcher>),
+        );
+
+        let events = resolver
+            .resolve_events(&contract_cfg(vec!["Transfer"]))
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].name, "Transfer");
+    }
+
+    #[tokio::test]
     async fn valid_abi_override_loads_caches_and_does_not_call_fetcher() {
         let store = StubAbiStore::empty();
         let cache = AbiCache::new(

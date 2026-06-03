@@ -4,7 +4,8 @@
 //! per ERA1 file: bloom-check each header, decode receipts for hits, verify
 //! the receipt Merkle root, ABI-decode matching logs, and store events.
 
-use crate::abi::{AbiCache, DecodedEvent, EventDecoder};
+use crate::abi::{DecodedEvent, EventDecoder};
+use crate::abi_resolution::AbiResolver;
 use crate::config::ContractConfig;
 use crate::era1_reader::Era1BlockFacts;
 use crate::error::{CoreError, VerifyError};
@@ -120,8 +121,8 @@ struct PreparedScope {
 }
 
 impl PreparedScope {
-    async fn new(contract: &ContractConfig, abi_cache: &mut AbiCache) -> Result<Self, CoreError> {
-        let events = abi_cache.get_or_fetch(contract).await?;
+    async fn new(contract: &ContractConfig, abi_resolver: &AbiResolver) -> Result<Self, CoreError> {
+        let events = abi_resolver.resolve_events(contract).await?;
         let topic0s: Vec<_> = events.iter().map(|e| e.topic0()).collect();
         let scanner = BloomScanner::new(&topic0s, contract.address);
         let decoder = EventDecoder::new(&events, contract.address)?;
@@ -233,14 +234,14 @@ impl BlockPipeline {
 pub async fn run_era1_scope(
     source: &Era1Source,
     contract: &ContractConfig,
-    abi_cache: &mut AbiCache,
+    abi_resolver: &AbiResolver,
     sink: &dyn EventSink,
     reporter: &dyn ProgressReporter,
 ) -> Result<(), CoreError> {
     run_era1_scopes(
         source,
         std::slice::from_ref(contract),
-        abi_cache,
+        abi_resolver,
         sink,
         reporter,
     )
@@ -255,13 +256,13 @@ pub async fn run_era1_scope(
 pub async fn run_era1_scopes(
     source: &Era1Source,
     contracts: &[ContractConfig],
-    abi_cache: &mut AbiCache,
+    abi_resolver: &AbiResolver,
     sink: &dyn EventSink,
     reporter: &dyn ProgressReporter,
 ) -> Result<(), CoreError> {
     let mut scopes = Vec::new();
     for contract in contracts {
-        match PreparedScope::new(contract, abi_cache).await {
+        match PreparedScope::new(contract, abi_resolver).await {
             Ok(scope) => scopes.push(scope),
             Err(err) if contracts.len() == 1 => return Err(err),
             Err(err) => {
