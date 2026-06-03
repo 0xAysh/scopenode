@@ -31,7 +31,10 @@ use tracing::info;
 
 use crate::filter_plan::FilterPlan;
 use crate::projection::{project_rest_event, EventResponse};
-use scopenode_storage::{Db, EventQuery, EventQueryOutcome};
+use crate::query_front_door::{
+    map_event_query_outcome, EventQueryResponse, MISSING_COVERAGE_MESSAGE, RESULT_CAP_MESSAGE,
+};
+use scopenode_storage::{Db, EventQuery};
 
 #[derive(Clone)]
 struct AppState {
@@ -97,24 +100,26 @@ async fn get_events(
         }
     };
 
-    match state
+    let outcome = state
         .db
         .query_events(&query)
         .await
-        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    {
-        EventQueryOutcome::Capped { .. } => Err((
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    match map_event_query_outcome(outcome) {
+        EventQueryResponse::TooManyResults { .. } => Err((
             axum::http::StatusCode::BAD_REQUEST,
-            "result set exceeds 10,000 rows — narrow your filter (smaller block range or add address/topic filter)".into(),
+            RESULT_CAP_MESSAGE.into(),
         )),
-        EventQueryOutcome::MissingCoverage { .. } => Err((
+        EventQueryResponse::MissingCoverage => Err((
             axum::http::StatusCode::BAD_REQUEST,
-            "requested range is outside local coverage — run `scopenode sync` for this contract and block range".into(),
+            MISSING_COVERAGE_MESSAGE.into(),
         )),
-        EventQueryOutcome::NotIndexed | EventQueryOutcome::Empty => {
-            Ok(Json(EventsResponse { events: vec![], count: 0 }))
-        }
-        EventQueryOutcome::Results(rows) => {
+        EventQueryResponse::NotIndexed | EventQueryResponse::Empty => Ok(Json(EventsResponse {
+            events: vec![],
+            count: 0,
+        })),
+        EventQueryResponse::Results(rows) => {
             let events: Vec<EventResponse> = rows.iter().map(project_rest_event).collect();
             let count = events.len();
             Ok(Json(EventsResponse { events, count }))

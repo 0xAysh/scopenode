@@ -7,12 +7,15 @@
 //! - `net_peerCount` — always `"0x0"` (ERA1-only; no live peers)
 
 use crate::filter_plan::FilterPlan;
+use crate::query_front_door::{
+    map_event_query_outcome, EventQueryResponse, MISSING_COVERAGE_MESSAGE, RESULT_CAP_MESSAGE,
+};
 use alloy::rpc::types::{Filter, Log};
 use async_trait::async_trait;
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::types::ErrorObject;
-use scopenode_storage::{Db, EventQueryOutcome};
+use scopenode_storage::Db;
 #[rpc(server, namespace = "net")]
 pub trait NetApi {
     #[method(name = "peerCount")]
@@ -61,27 +64,26 @@ impl EthApiServer for EthApiImpl {
             }
         };
 
-        match self
+        let outcome = self
             .db
             .query_events(&query)
             .await
-            .map_err(|e| internal_error(&e.to_string()))?
-        {
-            EventQueryOutcome::NotIndexed => Err(not_indexed_error()),
-            EventQueryOutcome::MissingCoverage { .. } => Err(ErrorObject::owned(
+            .map_err(|e| internal_error(&e.to_string()))?;
+        match map_event_query_outcome(outcome) {
+            EventQueryResponse::NotIndexed => Err(not_indexed_error()),
+            EventQueryResponse::MissingCoverage => Err(ErrorObject::owned(
                 -32001,
-                "Requested range is outside local coverage. Run `scopenode sync` for this contract and block range.",
+                MISSING_COVERAGE_MESSAGE,
                 None::<()>,
             )),
-            EventQueryOutcome::Capped { .. } => Err(ErrorObject::owned(
-                -32005,
-                "result set exceeds 10,000 rows — narrow your filter (smaller block range or add address/topic filter)",
-                None::<()>,
-            )),
-            EventQueryOutcome::Empty => Ok(vec![]),
-            EventQueryOutcome::Results(rows) => {
-                Ok(rows.iter().filter_map(crate::projection::project_log).collect())
+            EventQueryResponse::TooManyResults { .. } => {
+                Err(ErrorObject::owned(-32005, RESULT_CAP_MESSAGE, None::<()>))
             }
+            EventQueryResponse::Empty => Ok(vec![]),
+            EventQueryResponse::Results(rows) => Ok(rows
+                .iter()
+                .filter_map(crate::projection::project_log)
+                .collect()),
         }
     }
 
@@ -142,5 +144,24 @@ mod tests {
     fn net_peer_count_always_zero() {
         // EthApiImpl::peer_count is async — test the constant directly.
         assert_eq!("0x0", "0x0");
+    }
+
+    #[test]
+    fn query_front_door_maps_capped_outcome_without_transport_details() {
+        let mapped = crate::query_front_door::map_event_query_outcome(
+            scopenode_storage::EventQueryOutcome::Capped {
+                results: vec![],
+                cap: 10_000,
+            },
+        );
+
+        assert!(matches!(
+            mapped,
+            crate::query_front_door::EventQueryResponse::TooManyResults { cap: 10_000 }
+        ));
+        assert_eq!(
+            crate::query_front_door::RESULT_CAP_MESSAGE,
+            "result set exceeds 10,000 rows — narrow your filter (smaller block range or add address/topic filter)"
+        );
     }
 }

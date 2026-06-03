@@ -9,6 +9,7 @@
 
 pub mod filter_plan;
 pub mod projection;
+pub mod query_front_door;
 pub mod rest;
 pub mod server;
 
