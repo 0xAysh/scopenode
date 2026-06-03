@@ -30,6 +30,15 @@ pub trait ProgressReporter {
 #[async_trait]
 pub trait EventSink: Send + Sync {
     async fn store(&self, events: Vec<DecodedEvent>) -> Result<usize, CoreError>;
+
+    async fn record_coverage(
+        &self,
+        _contract: &str,
+        _from_block: u64,
+        _to_block: u64,
+    ) -> Result<(), CoreError> {
+        Ok(())
+    }
 }
 
 /// No-op reporter for tests and programmatic callers that don't need progress output.
@@ -102,6 +111,7 @@ impl ReceiptVerifier for AlwaysFailVerifier {
 }
 
 struct PreparedScope {
+    contract: String,
     name: String,
     from: u64,
     to: u64,
@@ -120,6 +130,7 @@ impl PreparedScope {
         })?;
 
         Ok(Self {
+            contract: contract.address.to_checksum(None),
             name: contract
                 .name
                 .clone()
@@ -310,6 +321,15 @@ pub async fn run_era1_scopes(
         }
     }
 
+    for scope in pipeline.scopes.iter() {
+        if let Err(e) = sink
+            .record_coverage(&scope.contract, scope.from, scope.to)
+            .await
+        {
+            warn!(contract = %scope.contract, err = %e, "Coverage record failed");
+        }
+    }
+
     reporter.finish(&format!(
         "done ({total_events} events across {})",
         scope_names.join(", ")
@@ -327,6 +347,7 @@ mod tests {
     fn make_scope(from: u64, to: u64) -> PreparedScope {
         let addr = address!("0000000000000000000000000000000000000001");
         PreparedScope {
+            contract: addr.to_checksum(None),
             name: "test".to_string(),
             from,
             to,
@@ -337,6 +358,7 @@ mod tests {
 
     fn make_scope_with_target(from: u64, to: u64, addr: Address, topic0: B256) -> PreparedScope {
         PreparedScope {
+            contract: addr.to_checksum(None),
             name: "test".to_string(),
             from,
             to,

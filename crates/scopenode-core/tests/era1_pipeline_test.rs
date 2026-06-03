@@ -445,6 +445,20 @@ async fn era1_pipeline_indexes_multiple_contracts_in_one_scope_pass() {
             .unwrap(),
         1
     );
+    let outcome = db
+        .query_events(&scopenode_storage::EventQuery {
+            contract: Some(first.to_checksum(None)),
+            from_block: Some(100),
+            to_block: Some(100),
+            limit: 100,
+            ..scopenode_storage::EventQuery::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, scopenode_storage::EventQueryOutcome::Results(rows) if rows.len() == 1),
+        "successful sync should record coverage for the processed range"
+    );
 
     let _ = std::fs::remove_file(&db_path);
     let _ = std::fs::remove_file(db_path.with_extension("db-wal"));

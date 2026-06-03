@@ -9,6 +9,7 @@ use crate::db::Db;
 use crate::error::DbError;
 use crate::models::StoredEvent;
 use crate::types::EventFilter;
+use crate::MissingCoverage;
 
 /// Domain-level request for an indexed event query.
 #[derive(Debug, Clone, Default)]
@@ -26,6 +27,8 @@ pub struct EventQuery {
 /// Explicit outcomes for an indexed event query.
 #[derive(Debug)]
 pub enum EventQueryOutcome {
+    /// The contract is indexed, but scopenode has not covered the requested range.
+    MissingCoverage { missing: MissingCoverage },
     /// One or more matching events within the result cap.
     Results(Vec<StoredEvent>),
     /// Result set hit the cap; first `cap` rows returned.
@@ -68,6 +71,15 @@ impl Db {
         if let Some(contract) = &q.contract {
             if !self.is_contract_indexed(contract).await? {
                 return Ok(EventQueryOutcome::NotIndexed);
+            }
+            if let (Some(from_block), Some(to_block)) = (q.from_block, q.to_block) {
+                if !self.is_range_covered(contract, from_block, to_block).await? {
+                    return Ok(EventQueryOutcome::MissingCoverage { missing: MissingCoverage {
+                        contract: contract.clone(),
+                        from_block,
+                        to_block,
+                    }});
+                }
             }
         }
 
@@ -188,6 +200,26 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(outcome, EventQueryOutcome::Empty));
+    }
+
+    #[tokio::test]
+    async fn query_reports_missing_coverage_for_indexed_contract_range() {
+        let (db, _guard) = open_test_db().await;
+        db.upsert_contract(CONTRACT, None, "[]").await.unwrap();
+        db.record_covered_range(CONTRACT, 100, 110).await.unwrap();
+
+        let outcome = db
+            .query_events(&EventQuery {
+                contract: Some(CONTRACT.to_string()),
+                from_block: Some(100),
+                to_block: Some(120),
+                limit: 100,
+                ..EventQuery::default()
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, EventQueryOutcome::MissingCoverage { .. }));
     }
 
     #[tokio::test]
@@ -364,6 +396,7 @@ mod tests {
         ])
         .await
         .unwrap();
+        db.record_covered_range(CONTRACT, 150, 250).await.unwrap();
         let outcome = db
             .query_events(&EventQuery {
                 contract: Some(CONTRACT.to_string()),

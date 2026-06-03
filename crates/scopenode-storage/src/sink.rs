@@ -32,6 +32,18 @@ impl EventSink for DbEventSink {
             .map_err(|e| CoreError::Storage(e.to_string()))?;
         Ok(count)
     }
+
+    async fn record_coverage(
+        &self,
+        contract: &str,
+        from_block: u64,
+        to_block: u64,
+    ) -> Result<(), CoreError> {
+        self.db
+            .record_covered_range(contract, from_block, to_block)
+            .await
+            .map_err(|e| CoreError::Storage(e.to_string()))
+    }
 }
 
 #[cfg(test)]
