@@ -9,6 +9,7 @@ pub mod abi;
 pub use abi::AbiFetcher;
 pub mod config;
 pub mod decode_quality;
+pub mod era1_codec;
 pub mod era1_reader;
 pub mod era_pipeline;
 pub mod error;
