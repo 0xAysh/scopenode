@@ -13,6 +13,7 @@
 use alloy::primitives::{Address, Bytes, LogData, B256};
 use alloy::rpc::types::Log;
 use serde::Serialize;
+use scopenode_core::decode_quality::DecodeQuality;
 use scopenode_storage::models::StoredEvent;
 
 // ---------------------------------------------------------------------------
@@ -35,6 +36,13 @@ pub struct EventResponse {
     pub timestamp: i64,
 }
 
+/// A projected JSON-RPC log plus the quality of the projection.
+#[derive(Debug)]
+pub struct ProjectedLog {
+    pub log: Log,
+    pub quality: DecodeQuality,
+}
+
 // ---------------------------------------------------------------------------
 // Public projection functions
 // ---------------------------------------------------------------------------
@@ -45,6 +53,12 @@ pub struct EventResponse {
 /// hash, or topic list). This preserves the same semantics as the private
 /// `row_to_log` in `server.rs`.
 pub fn project_log(row: &StoredEvent) -> Option<Log> {
+    project_log_with_quality(row).map(|projected| projected.log)
+}
+
+/// Convert a [`StoredEvent`] row into an `alloy` [`Log`] and report whether
+/// any lossy fallback was needed.
+pub fn project_log_with_quality(row: &StoredEvent) -> Option<ProjectedLog> {
     let address: Address = row.contract.parse().ok()?;
     let tx_hash: B256 = row.tx_hash.parse().ok()?;
     let block_hash: B256 = row.block_hash.parse().ok()?;
@@ -55,14 +69,22 @@ pub fn project_log(row: &StoredEvent) -> Option<Log> {
         .filter_map(|t| t.parse().ok())
         .collect();
 
-    let data_bytes = alloy_primitives::hex::decode(&row.raw_data).unwrap_or_default();
+    let (data_bytes, quality) = match alloy_primitives::hex::decode(&row.raw_data) {
+        Ok(bytes) => (bytes, DecodeQuality::Valid),
+        Err(e) => (
+            Vec::new(),
+            DecodeQuality::lossy(format!("raw_data hex decode failed: {e}")),
+        ),
+    };
     let data = Bytes::from(data_bytes);
 
     let log_data = LogData::new(topics, data)?;
 
     let inner_log = alloy::primitives::Log { address, data: log_data };
 
-    Some(Log {
+    Some(ProjectedLog {
+        quality,
+        log: Log {
         inner: inner_log,
         block_hash: Some(block_hash),
         block_number: Some(row.block_number as u64),
@@ -71,6 +93,7 @@ pub fn project_log(row: &StoredEvent) -> Option<Log> {
         transaction_index: Some(row.tx_index as u64),
         log_index: Some(row.log_index as u64),
         removed: false,
+        },
     })
 }
 
@@ -250,6 +273,21 @@ mod tests {
             0,
             "data bytes should be empty when raw_data is not valid hex"
         );
+    }
+
+    #[test]
+    fn project_log_with_quality_marks_invalid_raw_data_lossy() {
+        let row = StoredEvent {
+            raw_data: "not_hex!!!".into(),
+            ..make_valid_stored_event()
+        };
+
+        let projected = project_log_with_quality(&row).expect("valid row shape should project");
+
+        assert!(matches!(
+            projected.quality,
+            scopenode_core::decode_quality::DecodeQuality::Lossy { .. }
+        ));
     }
 
     #[test]
