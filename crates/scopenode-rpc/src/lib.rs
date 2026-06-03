@@ -8,6 +8,7 @@
 #![deny(warnings)]
 
 pub mod projection;
+pub mod filter_plan;
 pub mod rest;
 pub mod server;
 

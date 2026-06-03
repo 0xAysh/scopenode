@@ -31,6 +31,7 @@ use tracing::info;
 
 use scopenode_storage::{Db, EventQuery, EventQueryOutcome};
 use crate::projection::{project_rest_event, EventResponse};
+use crate::filter_plan::FilterPlan;
 
 #[derive(Clone)]
 struct AppState {
@@ -80,14 +81,20 @@ async fn get_events(
     Query(q): Query<EventsQuery>,
 ) -> Result<Json<EventsResponse>, (axum::http::StatusCode, String)> {
     let limit = q.limit.unwrap_or(100).min(10_000) as u64;
-    let query = EventQuery {
-        contract: q.contract,
-        event_name: q.event,
-        topic0: q.topic0,
-        from_block: q.from_block,
-        to_block: q.to_block,
+    let query = match FilterPlan::from_rest_params(
+        q.contract,
+        q.event,
+        q.topic0,
+        q.from_block,
+        q.to_block,
         limit,
-        offset: q.offset.unwrap_or(0),
+        q.offset.unwrap_or(0),
+    ) {
+        FilterPlan::Query(query) => query,
+        FilterPlan::MissingAddress => EventQuery::default(),
+        FilterPlan::Unsupported { reason } => {
+            return Err((axum::http::StatusCode::BAD_REQUEST, reason));
+        }
     };
 
     match state
@@ -99,6 +106,10 @@ async fn get_events(
         EventQueryOutcome::Capped { .. } => Err((
             axum::http::StatusCode::BAD_REQUEST,
             "result set exceeds 10,000 rows — narrow your filter (smaller block range or add address/topic filter)".into(),
+        )),
+        EventQueryOutcome::MissingCoverage { .. } => Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "requested range is outside local coverage — run `scopenode sync` for this contract and block range".into(),
         )),
         EventQueryOutcome::NotIndexed | EventQueryOutcome::Empty => {
             Ok(Json(EventsResponse { events: vec![], count: 0 }))

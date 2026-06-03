@@ -11,7 +11,8 @@ use async_trait::async_trait;
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::types::ErrorObject;
-use scopenode_storage::{Db, EventQuery, EventQueryOutcome};
+use scopenode_storage::{Db, EventQueryOutcome};
+use crate::filter_plan::FilterPlan;
 #[rpc(server, namespace = "net")]
 pub trait NetApi {
     #[method(name = "peerCount")]
@@ -52,22 +53,12 @@ impl NetApiServer for EthApiImpl {
 #[async_trait]
 impl EthApiServer for EthApiImpl {
     async fn get_logs(&self, filter: Filter) -> RpcResult<Vec<Log>> {
-        // JSON-RPC requires an address filter — protocol-level constraint.
-        let Some(addr) = filter.address.iter().next().copied() else {
-            return Err(not_indexed_error());
-        };
-
-        let query = EventQuery {
-            contract: Some(addr.to_checksum(None)),
-            topic0: filter
-                .topics
-                .first()
-                .and_then(|t| t.iter().next())
-                .map(|t| format!("{:?}", t)),
-            from_block: filter.get_from_block(),
-            to_block: filter.get_to_block(),
-            limit: 10_000,
-            ..EventQuery::default()
+        let query = match FilterPlan::from_rpc_filter(&filter) {
+            FilterPlan::Query(query) => query,
+            FilterPlan::MissingAddress => return Err(not_indexed_error()),
+            FilterPlan::Unsupported { reason } => {
+                return Err(ErrorObject::owned(-32002, reason, None::<()>));
+            }
         };
 
         match self
@@ -77,6 +68,11 @@ impl EthApiServer for EthApiImpl {
             .map_err(|e| internal_error(&e.to_string()))?
         {
             EventQueryOutcome::NotIndexed => Err(not_indexed_error()),
+            EventQueryOutcome::MissingCoverage { .. } => Err(ErrorObject::owned(
+                -32001,
+                "Requested range is outside local coverage. Run `scopenode sync` for this contract and block range.",
+                None::<()>,
+            )),
             EventQueryOutcome::Capped { .. } => Err(ErrorObject::owned(
                 -32005,
                 "result set exceeds 10,000 rows — narrow your filter (smaller block range or add address/topic filter)",
