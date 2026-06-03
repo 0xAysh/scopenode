@@ -11,7 +11,7 @@ use scopenode_core::{
     config::{Config, ContractConfig, NodeConfig},
     era_pipeline::{run_era1_scope, run_era1_scopes, NullReporter},
     error::AbiError,
-    source::{ChecksumStatus, RangeCompleteness, SourceFileManifest, SourceRangeManifest},
+    source::Era1Source,
 };
 use scopenode_storage::{Db, DbEventSink};
 use std::io::Write;
@@ -333,31 +333,14 @@ async fn era1_pipeline_indexes_transfer_event() {
         .await
         .unwrap();
 
-    // Build manifest pointing at the synthetic file
-    let files = vec![SourceFileManifest {
-        format: "era1".into(),
-        path: era1_path.clone(),
-        filename: "mainnet-00012-deadbeef.era1".into(),
-        network: "mainnet".into(),
-        epoch: 12,
-        file_hash: "deadbeef".into(),
-        size_bytes: era1_bytes.len() as u64,
-        modified_at: None,
-        sha256: "".into(),
-        checksum_status: ChecksumStatus::Unavailable,
-        ranges: vec![SourceRangeManifest {
-            from_block: 100,
-            to_block: 100,
-            completeness: RangeCompleteness::FileIndex,
-        }],
-    }];
+    let source = Era1Source::scan(dir.path(), None, 100, 100).unwrap();
 
     let config = test_config(contract);
     let contract_cfg = &config.contracts[0];
     let mut abi_cache = AbiCache::new(Arc::new(DbAbiStore(db.clone())), None);
     let sink = DbEventSink::new(db.clone());
 
-    run_era1_scope(&files, contract_cfg, &mut abi_cache, &sink, &NullReporter)
+    run_era1_scope(&source, contract_cfg, &mut abi_cache, &sink, &NullReporter)
         .await
         .unwrap();
 
@@ -415,23 +398,7 @@ async fn era1_pipeline_indexes_multiple_contracts_in_one_scope_pass() {
     .await
     .unwrap();
 
-    let files = vec![SourceFileManifest {
-        format: "era1".into(),
-        path: era1_path,
-        filename: "mainnet-00012-deadbeef.era1".into(),
-        network: "mainnet".into(),
-        epoch: 12,
-        file_hash: "deadbeef".into(),
-        size_bytes: era1_bytes.len() as u64,
-        modified_at: None,
-        sha256: "".into(),
-        checksum_status: ChecksumStatus::Unavailable,
-        ranges: vec![SourceRangeManifest {
-            from_block: 100,
-            to_block: 100,
-            completeness: RangeCompleteness::FileIndex,
-        }],
-    }];
+    let source = Era1Source::scan(dir.path(), None, 100, 100).unwrap();
 
     let contracts = vec![
         test_config(first).contracts.remove(0),
@@ -440,7 +407,7 @@ async fn era1_pipeline_indexes_multiple_contracts_in_one_scope_pass() {
     let mut abi_cache = AbiCache::new(Arc::new(DbAbiStore(db.clone())), None);
     let sink = DbEventSink::new(db.clone());
 
-    run_era1_scopes(&files, &contracts, &mut abi_cache, &sink, &NullReporter)
+    run_era1_scopes(&source, &contracts, &mut abi_cache, &sink, &NullReporter)
         .await
         .unwrap();
 

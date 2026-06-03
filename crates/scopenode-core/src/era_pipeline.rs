@@ -6,11 +6,11 @@
 
 use crate::abi::{AbiCache, DecodedEvent, EventDecoder};
 use crate::config::ContractConfig;
-use crate::era1_reader::{iter_era1_block_facts, Era1BlockFacts};
+use crate::era1_reader::Era1BlockFacts;
 use crate::error::{CoreError, VerifyError};
 use crate::headers::BloomScanner;
 use crate::receipts::verify_era1_receipts;
-use crate::source::SourceFileManifest;
+use crate::source::{Era1Source, SourceFileManifest};
 use alloy_consensus::ReceiptEnvelope;
 use alloy_primitives::{Log as PrimitiveLog, B256};
 use async_trait::async_trait;
@@ -225,20 +225,20 @@ impl BlockPipeline {
 
 /// Run the ERA1 indexing pipeline for one contract scope.
 ///
-/// `files` must be the manifest entries from the source scan. Only files whose
-/// covered range overlaps `[contract.from_block, contract.to_block]` are processed.
+/// The source's manifest determines which files overlap
+/// `[contract.from_block, contract.to_block]`.
 ///
 /// Each file is read sequentially in one pass. Bloom hits trigger full receipt
 /// decode and Merkle verification. Verification failures are logged and skipped.
 pub async fn run_era1_scope(
-    files: &[SourceFileManifest],
+    source: &Era1Source,
     contract: &ContractConfig,
     abi_cache: &mut AbiCache,
     sink: &dyn EventSink,
     reporter: &dyn ProgressReporter,
 ) -> Result<(), CoreError> {
     run_era1_scopes(
-        files,
+        source,
         std::slice::from_ref(contract),
         abi_cache,
         sink,
@@ -253,7 +253,7 @@ pub async fn run_era1_scope(
 /// matches are evaluated for all active scopes, and receipts/body data are
 /// decompressed and verified once when at least one scope might match.
 pub async fn run_era1_scopes(
-    files: &[SourceFileManifest],
+    source: &Era1Source,
     contracts: &[ContractConfig],
     abi_cache: &mut AbiCache,
     sink: &dyn EventSink,
@@ -274,7 +274,8 @@ pub async fn run_era1_scopes(
         return Ok(());
     }
 
-    let covering: Vec<&SourceFileManifest> = files
+    let covering: Vec<&SourceFileManifest> = source
+        .files()
         .iter()
         .filter(|file| scopes.iter().any(|scope| scope.overlaps_file(file)))
         .collect();
@@ -292,7 +293,7 @@ pub async fn run_era1_scopes(
     let mut total_events = 0usize;
 
     for file in &covering {
-        let facts_iter = match iter_era1_block_facts(&file.path) {
+        let facts_iter = match source.block_facts(file) {
             Ok(it) => it,
             Err(e) => {
                 warn!(path = %file.path.display(), err = %e, "Failed to open ERA1 file — skipping");

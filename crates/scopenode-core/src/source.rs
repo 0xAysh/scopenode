@@ -52,6 +52,38 @@ pub struct SourceScan {
     pub files: Vec<SourceFileManifest>,
 }
 
+#[derive(Debug, Clone)]
+pub struct Era1Source {
+    scan: SourceScan,
+}
+
+impl Era1Source {
+    pub fn scan(
+        path: impl AsRef<Path>,
+        network_override: Option<&str>,
+        from_block: u64,
+        to_block: u64,
+    ) -> Result<Self, SourceError> {
+        Ok(Self {
+            scan: scan_era1_source(path, network_override, from_block, to_block)?,
+        })
+    }
+
+    pub fn files(&self) -> &[SourceFileManifest] {
+        &self.scan.files
+    }
+
+    pub fn block_facts(
+        &self,
+        file: &SourceFileManifest,
+    ) -> Result<
+        impl Iterator<Item = Result<crate::era1_reader::Era1BlockFacts, SourceError>>,
+        SourceError,
+    > {
+        crate::era1_reader::iter_era1_block_facts(file.path.clone())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceFileManifest {
     pub format: String,
@@ -853,6 +885,31 @@ mod tests {
     }
 
     #[test]
+    fn era1_source_streams_block_facts_from_scanned_manifest_file() {
+        let dir = tempdir().unwrap();
+        let era1 = dir.path().join("mainnet-00000-5ec1ffb8.era1");
+        fs::write(&era1, synthetic_decodable_era1(64, &[64, 65])).unwrap();
+
+        let source = Era1Source::scan(dir.path(), None, 0, u64::MAX).unwrap();
+        let file = source
+            .files()
+            .first()
+            .expect("scan should find one ERA1 file");
+
+        let facts = source
+            .block_facts(file)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(facts.len(), 2);
+        assert_eq!(facts[0].block_number, 64);
+        assert_eq!(facts[0].header.number, 64);
+        assert_eq!(facts[1].block_number, 65);
+        assert_eq!(facts[1].header.number, 65);
+    }
+
+    #[test]
     fn decodes_compressed_header_to_scope_header() {
         let header = alloy_consensus::Header {
             number: 64,
@@ -901,6 +958,33 @@ mod tests {
             bytes.extend(e2store_entry([0x04, 0x00], body.as_bytes()));
             bytes.extend(e2store_entry([0x05, 0x00], receipts.as_bytes()));
             bytes.extend(e2store_entry([0x06, 0x00], difficulty.as_bytes()));
+        }
+
+        let offsets = (0..blocks.len())
+            .map(|index| index as i64)
+            .collect::<Vec<_>>();
+        let mut index = Vec::new();
+        index.extend_from_slice(&starting_number.to_le_bytes());
+        for offset in offsets {
+            index.extend_from_slice(&offset.to_le_bytes());
+        }
+        index.extend_from_slice(&(blocks.len() as i64).to_le_bytes());
+        bytes.extend(e2store_entry([0x66, 0x32], &index));
+        bytes
+    }
+
+    fn synthetic_decodable_era1(starting_number: u64, blocks: &[u64]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend(e2store_entry([0x65, 0x32], &[]));
+        for block_number in blocks {
+            let header = alloy_consensus::Header {
+                number: *block_number,
+                ..Default::default()
+            };
+            bytes.extend(e2store_entry([0x03, 0x00], &snappy_rlp(&header)));
+            bytes.extend(e2store_entry([0x04, 0x00], &snappy_empty_body()));
+            bytes.extend(e2store_entry([0x05, 0x00], &snappy_empty_receipts()));
+            bytes.extend(e2store_entry([0x06, 0x00], &0u64.to_le_bytes()));
         }
 
         let offsets = (0..blocks.len())
@@ -1017,18 +1101,49 @@ mod tests {
         assert!(hashes.is_empty());
     }
 
-    fn snappy_rlp(header: &alloy_consensus::Header) -> Vec<u8> {
-        use alloy_rlp::Encodable;
+    fn snappy_empty_body() -> Vec<u8> {
+        use alloy_rlp::Header as RlpHeader;
+
+        let empty = RlpHeader {
+            list: true,
+            payload_length: 0,
+        };
+        let mut txs = Vec::new();
+        empty.encode(&mut txs);
+        let mut uncles = Vec::new();
+        empty.encode(&mut uncles);
+        let body_header = RlpHeader {
+            list: true,
+            payload_length: txs.len() + uncles.len(),
+        };
+        let mut body = Vec::new();
+        body_header.encode(&mut body);
+        body.extend_from_slice(&txs);
+        body.extend_from_slice(&uncles);
+        snappy_bytes(&body)
+    }
+
+    fn snappy_empty_receipts() -> Vec<u8> {
+        snappy_bytes(&[0xC0])
+    }
+
+    fn snappy_bytes(bytes: &[u8]) -> Vec<u8> {
         use std::io::Write;
 
-        let mut rlp = Vec::new();
-        header.encode(&mut rlp);
         let mut compressed = Vec::new();
         {
             let mut encoder = snap::write::FrameEncoder::new(&mut compressed);
-            encoder.write_all(&rlp).unwrap();
+            encoder.write_all(bytes).unwrap();
             encoder.flush().unwrap();
         }
         compressed
+    }
+
+    fn snappy_rlp(header: &alloy_consensus::Header) -> Vec<u8> {
+        use alloy_rlp::Encodable;
+
+        let mut rlp = Vec::new();
+        header.encode(&mut rlp);
+        snappy_bytes(&rlp)
     }
 }

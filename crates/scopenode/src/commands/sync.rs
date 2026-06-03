@@ -8,7 +8,7 @@ use scopenode_core::{
     config::Config,
     era_pipeline::{run_era1_scopes, ProgressReporter},
     error::AbiError,
-    source::scan_era1_source,
+    source::Era1Source,
 };
 use scopenode_storage::Db;
 use std::path::PathBuf;
@@ -65,7 +65,7 @@ pub async fn run(config: Config, db: Db, dry_run: bool, quiet: bool) -> Result<(
         return Ok(());
     }
 
-    let scan = scan_era1_source(
+    let source = Era1Source::scan(
         &plan.era_dir,
         None,
         *plan.block_range.start(),
@@ -97,7 +97,7 @@ pub async fn run(config: Config, db: Db, dry_run: bool, quiet: bool) -> Result<(
     let pipeline_contracts = plan.pipeline_contracts();
 
     run_era1_scopes(
-        &scan.files,
+        &source,
         &pipeline_contracts,
         &mut abi_cache,
         &sink,
