@@ -6,13 +6,13 @@
 //! - `eth_chainId` — always `0x1` (Ethereum mainnet)
 //! - `net_peerCount` — always `"0x0"` (ERA1-only; no live peers)
 
+use crate::filter_plan::FilterPlan;
 use alloy::rpc::types::{Filter, Log};
 use async_trait::async_trait;
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::types::ErrorObject;
 use scopenode_storage::{Db, EventQueryOutcome};
-use crate::filter_plan::FilterPlan;
 #[rpc(server, namespace = "net")]
 pub trait NetApi {
     #[method(name = "peerCount")]

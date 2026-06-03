@@ -5,8 +5,10 @@
 //! `decode_era1_receipts`, and `decode_era1_tx_hashes` behind the
 //! [`iter_era1_block_facts`] function.
 
-use crate::source::{decode_era1_header, decode_era1_receipts, decode_era1_tx_hashes,
-                    iter_era1_block_tuples, SourceError};
+use crate::source::{
+    decode_era1_header, decode_era1_receipts, decode_era1_tx_hashes, iter_era1_block_tuples,
+    SourceError,
+};
 use crate::types::ScopeHeader;
 use alloy_consensus::ReceiptEnvelope;
 use alloy_primitives::{Log as PrimitiveLog, B256};
@@ -47,8 +49,7 @@ pub fn iter_era1_block_facts(
 
         let header = decode_era1_header(&tuple.compressed_header)?;
         let receipts = decode_era1_receipts(&tuple.compressed_receipts)?;
-        let tx_hashes =
-            decode_era1_tx_hashes(&tuple.compressed_body).unwrap_or_default();
+        let tx_hashes = decode_era1_tx_hashes(&tuple.compressed_body).unwrap_or_default();
 
         Ok(Era1BlockFacts {
             block_number: tuple.block_number,
@@ -103,12 +104,18 @@ mod tests {
     fn encode_empty_body() -> Vec<u8> {
         use alloy_rlp::Header as RlpHeader;
 
-        let empty = RlpHeader { list: true, payload_length: 0 };
+        let empty = RlpHeader {
+            list: true,
+            payload_length: 0,
+        };
         let mut empty_list = Vec::new();
         empty.encode(&mut empty_list);
 
         let payload_len = empty_list.len() * 2;
-        let outer = RlpHeader { list: true, payload_length: payload_len };
+        let outer = RlpHeader {
+            list: true,
+            payload_length: payload_len,
+        };
         let mut body = Vec::new();
         outer.encode(&mut body);
         body.extend_from_slice(&empty_list);
@@ -144,12 +151,12 @@ mod tests {
         index_data.extend_from_slice(&1i64.to_le_bytes()); // count
 
         let mut file = Vec::new();
-        file.extend(e2store_entry([0x65, 0x32], &[]));          // version
-        file.extend(e2store_entry([0x03, 0x00], &compressed_header));  // header
-        file.extend(e2store_entry([0x04, 0x00], &compressed_body));    // body
+        file.extend(e2store_entry([0x65, 0x32], &[])); // version
+        file.extend(e2store_entry([0x03, 0x00], &compressed_header)); // header
+        file.extend(e2store_entry([0x04, 0x00], &compressed_body)); // body
         file.extend(e2store_entry([0x05, 0x00], &compressed_receipts)); // receipts
-        file.extend(e2store_entry([0x06, 0x00], &td));                  // total difficulty
-        file.extend(e2store_entry([0x66, 0x32], &index_data));          // block index
+        file.extend(e2store_entry([0x06, 0x00], &td)); // total difficulty
+        file.extend(e2store_entry([0x66, 0x32], &index_data)); // block index
         file
     }
 
@@ -237,10 +244,7 @@ mod tests {
 
         let mut iter = iter_era1_block_facts(&path).expect("iter construction failed");
         let result = iter.next().expect("iterator should yield one item");
-        assert!(
-            result.is_err(),
-            "expected Err for malformed header, got Ok"
-        );
+        assert!(result.is_err(), "expected Err for malformed header, got Ok");
     }
 
     /// A valid header but garbage `compressed_receipts` must cause the iterator
@@ -249,11 +253,7 @@ mod tests {
     fn iter_block_facts_malformed_receipts_yields_err() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("mainnet-00000-deadbeef.era1");
-        std::fs::write(
-            &path,
-            build_era1_with_bad_receipts(10, &[0xFF, 0xFE, 0xFD]),
-        )
-        .unwrap();
+        std::fs::write(&path, build_era1_with_bad_receipts(10, &[0xFF, 0xFE, 0xFD])).unwrap();
 
         let mut iter = iter_era1_block_facts(&path).expect("iter construction failed");
         let result = iter.next().expect("iterator should yield one item");
@@ -287,7 +287,10 @@ mod tests {
         file.extend(e2store_entry([0x65, 0x32], &[])); // version
 
         for &n in block_numbers {
-            let header = Header { number: n, ..Default::default() };
+            let header = Header {
+                number: n,
+                ..Default::default()
+            };
             file.extend(e2store_entry([0x03, 0x00], &encode_header(&header)));
             file.extend(e2store_entry([0x04, 0x00], &encode_empty_body()));
             file.extend(e2store_entry([0x05, 0x00], &encode_empty_receipts()));
@@ -335,8 +338,14 @@ mod tests {
                 f.header.number, block_numbers[i],
                 "header.number mismatch at index {i}"
             );
-            assert!(f.tx_hashes.is_empty(), "expected empty tx_hashes at index {i}");
-            assert!(f.receipts.is_empty(), "expected empty receipts at index {i}");
+            assert!(
+                f.tx_hashes.is_empty(),
+                "expected empty tx_hashes at index {i}"
+            );
+            assert!(
+                f.receipts.is_empty(),
+                "expected empty receipts at index {i}"
+            );
         }
     }
 
@@ -350,7 +359,10 @@ mod tests {
     #[test]
     fn iter_block_facts_bad_tx_body_yields_ok_with_empty_tx_hashes() {
         let block_number = 77_u64;
-        let header = Header { number: block_number, ..Default::default() };
+        let header = Header {
+            number: block_number,
+            ..Default::default()
+        };
         let compressed_header = encode_header(&header);
         let compressed_receipts = encode_empty_receipts();
         let garbage_body: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF];

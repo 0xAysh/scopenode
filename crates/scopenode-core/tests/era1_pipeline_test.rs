@@ -25,10 +25,21 @@ struct DbAbiStore(Db);
 #[async_trait]
 impl AbiStore for DbAbiStore {
     async fn load(&self, address: &str) -> Result<Option<String>, AbiError> {
-        self.0.get_contract_abi(address).await.map_err(|e| AbiError::Cache(e.to_string()))
+        self.0
+            .get_contract_abi(address)
+            .await
+            .map_err(|e| AbiError::Cache(e.to_string()))
     }
-    async fn save(&self, address: &str, name: Option<&str>, abi_json: &str) -> Result<(), AbiError> {
-        self.0.upsert_contract(address, name, abi_json).await.map_err(|e| AbiError::Cache(e.to_string()))
+    async fn save(
+        &self,
+        address: &str,
+        name: Option<&str>,
+        abi_json: &str,
+    ) -> Result<(), AbiError> {
+        self.0
+            .upsert_contract(address, name, abi_json)
+            .await
+            .map_err(|e| AbiError::Cache(e.to_string()))
     }
 }
 

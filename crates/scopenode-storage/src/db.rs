@@ -303,17 +303,31 @@ impl Db {
         let has_event_name = filter.event_name.is_some();
         let has_topic0 = filter.topic0.is_some();
 
-        let query_limit = if filter.limit > 0 { filter.limit + 1 } else { i64::MAX as u64 };
+        let query_limit = if filter.limit > 0 {
+            filter.limit + 1
+        } else {
+            i64::MAX as u64
+        };
         let sql = format!(
             "{} LIMIT ? OFFSET ?",
             filter_sql_base(has_contract, has_event_name, has_topic0)
         );
 
         let mut q = sqlx::query_as::<_, StoredEvent>(&sql);
-        if let Some(c) = &filter.contract { q = q.bind(c.as_str()); }
-        if let Some(e) = &filter.event_name { q = q.bind(e.as_str()); }
-        if let Some(t) = &filter.topic0 { q = q.bind(t.as_str()); }
-        q = q.bind(from).bind(to).bind(query_limit as i64).bind(filter.offset as i64);
+        if let Some(c) = &filter.contract {
+            q = q.bind(c.as_str());
+        }
+        if let Some(e) = &filter.event_name {
+            q = q.bind(e.as_str());
+        }
+        if let Some(t) = &filter.topic0 {
+            q = q.bind(t.as_str());
+        }
+        q = q
+            .bind(from)
+            .bind(to)
+            .bind(query_limit as i64)
+            .bind(filter.offset as i64);
 
         let mut rows = q
             .fetch_all(&self.pool)
@@ -322,7 +336,10 @@ impl Db {
 
         if filter.limit > 0 && rows.len() as u64 > filter.limit {
             rows.truncate(filter.limit as usize);
-            return Ok(QueryResult::Capped { results: rows, cap: filter.limit });
+            return Ok(QueryResult::Capped {
+                results: rows,
+                cap: filter.limit,
+            });
         }
 
         Ok(QueryResult::Results(rows))
@@ -364,19 +381,23 @@ impl Db {
 /// Results are cached in a `OnceLock` array (one slot per 3-bit flag combination) so each unique
 /// SQL string is built once and lives for `'static`.
 fn filter_sql_base(has_contract: bool, has_event_name: bool, has_topic0: bool) -> &'static str {
-    static CACHE: [std::sync::OnceLock<String>; 8] =
-        [const { std::sync::OnceLock::new() }; 8];
+    static CACHE: [std::sync::OnceLock<String>; 8] = [const { std::sync::OnceLock::new() }; 8];
 
-    let idx = (has_contract as usize)
-        | ((has_event_name as usize) << 1)
-        | ((has_topic0 as usize) << 2);
+    let idx =
+        (has_contract as usize) | ((has_event_name as usize) << 1) | ((has_topic0 as usize) << 2);
 
     CACHE[idx]
         .get_or_init(|| {
             let mut conditions: Vec<&str> = Vec::new();
-            if has_contract   { conditions.push("contract = ?"); }
-            if has_event_name { conditions.push("event_name = ?"); }
-            if has_topic0     { conditions.push("topic0 = ?"); }
+            if has_contract {
+                conditions.push("contract = ?");
+            }
+            if has_event_name {
+                conditions.push("event_name = ?");
+            }
+            if has_topic0 {
+                conditions.push("topic0 = ?");
+            }
             conditions.extend(["block_number >= ?", "block_number <= ?"]);
             format!(
                 "SELECT contract, event_name, topic0, block_number, block_hash, \
@@ -504,7 +525,9 @@ mod tests {
             })
             .await
             .unwrap();
-        let QueryResult::Results(rows) = result else { panic!("expected Results") };
+        let QueryResult::Results(rows) = result else {
+            panic!("expected Results")
+        };
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].topic0, transfer_topic0);
     }
@@ -515,7 +538,15 @@ mod tests {
         let contract = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
         db.upsert_contract(contract, None, "[]").await.unwrap();
         let events: Vec<_> = (0..5)
-            .map(|i| make_event(contract, 100 + i, &format!("0x{:04x}", i), &format!("0x{:04x}", i), 0))
+            .map(|i| {
+                make_event(
+                    contract,
+                    100 + i,
+                    &format!("0x{:04x}", i),
+                    &format!("0x{:04x}", i),
+                    0,
+                )
+            })
             .collect();
         db.insert_events(&events).await.unwrap();
 
@@ -541,7 +572,15 @@ mod tests {
         let contract = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
         db.upsert_contract(contract, None, "[]").await.unwrap();
         let events: Vec<_> = (0..3)
-            .map(|i| make_event(contract, 100 + i, &format!("0x{:04x}", i), &format!("0x{:04x}", i), 0))
+            .map(|i| {
+                make_event(
+                    contract,
+                    100 + i,
+                    &format!("0x{:04x}", i),
+                    &format!("0x{:04x}", i),
+                    0,
+                )
+            })
             .collect();
         db.insert_events(&events).await.unwrap();
 

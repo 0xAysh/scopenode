@@ -82,7 +82,10 @@ pub fn load_abi_override(
 }
 
 /// Extract and parse all `event` entries from a raw ABI JSON array.
-fn parse_events_from_abi(_address: Address, abi_array: &[Value]) -> Result<Vec<EventAbi>, AbiError> {
+fn parse_events_from_abi(
+    _address: Address,
+    abi_array: &[Value],
+) -> Result<Vec<EventAbi>, AbiError> {
     let events: Vec<EventAbi> = abi_array
         .iter()
         .filter(|entry| entry["type"].as_str() == Some("event"))
@@ -110,7 +113,8 @@ fn parse_events_from_abi(_address: Address, abi_array: &[Value]) -> Result<Vec<E
 #[async_trait]
 pub trait AbiStore: Send + Sync {
     async fn load(&self, address: &str) -> Result<Option<String>, AbiError>;
-    async fn save(&self, address: &str, name: Option<&str>, abi_json: &str) -> Result<(), AbiError>;
+    async fn save(&self, address: &str, name: Option<&str>, abi_json: &str)
+        -> Result<(), AbiError>;
 }
 
 /// Seam between the network-free core library and the binary's HTTP client.
@@ -151,7 +155,10 @@ impl AbiCache {
             match load_abi_override(override_path, contract.address) {
                 Ok(all_events) => {
                     let json = serialize_events_to_json(&all_events);
-                    let _ = self.store.save(&addr_str, contract.name.as_deref(), &json).await;
+                    let _ = self
+                        .store
+                        .save(&addr_str, contract.name.as_deref(), &json)
+                        .await;
                     return filter_events(all_events, &contract.events, contract.address);
                 }
                 Err(_) => {
@@ -171,7 +178,10 @@ impl AbiCache {
                     .map_err(|e| AbiError::ParseFailed(contract.address, e.to_string()))?;
                 let all_events = parse_events_from_abi(contract.address, &abi_array)?;
                 let normalized = serialize_events_to_json(&all_events);
-                let _ = self.store.save(&addr_str, contract.name.as_deref(), &normalized).await;
+                let _ = self
+                    .store
+                    .save(&addr_str, contract.name.as_deref(), &normalized)
+                    .await;
                 return filter_events(all_events, &contract.events, contract.address);
             }
         }
@@ -217,10 +227,12 @@ fn serialize_events_to_json(events: &[EventAbi]) -> String {
     serde_json::to_string(
         &events
             .iter()
-            .map(|e| serde_json::json!({
-                "name": e.name,
-                "inputs": e.inputs.iter().map(serialize_event_input).collect::<Vec<_>>(),
-            }))
+            .map(|e| {
+                serde_json::json!({
+                    "name": e.name,
+                    "inputs": e.inputs.iter().map(serialize_event_input).collect::<Vec<_>>(),
+                })
+            })
             .collect::<Vec<_>>(),
     )
     .unwrap_or_default()
@@ -529,9 +541,24 @@ mod era1_tests {
         let events = vec![EventAbi {
             name: "Transfer".into(),
             inputs: vec![
-                EventInput { name: "from".into(), ty: "address".into(), indexed: true, components: vec![] },
-                EventInput { name: "to".into(), ty: "address".into(), indexed: true, components: vec![] },
-                EventInput { name: "value".into(), ty: "uint256".into(), indexed: false, components: vec![] },
+                EventInput {
+                    name: "from".into(),
+                    ty: "address".into(),
+                    indexed: true,
+                    components: vec![],
+                },
+                EventInput {
+                    name: "to".into(),
+                    ty: "address".into(),
+                    indexed: true,
+                    components: vec![],
+                },
+                EventInput {
+                    name: "value".into(),
+                    ty: "uint256".into(),
+                    indexed: false,
+                    components: vec![],
+                },
             ],
         }];
         let decoder = EventDecoder::new(&events, contract).unwrap();
@@ -545,10 +572,7 @@ mod era1_tests {
         };
         let log = PrimitiveLog {
             address: contract,
-            data: LogData::new_unchecked(
-                vec![topic0, from_topic, to_topic],
-                value_bytes,
-            ),
+            data: LogData::new_unchecked(vec![topic0, from_topic, to_topic], value_bytes),
         };
 
         let result = decoder.decode_log(
@@ -589,7 +613,9 @@ mod era1_tests {
             address: other,
             data: LogData::new_unchecked(vec![topic0], Bytes::new()),
         };
-        assert!(decoder.decode_log(&log, 0, B256::ZERO, B256::ZERO, 0, 0, 0, "era1").is_none());
+        assert!(decoder
+            .decode_log(&log, 0, B256::ZERO, B256::ZERO, 0, 0, 0, "era1")
+            .is_none());
     }
 
     #[test]
@@ -598,7 +624,10 @@ mod era1_tests {
         let topic0 = keccak256(b"Transfer(address,address,uint256)");
         let unknown = keccak256(b"Unknown(address)");
 
-        let events = vec![EventAbi { name: "Transfer".into(), inputs: vec![] }];
+        let events = vec![EventAbi {
+            name: "Transfer".into(),
+            inputs: vec![],
+        }];
         let decoder = EventDecoder::new(&events, contract).unwrap();
 
         let log = PrimitiveLog {
@@ -606,7 +635,9 @@ mod era1_tests {
             data: LogData::new_unchecked(vec![unknown], Bytes::new()),
         };
         let _ = topic0; // used above to construct decoder
-        assert!(decoder.decode_log(&log, 0, B256::ZERO, B256::ZERO, 0, 0, 0, "era1").is_none());
+        assert!(decoder
+            .decode_log(&log, 0, B256::ZERO, B256::ZERO, 0, 0, 0, "era1")
+            .is_none());
     }
 
     #[test]
@@ -936,13 +967,17 @@ mod abi_cache_tests {
 
     impl StubAbiStore {
         fn empty() -> Arc<Self> {
-            Arc::new(Self { data: Mutex::new(HashMap::new()) })
+            Arc::new(Self {
+                data: Mutex::new(HashMap::new()),
+            })
         }
 
         fn with_entry(address: &str, json: &str) -> Arc<Self> {
             let mut m = HashMap::new();
             m.insert(address.to_string(), json.to_string());
-            Arc::new(Self { data: Mutex::new(m) })
+            Arc::new(Self {
+                data: Mutex::new(m),
+            })
         }
 
         fn get(&self, address: &str) -> Option<String> {
@@ -956,8 +991,16 @@ mod abi_cache_tests {
             Ok(self.data.lock().unwrap().get(address).cloned())
         }
 
-        async fn save(&self, address: &str, _name: Option<&str>, abi_json: &str) -> Result<(), AbiError> {
-            self.data.lock().unwrap().insert(address.to_string(), abi_json.to_string());
+        async fn save(
+            &self,
+            address: &str,
+            _name: Option<&str>,
+            abi_json: &str,
+        ) -> Result<(), AbiError> {
+            self.data
+                .lock()
+                .unwrap()
+                .insert(address.to_string(), abi_json.to_string());
             Ok(())
         }
     }
@@ -1050,7 +1093,10 @@ mod abi_cache_tests {
         let store = StubAbiStore::with_entry(&ADDR.to_checksum(None), &cached_transfer_json());
         let cache = AbiCache::new(store, Some(Arc::new(PanicFetcher) as Arc<dyn AbiFetcher>));
 
-        let events = cache.get_or_fetch(&contract_cfg(vec!["Transfer"])).await.unwrap();
+        let events = cache
+            .get_or_fetch(&contract_cfg(vec!["Transfer"]))
+            .await
+            .unwrap();
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].name, "Transfer");
@@ -1073,7 +1119,10 @@ mod abi_cache_tests {
         let events = cache.get_or_fetch(&cfg).await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].name, "Transfer");
-        assert!(store.get(&ADDR.to_checksum(None)).is_some(), "ABI must be cached after file load");
+        assert!(
+            store.get(&ADDR.to_checksum(None)).is_some(),
+            "ABI must be cached after file load"
+        );
     }
 
     #[tokio::test]
@@ -1094,8 +1143,15 @@ mod abi_cache_tests {
         let events = cache.get_or_fetch(&cfg).await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].name, "Transfer");
-        assert_eq!(fetcher.last_address(), Some(ADDR), "fetcher must be called with contract address");
-        assert!(store.get(&ADDR.to_checksum(None)).is_some(), "ABI must be cached after fetcher call");
+        assert_eq!(
+            fetcher.last_address(),
+            Some(ADDR),
+            "fetcher must be called with contract address"
+        );
+        assert!(
+            store.get(&ADDR.to_checksum(None)).is_some(),
+            "ABI must be cached after fetcher call"
+        );
     }
 
     #[tokio::test]
@@ -1104,7 +1160,10 @@ mod abi_cache_tests {
         let fetcher = StubAbiFetcher::err_result("network down");
         let cache = AbiCache::new(store, Some(Arc::clone(&fetcher) as Arc<dyn AbiFetcher>));
 
-        let err = cache.get_or_fetch(&contract_cfg(vec!["Transfer"])).await.unwrap_err();
+        let err = cache
+            .get_or_fetch(&contract_cfg(vec!["Transfer"]))
+            .await
+            .unwrap_err();
 
         assert!(matches!(err, AbiError::AbiRequired(_)));
     }
@@ -1157,6 +1216,10 @@ mod abi_cache_tests {
 
         let _ = cache.get_or_fetch(&cfg).await;
 
-        assert_eq!(fetcher.last_address(), Some(IMPL), "fetcher must receive impl_address");
+        assert_eq!(
+            fetcher.last_address(),
+            Some(IMPL),
+            "fetcher must receive impl_address"
+        );
     }
 }

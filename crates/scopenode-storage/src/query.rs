@@ -73,12 +73,17 @@ impl Db {
                 return Ok(EventQueryOutcome::NotIndexed);
             }
             if let (Some(from_block), Some(to_block)) = (q.from_block, q.to_block) {
-                if !self.is_range_covered(contract, from_block, to_block).await? {
-                    return Ok(EventQueryOutcome::MissingCoverage { missing: MissingCoverage {
-                        contract: contract.clone(),
-                        from_block,
-                        to_block,
-                    }});
+                if !self
+                    .is_range_covered(contract, from_block, to_block)
+                    .await?
+                {
+                    return Ok(EventQueryOutcome::MissingCoverage {
+                        missing: MissingCoverage {
+                            contract: contract.clone(),
+                            from_block,
+                            to_block,
+                        },
+                    });
                 }
             }
         }
@@ -282,10 +287,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(matches!(
-            outcome,
-            EventQueryOutcome::Capped { cap: 3, .. }
-        ));
+        assert!(matches!(outcome, EventQueryOutcome::Capped { cap: 3, .. }));
     }
 
     // ── 10,000 / 10,001 cap boundary ─────────────────────────────────────────
@@ -508,6 +510,9 @@ mod tests {
         assert_eq!(s.contracts.len(), 1);
         assert_eq!(s.contracts[0].address, CONTRACT);
         assert_eq!(s.contracts[0].total_events, 1);
-        assert_eq!(s.contracts[0].event_breakdown, vec![("Transfer".to_string(), 1)]);
+        assert_eq!(
+            s.contracts[0].event_breakdown,
+            vec![("Transfer".to_string(), 1)]
+        );
     }
 }

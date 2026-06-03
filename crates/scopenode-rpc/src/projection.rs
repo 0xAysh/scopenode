@@ -12,9 +12,9 @@
 
 use alloy::primitives::{Address, Bytes, LogData, B256};
 use alloy::rpc::types::Log;
-use serde::Serialize;
 use scopenode_core::decode_quality::DecodeQuality;
 use scopenode_storage::models::StoredEvent;
+use serde::Serialize;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -80,19 +80,22 @@ pub fn project_log_with_quality(row: &StoredEvent) -> Option<ProjectedLog> {
 
     let log_data = LogData::new(topics, data)?;
 
-    let inner_log = alloy::primitives::Log { address, data: log_data };
+    let inner_log = alloy::primitives::Log {
+        address,
+        data: log_data,
+    };
 
     Some(ProjectedLog {
         quality,
         log: Log {
-        inner: inner_log,
-        block_hash: Some(block_hash),
-        block_number: Some(row.block_number as u64),
-        block_timestamp: None,
-        transaction_hash: Some(tx_hash),
-        transaction_index: Some(row.tx_index as u64),
-        log_index: Some(row.log_index as u64),
-        removed: false,
+            inner: inner_log,
+            block_hash: Some(block_hash),
+            block_number: Some(row.block_number as u64),
+            block_timestamp: None,
+            transaction_hash: Some(tx_hash),
+            transaction_index: Some(row.tx_index as u64),
+            log_index: Some(row.log_index as u64),
+            removed: false,
         },
     })
 }
@@ -135,9 +138,8 @@ mod tests {
             tx_hash: format!("0x{:064x}", 1u64),
             tx_index: 3,
             log_index: 7,
-            raw_topics:
-                "[\"0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef\"]"
-                    .into(),
+            raw_topics: "[\"0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef\"]"
+                .into(),
             raw_data: "deadbeef".into(),
             decoded: "{\"from\":\"0xabc\",\"to\":\"0xdef\"}".into(),
             source: "era1".into(),
@@ -216,8 +218,7 @@ mod tests {
         assert_eq!(resp.source, row.source);
         assert_eq!(resp.timestamp, row.timestamp);
         // decoded JSON must round-trip to the same value
-        let expected: serde_json::Value =
-            serde_json::from_str(&row.decoded).unwrap();
+        let expected: serde_json::Value = serde_json::from_str(&row.decoded).unwrap();
         assert_eq!(resp.decoded, expected);
     }
 
@@ -313,7 +314,10 @@ mod tests {
             ..make_valid_stored_event()
         };
         let resp = project_rest_event(&row);
-        let obj = resp.decoded.as_object().expect("decoded should be a JSON object");
+        let obj = resp
+            .decoded
+            .as_object()
+            .expect("decoded should be a JSON object");
         let amount = obj.get("amount").expect("key \"amount\" must be present");
         assert_eq!(
             amount.as_str(),

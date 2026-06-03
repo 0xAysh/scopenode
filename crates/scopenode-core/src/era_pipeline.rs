@@ -199,10 +199,11 @@ impl BlockPipeline {
             return vec![];
         }
 
-        if let Err(e) = self
-            .verifier
-            .verify(&facts.receipts, facts.header.receipts_root, facts.header.number)
-        {
+        if let Err(e) = self.verifier.verify(
+            &facts.receipts,
+            facts.header.receipts_root,
+            facts.header.number,
+        ) {
             warn!(block = facts.header.number, err = %e, "Receipt Merkle verify failed — skipping");
             return vec![];
         }
@@ -406,8 +407,7 @@ mod tests {
     fn bloom_no_match_returns_empty() {
         let addr = Address::repeat_byte(0xAB);
         let topic0 = keccak256(b"Transfer(address,address,uint256)");
-        let pipeline =
-            BlockPipeline::new(vec![make_scope_with_target(100, 200, addr, topic0)]);
+        let pipeline = BlockPipeline::new(vec![make_scope_with_target(100, 200, addr, topic0)]);
 
         // Facts with empty bloom — scanner's address/topic0 are not present.
         let facts = empty_facts(150);
@@ -418,8 +418,7 @@ mod tests {
     fn bloom_match_with_empty_receipts_returns_empty() {
         let addr = Address::repeat_byte(0xAB);
         let topic0 = keccak256(b"Transfer(address,address,uint256)");
-        let pipeline =
-            BlockPipeline::new(vec![make_scope_with_target(100, 200, addr, topic0)]);
+        let pipeline = BlockPipeline::new(vec![make_scope_with_target(100, 200, addr, topic0)]);
 
         let mut bloom = Bloom::default();
         bloom.accrue(BloomInput::Raw(addr.as_slice()));
@@ -445,8 +444,7 @@ mod tests {
 
         let addr = Address::repeat_byte(0xAB);
         let topic0 = keccak256(b"Transfer(address,address,uint256)");
-        let pipeline =
-            BlockPipeline::new(vec![make_scope_with_target(100, 200, addr, topic0)]);
+        let pipeline = BlockPipeline::new(vec![make_scope_with_target(100, 200, addr, topic0)]);
 
         let mut bloom = Bloom::default();
         bloom.accrue(BloomInput::Raw(addr.as_slice()));

@@ -20,7 +20,12 @@ impl SourcifyClient {
         Self { client, base_url }
     }
 
-    async fn try_match(&self, match_type: &str, addr_str: &str, address: Address) -> Result<Option<String>, AbiError> {
+    async fn try_match(
+        &self,
+        match_type: &str,
+        addr_str: &str,
+        address: Address,
+    ) -> Result<Option<String>, AbiError> {
         let url = format!(
             "{}/contracts/{}/1/{}/metadata.json",
             self.base_url, match_type, addr_str
@@ -195,9 +200,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path(full_path(&addr_str)))
-            .respond_with(
-                ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(30)),
-            )
+            .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(30)))
             .mount(&server)
             .await;
 

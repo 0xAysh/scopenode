@@ -29,9 +29,9 @@ use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
 use tracing::info;
 
-use scopenode_storage::{Db, EventQuery, EventQueryOutcome};
-use crate::projection::{project_rest_event, EventResponse};
 use crate::filter_plan::FilterPlan;
+use crate::projection::{project_rest_event, EventResponse};
+use scopenode_storage::{Db, EventQuery, EventQueryOutcome};
 
 #[derive(Clone)]
 struct AppState {

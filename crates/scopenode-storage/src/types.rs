@@ -31,4 +31,3 @@ pub(crate) enum QueryResult {
     /// rows and `cap` is the limit that was applied.
     Capped { results: Vec<StoredEvent>, cap: u64 },
 }
-
