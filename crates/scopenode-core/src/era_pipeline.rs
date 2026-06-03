@@ -42,6 +42,48 @@ pub trait EventSink: Send + Sync {
     }
 }
 
+/// In-memory event sink for programmatic callers and tests.
+///
+/// This is the second concrete adapter for the `EventSink` seam; production
+/// storage still uses `DbEventSink` in `scopenode-storage`.
+#[derive(Default)]
+pub struct InMemoryEventSink {
+    events: tokio::sync::Mutex<Vec<DecodedEvent>>,
+    covered_ranges: tokio::sync::Mutex<Vec<(String, u64, u64)>>,
+}
+
+impl InMemoryEventSink {
+    pub async fn events(&self) -> Vec<DecodedEvent> {
+        self.events.lock().await.clone()
+    }
+
+    pub async fn covered_ranges(&self) -> Vec<(String, u64, u64)> {
+        self.covered_ranges.lock().await.clone()
+    }
+}
+
+#[async_trait]
+impl EventSink for InMemoryEventSink {
+    async fn store(&self, events: Vec<DecodedEvent>) -> Result<usize, CoreError> {
+        let count = events.len();
+        self.events.lock().await.extend(events);
+        Ok(count)
+    }
+
+    async fn record_coverage(
+        &self,
+        contract: &str,
+        from_block: u64,
+        to_block: u64,
+    ) -> Result<(), CoreError> {
+        self.covered_ranges
+            .lock()
+            .await
+            .push((contract.to_string(), from_block, to_block));
+        Ok(())
+    }
+}
+
 /// No-op reporter for tests and programmatic callers that don't need progress output.
 pub struct NullReporter;
 
@@ -525,5 +567,38 @@ mod tests {
             inputs: vec![],
         }];
         assert!(EventDecoder::new(&events, addr).is_ok());
+    }
+
+    #[tokio::test]
+    async fn in_memory_event_sink_captures_events_and_coverage() {
+        let sink = InMemoryEventSink::default();
+        let events = vec![DecodedEvent {
+            contract: address!("0000000000000000000000000000000000000001"),
+            event_name: "Transfer".to_string(),
+            topic0: B256::ZERO,
+            block_number: 100,
+            block_hash: B256::ZERO,
+            tx_hash: B256::ZERO,
+            tx_index: 0,
+            log_index: 0,
+            raw_topics: vec![B256::ZERO],
+            raw_data: alloy_primitives::Bytes::new(),
+            decoded: serde_json::json!({}),
+            source: "era1".to_string(),
+            timestamp: 0,
+        }];
+
+        let stored = sink.store(events.clone()).await.unwrap();
+        sink.record_coverage("0xabc", 100, 200).await.unwrap();
+
+        assert_eq!(stored, 1);
+        let captured = sink.events().await;
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].event_name, "Transfer");
+        assert_eq!(captured[0].block_number, 100);
+        assert_eq!(
+            sink.covered_ranges().await,
+            vec![("0xabc".to_string(), 100, 200)]
+        );
     }
 }
