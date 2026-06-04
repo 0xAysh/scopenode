@@ -4,7 +4,7 @@ use crate::models::StoredEvent;
 use crate::Db;
 use async_trait::async_trait;
 use scopenode_core::abi::DecodedEvent;
-use scopenode_core::era_pipeline::EventSink;
+use scopenode_core::era_pipeline::{CoverageSink, EventSink};
 use scopenode_core::error::CoreError;
 
 /// Writes decoded events to SQLite by converting them to `StoredEvent` rows.
@@ -32,7 +32,10 @@ impl EventSink for DbEventSink {
             .map_err(|e| CoreError::Storage(e.to_string()))?;
         Ok(count)
     }
+}
 
+#[async_trait]
+impl CoverageSink for DbEventSink {
     async fn record_coverage(
         &self,
         contract: &str,

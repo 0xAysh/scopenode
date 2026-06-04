@@ -31,16 +31,22 @@ pub trait ProgressReporter {
 #[async_trait]
 pub trait EventSink: Send + Sync {
     async fn store(&self, events: Vec<DecodedEvent>) -> Result<usize, CoreError>;
+}
 
+/// Sink that receives Coverage facts from the pipeline.
+#[async_trait]
+pub trait CoverageSink: Send + Sync {
     async fn record_coverage(
         &self,
-        _contract: &str,
-        _from_block: u64,
-        _to_block: u64,
-    ) -> Result<(), CoreError> {
-        Ok(())
-    }
+        contract: &str,
+        from_block: u64,
+        to_block: u64,
+    ) -> Result<(), CoreError>;
 }
+
+pub trait PipelineSink: EventSink + CoverageSink {}
+
+impl<T> PipelineSink for T where T: EventSink + CoverageSink {}
 
 /// In-memory event sink for programmatic callers and tests.
 ///
@@ -69,7 +75,10 @@ impl EventSink for InMemoryEventSink {
         self.events.lock().await.extend(events);
         Ok(count)
     }
+}
 
+#[async_trait]
+impl CoverageSink for InMemoryEventSink {
     async fn record_coverage(
         &self,
         contract: &str,
@@ -271,7 +280,7 @@ pub async fn run_era1_scope(
     source: &Era1Source,
     contract: &ContractConfig,
     abi_resolver: &AbiResolver,
-    sink: &dyn EventSink,
+    sink: &dyn PipelineSink,
     reporter: &dyn ProgressReporter,
 ) -> Result<(), CoreError> {
     run_era1_scopes(
@@ -293,7 +302,7 @@ pub async fn run_era1_scopes(
     source: &Era1Source,
     contracts: &[ContractConfig],
     abi_resolver: &AbiResolver,
-    sink: &dyn EventSink,
+    sink: &dyn PipelineSink,
     reporter: &dyn ProgressReporter,
 ) -> Result<(), CoreError> {
     let mut scopes = Vec::new();
