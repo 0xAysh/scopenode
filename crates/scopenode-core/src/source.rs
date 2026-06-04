@@ -57,6 +57,46 @@ pub struct Era1Source {
     scan: SourceScan,
 }
 
+pub struct Era1BlockFactSelection {
+    files: Vec<SourceFileManifest>,
+    total_blocks: u64,
+}
+
+impl Era1BlockFactSelection {
+    pub fn total_blocks(&self) -> u64 {
+        self.total_blocks
+    }
+
+    pub fn file_count(&self) -> usize {
+        self.files.len()
+    }
+
+    pub fn files(&self) -> impl Iterator<Item = Era1BlockFactFile<'_>> {
+        self.files
+            .iter()
+            .map(|manifest| Era1BlockFactFile { manifest })
+    }
+}
+
+pub struct Era1BlockFactFile<'a> {
+    manifest: &'a SourceFileManifest,
+}
+
+impl Era1BlockFactFile<'_> {
+    pub fn path(&self) -> &Path {
+        &self.manifest.path
+    }
+
+    pub fn block_facts(
+        &self,
+    ) -> Result<
+        impl Iterator<Item = Result<crate::era1_reader::Era1BlockFacts, SourceError>>,
+        SourceError,
+    > {
+        crate::era1_reader::iter_era1_block_facts(self.manifest.path.clone())
+    }
+}
+
 impl Era1Source {
     pub fn scan(
         path: impl AsRef<Path>,
@@ -71,6 +111,37 @@ impl Era1Source {
 
     pub fn files(&self) -> &[SourceFileManifest] {
         &self.scan.files
+    }
+
+    pub fn block_facts_for_range(&self, from_block: u64, to_block: u64) -> Era1BlockFactSelection {
+        self.block_facts_for_ranges(&[(from_block, to_block)])
+    }
+
+    pub fn block_facts_for_ranges(&self, ranges: &[(u64, u64)]) -> Era1BlockFactSelection {
+        let files: Vec<SourceFileManifest> = self
+            .scan
+            .files
+            .iter()
+            .filter(|file| {
+                file.ranges.iter().any(|file_range| {
+                    ranges.iter().any(|(from_block, to_block)| {
+                        file_range.to_block >= *from_block && file_range.from_block <= *to_block
+                    })
+                })
+            })
+            .cloned()
+            .collect();
+
+        let total_blocks = files
+            .iter()
+            .flat_map(|f| &f.ranges)
+            .map(|r| r.to_block.saturating_sub(r.from_block) + 1)
+            .sum();
+
+        Era1BlockFactSelection {
+            files,
+            total_blocks,
+        }
     }
 
     pub fn block_facts(
@@ -907,6 +978,28 @@ mod tests {
         assert_eq!(facts[0].header.number, 64);
         assert_eq!(facts[1].block_number, 65);
         assert_eq!(facts[1].header.number, 65);
+    }
+
+    #[test]
+    fn era1_source_selects_block_fact_files_for_range() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("mainnet-00000-5ec1ffb8.era1"),
+            synthetic_era1_with_block_index(64, &[10, 20, 30]),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("mainnet-00001-deadbeef.era1"),
+            synthetic_era1_with_block_index(8192, &[10, 20]),
+        )
+        .unwrap();
+
+        let source = Era1Source::scan(dir.path(), None, 0, u64::MAX).unwrap();
+
+        let selection = source.block_facts_for_range(65, 8200);
+
+        assert_eq!(selection.file_count(), 2);
+        assert_eq!(selection.total_blocks(), 5);
     }
 
     #[test]

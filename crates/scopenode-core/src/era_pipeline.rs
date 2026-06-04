@@ -11,7 +11,7 @@ use crate::era1_reader::Era1BlockFacts;
 use crate::error::{CoreError, VerifyError};
 use crate::headers::BloomScanner;
 use crate::receipts::verify_era1_receipts;
-use crate::source::{Era1Source, SourceFileManifest};
+use crate::source::Era1Source;
 use alloy_consensus::ReceiptEnvelope;
 use alloy_primitives::{Log as PrimitiveLog, B256};
 use async_trait::async_trait;
@@ -185,12 +185,6 @@ impl PreparedScope {
         })
     }
 
-    fn overlaps_file(&self, file: &SourceFileManifest) -> bool {
-        file.ranges
-            .iter()
-            .any(|r| r.to_block >= self.from && r.from_block <= self.to)
-    }
-
     fn contains_block(&self, block_number: u64) -> bool {
         block_number >= self.from && block_number <= self.to
     }
@@ -317,29 +311,20 @@ pub async fn run_era1_scopes(
         return Ok(());
     }
 
-    let covering: Vec<&SourceFileManifest> = source
-        .files()
-        .iter()
-        .filter(|file| scopes.iter().any(|scope| scope.overlaps_file(file)))
-        .collect();
+    let ranges: Vec<(u64, u64)> = scopes.iter().map(|scope| (scope.from, scope.to)).collect();
+    let selected_files = source.block_facts_for_ranges(&ranges);
 
-    let total_blocks: u64 = covering
-        .iter()
-        .flat_map(|f| &f.ranges)
-        .map(|r| r.to_block.saturating_sub(r.from_block) + 1)
-        .sum();
-
-    reporter.set_total(total_blocks.max(1));
+    reporter.set_total(selected_files.total_blocks().max(1));
 
     let scope_names: Vec<String> = scopes.iter().map(|s| s.name.clone()).collect();
     let pipeline = BlockPipeline::new(scopes);
     let mut total_events = 0usize;
 
-    for file in &covering {
-        let facts_iter = match source.block_facts(file) {
+    for file in selected_files.files() {
+        let facts_iter = match file.block_facts() {
             Ok(it) => it,
             Err(e) => {
-                warn!(path = %file.path.display(), err = %e, "Failed to open ERA1 file — skipping");
+                warn!(path = %file.path().display(), err = %e, "Failed to open ERA1 file — skipping");
                 continue;
             }
         };
