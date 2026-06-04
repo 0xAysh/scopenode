@@ -85,6 +85,33 @@ pub struct DecodedEvent {
     pub timestamp: u64,
 }
 
+/// Block and transaction identity for one raw log.
+#[derive(Debug, Clone, Copy)]
+pub struct LogContext<'a> {
+    pub block_number: u64,
+    pub block_hash: B256,
+    pub tx_hash: B256,
+    pub tx_index: u64,
+    pub log_index: u64,
+    pub timestamp: u64,
+    pub source: &'a str,
+}
+
+impl LogContext<'static> {
+    #[cfg(test)]
+    fn test() -> Self {
+        Self {
+            block_number: 0,
+            block_hash: B256::ZERO,
+            tx_hash: B256::ZERO,
+            tx_index: 0,
+            log_index: 0,
+            timestamp: 0,
+            source: "era1",
+        }
+    }
+}
+
 /// Precomputed decode metadata for one Solidity event.
 struct CompiledEvent {
     name: String,
@@ -164,16 +191,16 @@ impl EventDecoder {
             for log in receipt.logs() {
                 let log_index = cumulative_log_index;
                 cumulative_log_index += 1;
-                if let Some(event) = self.decode_log(
-                    log,
-                    block_num,
+                let context = LogContext {
+                    block_number: block_num,
                     block_hash,
                     tx_hash,
-                    tx_idx as u64,
+                    tx_index: tx_idx as u64,
                     log_index,
                     timestamp,
                     source,
-                ) {
+                };
+                if let Some(event) = self.decode_log(log, context) {
                     results.push(event);
                 }
             }
@@ -189,17 +216,7 @@ impl EventDecoder {
     /// in tests with a synthetic `PrimitiveLog` and known block context to verify
     /// the full decode chain without constructing a receipt list.
     #[allow(clippy::too_many_arguments)]
-    pub fn decode_log(
-        &self,
-        log: &PrimitiveLog,
-        block_number: u64,
-        block_hash: B256,
-        tx_hash: B256,
-        tx_index: u64,
-        log_index: u64,
-        timestamp: u64,
-        source: &str,
-    ) -> Option<DecodedEvent> {
+    pub fn decode_log(&self, log: &PrimitiveLog, context: LogContext<'_>) -> Option<DecodedEvent> {
         if log.address != self.contract {
             return None;
         }
@@ -214,16 +231,16 @@ impl EventDecoder {
             contract: self.contract,
             event_name: event_abi.name.clone(),
             topic0,
-            block_number,
-            block_hash,
-            tx_hash,
-            tx_index,
-            log_index,
+            block_number: context.block_number,
+            block_hash: context.block_hash,
+            tx_hash: context.tx_hash,
+            tx_index: context.tx_index,
+            log_index: context.log_index,
             raw_topics: topics.to_vec(),
             raw_data,
             decoded,
-            source: source.to_owned(),
-            timestamp,
+            source: context.source.to_owned(),
+            timestamp: context.timestamp,
         })
     }
 
@@ -376,13 +393,15 @@ mod era1_tests {
 
         let result = decoder.decode_log(
             &log,
-            18_000_000,
-            B256::from([0xAA; 32]),
-            B256::from([0xBB; 32]),
-            3,
-            7,
-            1_700_000_000,
-            "era1",
+            LogContext {
+                block_number: 18_000_000,
+                block_hash: B256::from([0xAA; 32]),
+                tx_hash: B256::from([0xBB; 32]),
+                tx_index: 3,
+                log_index: 7,
+                timestamp: 1_700_000_000,
+                source: "era1",
+            },
         );
 
         let event = result.expect("matching log must decode to Some");
@@ -412,9 +431,7 @@ mod era1_tests {
             address: other,
             data: LogData::new_unchecked(vec![topic0], Bytes::new()),
         };
-        assert!(decoder
-            .decode_log(&log, 0, B256::ZERO, B256::ZERO, 0, 0, 0, "era1")
-            .is_none());
+        assert!(decoder.decode_log(&log, LogContext::test()).is_none());
     }
 
     #[test]
@@ -434,9 +451,7 @@ mod era1_tests {
             data: LogData::new_unchecked(vec![unknown], Bytes::new()),
         };
         let _ = topic0; // used above to construct decoder
-        assert!(decoder
-            .decode_log(&log, 0, B256::ZERO, B256::ZERO, 0, 0, 0, "era1")
-            .is_none());
+        assert!(decoder.decode_log(&log, LogContext::test()).is_none());
     }
 
     #[test]
