@@ -5,10 +5,8 @@
 //! `decode_era1_receipts`, and `decode_era1_tx_hashes` behind the
 //! [`iter_era1_block_facts`] function.
 
-use crate::source::{
-    decode_era1_header, decode_era1_receipts, decode_era1_tx_hashes, iter_era1_block_tuples,
-    SourceError,
-};
+use crate::e2store::iter_era1_block_tuples;
+use crate::source::{decode_era1_header, decode_era1_receipts, decode_era1_tx_hashes, SourceError};
 use crate::types::ScopeHeader;
 use alloy_consensus::ReceiptEnvelope;
 use alloy_primitives::{Log as PrimitiveLog, B256};

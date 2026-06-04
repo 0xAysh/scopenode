@@ -10,6 +10,7 @@ pub mod abi_resolution;
 pub use abi_resolution::AbiFetcher;
 pub mod config;
 pub mod decode_quality;
+mod e2store;
 pub mod era1_codec;
 pub mod era1_reader;
 pub mod era_pipeline;
