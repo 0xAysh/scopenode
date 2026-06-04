@@ -1,6 +1,6 @@
 use alloy_primitives::Address;
 use async_trait::async_trait;
-use scopenode_core::{abi::AbiFetcher, error::AbiError};
+use scopenode_core::{abi_resolution::AbiFetcher, error::AbiError};
 
 pub struct SourcifyClient {
     client: reqwest::Client,
