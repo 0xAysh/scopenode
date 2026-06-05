@@ -32,9 +32,10 @@ use tracing::info;
 use crate::filter_plan::FilterPlan;
 use crate::projection::{project_rest_event, EventResponse};
 use crate::query_front_door::{
-    map_event_query_outcome, EventQueryResponse, MISSING_COVERAGE_MESSAGE, RESULT_CAP_MESSAGE,
+    execute_event_query, EventQueryFrontDoorError, EventQueryResponse, MISSING_COVERAGE_MESSAGE,
+    RESULT_CAP_MESSAGE,
 };
-use scopenode_storage::{Db, EventQuery};
+use scopenode_storage::Db;
 
 #[derive(Clone)]
 struct AppState {
@@ -84,7 +85,7 @@ async fn get_events(
     Query(q): Query<EventsQuery>,
 ) -> Result<Json<EventsResponse>, (axum::http::StatusCode, String)> {
     let limit = q.limit.unwrap_or(100).min(10_000) as u64;
-    let query = match FilterPlan::from_rest_params(
+    let plan = FilterPlan::from_rest_params(
         q.contract,
         q.event,
         q.topic0,
@@ -92,21 +93,24 @@ async fn get_events(
         q.to_block,
         limit,
         q.offset.unwrap_or(0),
-    ) {
-        FilterPlan::Query(query) => query,
-        FilterPlan::MissingAddress => EventQuery::default(),
-        FilterPlan::Unsupported { reason } => {
-            return Err((axum::http::StatusCode::BAD_REQUEST, reason));
-        }
-    };
+    );
 
-    let outcome = state
-        .db
-        .query_events(&query)
+    let response = execute_event_query(&state.db, plan)
         .await
-        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|err| match err {
+            EventQueryFrontDoorError::MissingAddress => (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "missing REST query plan".to_string(),
+            ),
+            EventQueryFrontDoorError::Unsupported { reason } => {
+                (axum::http::StatusCode::BAD_REQUEST, reason)
+            }
+            EventQueryFrontDoorError::Storage(e) => {
+                (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            }
+        })?;
 
-    match map_event_query_outcome(outcome) {
+    match response {
         EventQueryResponse::TooManyResults { .. } => Err((
             axum::http::StatusCode::BAD_REQUEST,
             RESULT_CAP_MESSAGE.into(),

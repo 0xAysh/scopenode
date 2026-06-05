@@ -8,7 +8,8 @@
 
 use crate::filter_plan::FilterPlan;
 use crate::query_front_door::{
-    map_event_query_outcome, EventQueryResponse, MISSING_COVERAGE_MESSAGE, RESULT_CAP_MESSAGE,
+    execute_event_query, EventQueryFrontDoorError, EventQueryResponse, MISSING_COVERAGE_MESSAGE,
+    RESULT_CAP_MESSAGE,
 };
 use alloy::rpc::types::{Filter, Log};
 use async_trait::async_trait;
@@ -56,20 +57,16 @@ impl NetApiServer for EthApiImpl {
 #[async_trait]
 impl EthApiServer for EthApiImpl {
     async fn get_logs(&self, filter: Filter) -> RpcResult<Vec<Log>> {
-        let query = match FilterPlan::from_rpc_filter(&filter) {
-            FilterPlan::Query(query) => query,
-            FilterPlan::MissingAddress => return Err(not_indexed_error()),
-            FilterPlan::Unsupported { reason } => {
-                return Err(ErrorObject::owned(-32002, reason, None::<()>));
-            }
-        };
-
-        let outcome = self
-            .db
-            .query_events(&query)
+        let response = execute_event_query(&self.db, FilterPlan::from_rpc_filter(&filter))
             .await
-            .map_err(|e| internal_error(&e.to_string()))?;
-        match map_event_query_outcome(outcome) {
+            .map_err(|err| match err {
+                EventQueryFrontDoorError::MissingAddress => not_indexed_error(),
+                EventQueryFrontDoorError::Unsupported { reason } => {
+                    ErrorObject::owned(-32002, reason, None::<()>)
+                }
+                EventQueryFrontDoorError::Storage(e) => internal_error(&e.to_string()),
+            })?;
+        match response {
             EventQueryResponse::NotIndexed => Err(not_indexed_error()),
             EventQueryResponse::MissingCoverage => Err(ErrorObject::owned(
                 -32001,
