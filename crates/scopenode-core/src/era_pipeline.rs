@@ -328,6 +328,7 @@ pub async fn run_era1_scopes(
     let scope_names: Vec<String> = scopes.iter().map(|s| s.name.clone()).collect();
     let pipeline = BlockPipeline::new(scopes);
     let mut total_events = 0usize;
+    let mut had_store_failure = false;
 
     for file in selected_files.files() {
         let facts_iter = match file.block_facts() {
@@ -354,18 +355,25 @@ pub async fn run_era1_scopes(
             if !block_events.is_empty() {
                 match sink.store(block_events).await {
                     Ok(n) => total_events += n,
-                    Err(e) => warn!(block = block_number, err = %e, "Event insert failed"),
+                    Err(e) => {
+                        had_store_failure = true;
+                        warn!(block = block_number, err = %e, "Event insert failed");
+                    }
                 }
             }
         }
     }
 
-    for scope in pipeline.scopes.iter() {
-        if let Err(e) = sink
-            .record_coverage(&scope.contract, scope.from, scope.to)
-            .await
-        {
-            warn!(contract = %scope.contract, err = %e, "Coverage record failed");
+    if had_store_failure {
+        warn!("Skipping Coverage record because one or more event inserts failed");
+    } else {
+        for scope in pipeline.scopes.iter() {
+            if let Err(e) = sink
+                .record_coverage(&scope.contract, scope.from, scope.to)
+                .await
+            {
+                warn!(contract = %scope.contract, err = %e, "Coverage record failed");
+            }
         }
     }
 

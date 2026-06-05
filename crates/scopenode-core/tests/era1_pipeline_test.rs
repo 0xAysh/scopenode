@@ -7,10 +7,11 @@ use alloy_rlp::{Encodable, Header as RlpHeader};
 use alloy_trie::{HashBuilder, Nibbles};
 use async_trait::async_trait;
 use scopenode_core::{
+    abi::DecodedEvent,
     abi_resolution::{AbiResolver, AbiStore},
     config::{Config, ContractConfig, NodeConfig},
-    era_pipeline::{run_era1_scope, run_era1_scopes, NullReporter},
-    error::AbiError,
+    era_pipeline::{run_era1_scope, run_era1_scopes, CoverageSink, EventSink, NullReporter},
+    error::{AbiError, CoreError},
     source::Era1Source,
 };
 use scopenode_storage::{Db, DbEventSink};
@@ -19,6 +20,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tempfile::tempdir;
+use tokio::sync::Mutex;
 
 struct DbAbiStore(Db);
 
@@ -40,6 +42,34 @@ impl AbiStore for DbAbiStore {
             .upsert_contract(address, name, abi_json)
             .await
             .map_err(|e| AbiError::Cache(e.to_string()))
+    }
+}
+
+#[derive(Default)]
+struct FailingStoreSink {
+    covered_ranges: Mutex<Vec<(String, u64, u64)>>,
+}
+
+#[async_trait]
+impl EventSink for FailingStoreSink {
+    async fn store(&self, _events: Vec<DecodedEvent>) -> Result<usize, CoreError> {
+        Err(CoreError::Storage("synthetic insert failure".to_string()))
+    }
+}
+
+#[async_trait]
+impl CoverageSink for FailingStoreSink {
+    async fn record_coverage(
+        &self,
+        contract: &str,
+        from_block: u64,
+        to_block: u64,
+    ) -> Result<(), CoreError> {
+        self.covered_ranges
+            .lock()
+            .await
+            .push((contract.to_string(), from_block, to_block));
+        Ok(())
     }
 }
 
@@ -349,6 +379,43 @@ async fn era1_pipeline_indexes_transfer_event() {
     assert_eq!(count, 1, "expected exactly one Transfer event in DB");
 
     // Cleanup
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+    let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+}
+
+#[tokio::test]
+async fn era1_pipeline_does_not_record_coverage_when_event_store_fails() {
+    let contract = address!("dAC17F958D2ee523a2206206994597C13D831ec7");
+    let transfer_topic0 = keccak256(b"Transfer(address,address,uint256)");
+
+    let dir = tempdir().unwrap();
+    let era1_path = dir.path().join("mainnet-00012-deadbeef.era1");
+    let era1_bytes = build_synthetic_era1(contract, transfer_topic0);
+    std::fs::write(&era1_path, &era1_bytes).unwrap();
+
+    let db_path = unique_db_path();
+    let db = Db::open(db_path.clone()).await.unwrap();
+    let addr_str = contract.to_checksum(None);
+    db.upsert_contract(&addr_str, Some("USDT"), &transfer_abi_json())
+        .await
+        .unwrap();
+
+    let source = Era1Source::scan(dir.path(), None, 100, 100).unwrap();
+    let config = test_config(contract);
+    let contract_cfg = &config.contracts[0];
+    let abi_resolver = AbiResolver::new(Arc::new(DbAbiStore(db.clone())), None);
+    let sink = FailingStoreSink::default();
+
+    run_era1_scope(&source, contract_cfg, &abi_resolver, &sink, &NullReporter)
+        .await
+        .unwrap();
+
+    assert!(
+        sink.covered_ranges.lock().await.is_empty(),
+        "failed event storage must not record Coverage for the Contract scope"
+    );
+
     let _ = std::fs::remove_file(&db_path);
     let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
     let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
