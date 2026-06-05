@@ -10,7 +10,9 @@ use scopenode_core::{
     abi::DecodedEvent,
     abi_resolution::{AbiResolver, AbiStore},
     config::{Config, ContractConfig, NodeConfig},
-    era_pipeline::{run_era1_scope, run_era1_scopes, CoverageSink, EventSink, NullReporter},
+    era_pipeline::{
+        run_era1_scope, run_era1_scopes, CoverageSink, EventSink, InMemoryEventSink, NullReporter,
+    },
     error::{AbiError, CoreError},
     source::Era1Source,
 };
@@ -414,6 +416,45 @@ async fn era1_pipeline_does_not_record_coverage_when_event_store_fails() {
     assert!(
         sink.covered_ranges.lock().await.is_empty(),
         "failed event storage must not record Coverage for the Contract scope"
+    );
+
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+    let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+}
+
+#[tokio::test]
+async fn era1_pipeline_does_not_record_coverage_when_selected_file_cannot_open() {
+    let contract = address!("dAC17F958D2ee523a2206206994597C13D831ec7");
+    let transfer_topic0 = keccak256(b"Transfer(address,address,uint256)");
+
+    let dir = tempdir().unwrap();
+    let era1_path = dir.path().join("mainnet-00012-deadbeef.era1");
+    let era1_bytes = build_synthetic_era1(contract, transfer_topic0);
+    std::fs::write(&era1_path, &era1_bytes).unwrap();
+
+    let db_path = unique_db_path();
+    let db = Db::open(db_path.clone()).await.unwrap();
+    let addr_str = contract.to_checksum(None);
+    db.upsert_contract(&addr_str, Some("USDT"), &transfer_abi_json())
+        .await
+        .unwrap();
+
+    let source = Era1Source::scan(dir.path(), None, 100, 100).unwrap();
+    std::fs::remove_file(&era1_path).unwrap();
+
+    let config = test_config(contract);
+    let contract_cfg = &config.contracts[0];
+    let abi_resolver = AbiResolver::new(Arc::new(DbAbiStore(db.clone())), None);
+    let sink = InMemoryEventSink::default();
+
+    run_era1_scope(&source, contract_cfg, &abi_resolver, &sink, &NullReporter)
+        .await
+        .unwrap();
+
+    assert!(
+        sink.covered_ranges().await.is_empty(),
+        "unopened ERA1 source files must not record Coverage for the Contract scope"
     );
 
     let _ = std::fs::remove_file(&db_path);

@@ -328,12 +328,14 @@ pub async fn run_era1_scopes(
     let scope_names: Vec<String> = scopes.iter().map(|s| s.name.clone()).collect();
     let pipeline = BlockPipeline::new(scopes);
     let mut total_events = 0usize;
+    let mut had_source_failure = false;
     let mut had_store_failure = false;
 
     for file in selected_files.files() {
         let facts_iter = match file.block_facts() {
             Ok(it) => it,
             Err(e) => {
+                had_source_failure = true;
                 warn!(path = %file.path().display(), err = %e, "Failed to open ERA1 file — skipping");
                 continue;
             }
@@ -343,6 +345,7 @@ pub async fn run_era1_scopes(
             let facts = match facts_result {
                 Ok(f) => f,
                 Err(e) => {
+                    had_source_failure = true;
                     warn!(err = %e, "ERA1 read error — skipping block");
                     continue;
                 }
@@ -364,8 +367,8 @@ pub async fn run_era1_scopes(
         }
     }
 
-    if had_store_failure {
-        warn!("Skipping Coverage record because one or more event inserts failed");
+    if had_source_failure || had_store_failure {
+        warn!("Skipping Coverage record because the ERA1 scope run did not complete cleanly");
     } else {
         for scope in pipeline.scopes.iter() {
             if let Err(e) = sink
