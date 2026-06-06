@@ -220,6 +220,7 @@ impl ChecksumStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Era1FileName {
+    format: String,
     network: String,
     epoch: u64,
     file_hash: String,
@@ -314,7 +315,7 @@ pub fn scan_era1_source(
             .map(|duration| duration.as_secs() as i64);
 
         files.push(SourceFileManifest {
-            format: "era1".to_string(),
+            format: parsed.format,
             path: file_path,
             filename,
             network: parsed.network,
@@ -347,13 +348,14 @@ pub fn scan_era1_source(
 pub(crate) use crate::era1_codec::{decode_era1_receipts, decode_era1_tx_hashes};
 
 fn parse_era1_filename(path: &Path, network_override: Option<&str>) -> Option<Era1FileName> {
-    if path.extension().and_then(|ext| ext.to_str()) != Some("era1") {
+    let extension = path.extension().and_then(|ext| ext.to_str())?;
+    if extension != "era1" && extension != "ere" {
         return None;
     }
 
     let stem = path.file_stem()?.to_str()?;
     let parts = stem.split('-').collect::<Vec<_>>();
-    if parts.len() != 3 {
+    if (extension == "era1" && parts.len() != 3) || (extension == "ere" && parts.len() < 3) {
         return None;
     }
 
@@ -363,10 +365,18 @@ fn parse_era1_filename(path: &Path, network_override: Option<&str>) -> Option<Er
     if file_hash.len() != 8 || !file_hash.chars().all(|c| c.is_ascii_hexdigit()) {
         return None;
     }
+    if extension == "ere"
+        && !parts[3..]
+            .iter()
+            .all(|profile| !profile.is_empty() && profile.chars().all(|c| c.is_ascii_lowercase()))
+    {
+        return None;
+    }
     let from_block = epoch.checked_mul(ERA1_BLOCKS_PER_FILE)?;
     let to_block = from_block.checked_add(ERA1_BLOCKS_PER_FILE - 1)?;
 
     Some(Era1FileName {
+        format: extension.to_string(),
         network,
         epoch,
         file_hash,
@@ -482,6 +492,18 @@ mod tests {
         assert_eq!(parsed.file_hash, "5ec1ffb8");
         assert_eq!(parsed.from_block, 0);
         assert_eq!(parsed.to_block, 8191);
+    }
+
+    #[test]
+    fn parses_standard_ere_filename_with_profile() {
+        let parsed =
+            parse_era1_filename(Path::new("mainnet-00012-4bb7de2e-noproofs.ere"), None).unwrap();
+
+        assert_eq!(parsed.network, "mainnet");
+        assert_eq!(parsed.epoch, 12);
+        assert_eq!(parsed.file_hash, "4bb7de2e");
+        assert_eq!(parsed.from_block, 98_304);
+        assert_eq!(parsed.to_block, 106_495);
     }
 
     #[test]
@@ -652,6 +674,38 @@ mod tests {
     }
 
     #[test]
+    fn ere_source_streams_block_facts_from_sectioned_file() {
+        let dir = tempdir().unwrap();
+        let ere = dir.path().join("mainnet-00000-4bb7de2e-noproofs.ere");
+        fs::write(&ere, synthetic_decodable_ere(64, &[64, 65])).unwrap();
+
+        let source = Era1Source::scan(dir.path(), None, 0, u64::MAX).unwrap();
+        let file = source
+            .files()
+            .first()
+            .expect("scan should find one ERE file");
+
+        assert_eq!(file.format, "ere");
+        assert_eq!(file.ranges[0].from_block, 64);
+        assert_eq!(file.ranges[0].to_block, 65);
+
+        let facts = source
+            .block_facts(file)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(facts.len(), 2);
+        assert_eq!(facts[0].block_number, 64);
+        assert_eq!(facts[0].header.number, 64);
+        assert_eq!(facts[0].receipts.len(), 1);
+        let receipt = facts[0].receipts[0].as_receipt_with_bloom().unwrap();
+        assert_eq!(receipt.receipt.cumulative_gas_used, 21_000);
+        assert_eq!(facts[1].block_number, 65);
+        assert_eq!(facts[1].header.number, 65);
+    }
+
+    #[test]
     fn era1_source_selects_block_fact_files_for_range() {
         let dir = tempdir().unwrap();
         fs::write(
@@ -761,6 +815,39 @@ mod tests {
         }
         index.extend_from_slice(&(blocks.len() as i64).to_le_bytes());
         bytes.extend(e2store_entry([0x66, 0x32], &index));
+        bytes
+    }
+
+    fn synthetic_decodable_ere(starting_number: u64, blocks: &[u64]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend(e2store_entry([0x65, 0x32], &[]));
+
+        for block_number in blocks {
+            let header = alloy_consensus::Header {
+                number: *block_number,
+                ..Default::default()
+            };
+            bytes.extend(e2store_entry([0x03, 0x00], &snappy_rlp(&header)));
+        }
+        for _ in blocks {
+            bytes.extend(e2store_entry([0x04, 0x00], &snappy_empty_body()));
+        }
+        for _ in blocks {
+            bytes.extend(e2store_entry([0x0a, 0x00], &snappy_one_slim_receipt()));
+        }
+
+        let component_count = 3_u64;
+        let mut index = Vec::new();
+        index.extend_from_slice(&starting_number.to_le_bytes());
+        for i in 0..blocks.len() {
+            for slot in 0..component_count {
+                let offset = -(((i as i64) + 1) * 100 + slot as i64);
+                index.extend_from_slice(&offset.to_le_bytes());
+            }
+        }
+        index.extend_from_slice(&component_count.to_le_bytes());
+        index.extend_from_slice(&(blocks.len() as u64).to_le_bytes());
+        bytes.extend(e2store_entry([0x67, 0x32], &index));
         bytes
     }
 
@@ -889,6 +976,37 @@ mod tests {
 
     fn snappy_empty_receipts() -> Vec<u8> {
         snappy_bytes(&[0xC0])
+    }
+
+    fn snappy_one_slim_receipt() -> Vec<u8> {
+        use alloy_consensus::Eip658Value;
+        use alloy_rlp::{Encodable, Header as RlpHeader};
+
+        let mut receipt_payload = Vec::new();
+        0_u8.encode(&mut receipt_payload);
+        Eip658Value::Eip658(true).encode(&mut receipt_payload);
+        21_000_u64.encode(&mut receipt_payload);
+        Vec::<alloy_primitives::Log>::new().encode(&mut receipt_payload);
+
+        let mut receipt = Vec::new();
+        RlpHeader {
+            list: true,
+            payload_length: receipt_payload.len(),
+        }
+        .encode(&mut receipt);
+        receipt.extend_from_slice(&receipt_payload);
+
+        let mut receipts_payload = Vec::new();
+        receipts_payload.extend_from_slice(&receipt);
+        let mut receipts = Vec::new();
+        RlpHeader {
+            list: true,
+            payload_length: receipts_payload.len(),
+        }
+        .encode(&mut receipts);
+        receipts.extend_from_slice(&receipts_payload);
+
+        snappy_bytes(&receipts)
     }
 
     fn snappy_bytes(bytes: &[u8]) -> Vec<u8> {

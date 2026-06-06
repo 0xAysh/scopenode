@@ -5,8 +5,8 @@
 
 use crate::source::SourceError;
 use crate::types::ScopeHeader;
-use alloy_consensus::{Header, Receipt, ReceiptEnvelope, ReceiptWithBloom};
-use alloy_primitives::{keccak256, Log as PrimitiveLog};
+use alloy_consensus::{Eip658Value, Header, Receipt, ReceiptEnvelope, ReceiptWithBloom};
+use alloy_primitives::{keccak256, logs_bloom, Log as PrimitiveLog};
 use alloy_rlp::Decodable;
 use snap::read::FrameDecoder;
 use std::io::Read;
@@ -102,6 +102,77 @@ pub(crate) fn decode_era1_receipts(
                 }
             });
         }
+    }
+
+    Ok(receipts)
+}
+
+pub(crate) fn decode_ere_slim_receipts(
+    compressed: &[u8],
+) -> Result<Vec<ReceiptEnvelope<PrimitiveLog>>, SourceError> {
+    let mut raw = Vec::new();
+    FrameDecoder::new(compressed)
+        .read_to_end(&mut raw)
+        .map_err(|e| SourceError::InvalidEra1Header(e.to_string()))?;
+
+    let mut slice = raw.as_slice();
+    let list_header = alloy_rlp::Header::decode(&mut slice)
+        .map_err(|e| SourceError::InvalidEra1Header(e.to_string()))?;
+    if !list_header.list {
+        return Err(SourceError::InvalidEra1Header(
+            "slim receipts block is not an RLP list".into(),
+        ));
+    }
+
+    let mut payload = &slice[..list_header.payload_length];
+    let mut receipts = Vec::new();
+
+    while !payload.is_empty() {
+        let receipt_header = alloy_rlp::Header::decode(&mut payload)
+            .map_err(|e| SourceError::InvalidEra1Header(e.to_string()))?;
+        if !receipt_header.list {
+            return Err(SourceError::InvalidEra1Header(
+                "slim receipt is not an RLP list".into(),
+            ));
+        }
+        let mut receipt_payload = &payload[..receipt_header.payload_length];
+        payload = &payload[receipt_header.payload_length..];
+
+        let receipt_type = u8::decode(&mut receipt_payload)
+            .map_err(|e| SourceError::InvalidEra1Header(e.to_string()))?;
+        let status = Eip658Value::decode(&mut receipt_payload)
+            .map_err(|e| SourceError::InvalidEra1Header(e.to_string()))?;
+        let cumulative_gas_used = u64::decode(&mut receipt_payload)
+            .map_err(|e| SourceError::InvalidEra1Header(e.to_string()))?;
+        let logs = Vec::<PrimitiveLog>::decode(&mut receipt_payload)
+            .map_err(|e| SourceError::InvalidEra1Header(e.to_string()))?;
+        if !receipt_payload.is_empty() {
+            return Err(SourceError::InvalidEra1Header(
+                "slim receipt has trailing RLP data".into(),
+            ));
+        }
+
+        let logs_bloom = logs_bloom(&logs);
+        let with_bloom = ReceiptWithBloom::<Receipt<PrimitiveLog>> {
+            receipt: Receipt {
+                status,
+                cumulative_gas_used,
+                logs,
+            },
+            logs_bloom,
+        };
+        receipts.push(match receipt_type {
+            0 => ReceiptEnvelope::Legacy(with_bloom),
+            1 => ReceiptEnvelope::Eip2930(with_bloom),
+            2 => ReceiptEnvelope::Eip1559(with_bloom),
+            3 => ReceiptEnvelope::Eip4844(with_bloom),
+            4 => ReceiptEnvelope::Eip7702(with_bloom),
+            t => {
+                return Err(SourceError::InvalidEra1Header(format!(
+                    "unknown receipt type: {t}"
+                )))
+            }
+        });
     }
 
     Ok(receipts)

@@ -6,6 +6,7 @@
 //! [`iter_era1_block_facts`] function.
 
 use crate::e2store::iter_era1_block_tuples;
+use crate::era1_codec::decode_ere_slim_receipts;
 use crate::source::{decode_era1_header, decode_era1_receipts, decode_era1_tx_hashes, SourceError};
 use crate::types::ScopeHeader;
 use alloy_consensus::ReceiptEnvelope;
@@ -41,12 +42,17 @@ pub struct Era1BlockFacts {
 pub fn iter_era1_block_facts(
     path: impl AsRef<Path>,
 ) -> Result<impl Iterator<Item = Result<Era1BlockFacts, SourceError>>, SourceError> {
+    let is_ere = path.as_ref().extension().and_then(|ext| ext.to_str()) == Some("ere");
     let iter = iter_era1_block_tuples(path)?;
-    let mapped = iter.map(|tuple_result| {
+    let mapped = iter.map(move |tuple_result| {
         let tuple = tuple_result?;
 
         let header = decode_era1_header(&tuple.compressed_header)?;
-        let receipts = decode_era1_receipts(&tuple.compressed_receipts)?;
+        let receipts = if is_ere {
+            decode_ere_slim_receipts(&tuple.compressed_receipts)?
+        } else {
+            decode_era1_receipts(&tuple.compressed_receipts)?
+        };
         let tx_hashes = decode_era1_tx_hashes(&tuple.compressed_body).unwrap_or_default();
 
         Ok(Era1BlockFacts {
