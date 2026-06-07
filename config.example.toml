@@ -1,13 +1,29 @@
 [node]
+# JSON-RPC and REST listeners bind to 127.0.0.1.
 port = 8545
 rest_port = 8546
+
+# SQLite is stored at <data_dir>/scopenode.db.
 data_dir = "~/.scopenode"
-era_dir = "~/era1"
+
+# Directory containing supported .era1 and/or .ere execution-history files.
+era_dir = "~/ethereum-archives"
 
 [[contracts]]
-name = "Uniswap V3 ETH/USDC"
-address = "0x8ad599c3A0ff1De082011EFDDc58f1908eb6e6D8"
-events = ["Swap"]
-from_block = 25000000
-to_block = 25010000
-abi_override = "./abis/UniswapV3Pool.json"
+name = "USDC"
+address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+
+# Use named events, or use ["*"] alone to index every event in the resolved ABI.
+events = ["Transfer", "Approval"]
+
+# Inclusive bounds. Integers and K/M shorthand are accepted.
+from_block = "17M"
+to_block = "17.1M"
+
+# Optional ABI resolution inputs.
+# Resolution order: SQLite cache -> valid local override -> Sourcify.
+abi_override = "./abis/USDC.json"
+
+# For a proxy, remote-fetch the implementation ABI while indexing logs emitted
+# by the configured proxy address.
+# impl_address = "0x0000000000000000000000000000000000000000"
