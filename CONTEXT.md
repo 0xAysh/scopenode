@@ -1,24 +1,71 @@
 # scopenode Context
 
-## Domain Terms
+This file defines the canonical vocabulary for the current architecture.
 
-**ERA1 source** — A local directory of `.era1` archive files used as the only historical chain data source. The ERA1 source owns file discovery, manifest facts, checksum status, range coverage, and decoded block fact streaming.
+## Product boundary
 
-**Contract scope** — One configured contract address, event selection, ABI resolution settings, and inclusive block range to index.
+**scopenode** — A local, bounded Ethereum event indexer backed by execution
+history archive files. It is not a full node, live peer, state database, or
+complete JSON-RPC implementation.
 
-**Block fact** — The decoded facts scopenode needs from one ERA1 block: block number, header, receipts, and transaction hashes.
+**Archive source** — A local directory containing supported `.era1` and `.ere`
+execution-history files. The source layer owns discovery, filename metadata,
+checksum status, block-range inspection, file selection, and block-fact streams.
+Some code retains the historical `Era1*` name while supporting both formats.
 
-**ABI resolution** — The process of finding event ABIs for a contract scope through the SQLite cache, local ABI file, or configured remote fetch adapter.
+**Contract scope** — One configured contract address, selected event names,
+inclusive block range, and ABI resolution settings.
 
-**Event decoder** — The module that compiles event ABI definitions, matches receipt logs by contract/topic, decodes indexed and non-indexed fields, and produces decoded events.
+**Union range** — The minimum `from_block` through maximum `to_block` across all
+contract scopes. Archive files are selected once against this range, then each
+block is evaluated against every applicable scope.
 
-**Decoded event** — A matched Ethereum log enriched with decoded JSON fields and storage-ready block, transaction, and log identity.
+## Sync domain
 
-**Coverage** — A recorded contract/block range that has been processed. Query callers use coverage to fail loudly when a request asks for data outside local indexed scope.
+**Block fact** — The archive-decoded inputs needed by the pipeline for one block:
+block number, header, receipts, and transaction hashes.
 
-**Event query** — A domain-level request for indexed decoded events, including contract, event name, topic0, block range, limit, and offset.
+**ABI resolution** — Resolution of event definitions through the contract ABI
+cache, a local override, or the remote Sourcify adapter. `impl_address` changes
+the remote lookup address for proxies without changing the log address.
 
-**Query adapter** — A transport-facing module that turns event query outcomes into JSON-RPC or REST responses.
+**Prepared scope** — A validated contract scope paired with a compiled
+`EventDecoder`, ready for repeated block evaluation.
 
-**Event sink** — A pipeline adapter that receives decoded events and coverage facts. SQLite and in-memory sinks are the current adapters.
+**Event decoder** — Compiled event definitions used to compute topic signatures,
+match logs by address/topic, and decode indexed and non-indexed fields.
+
+**Decoded event** — A matched Ethereum log enriched with decoded JSON and
+storage-ready block, transaction, log, source, and timestamp identity.
+
+**Receipt verification** — Reconstruction of the Ethereum receipt trie and
+comparison with the block header's `receipts_root`.
+
+**Pipeline sink** — The combined event and coverage output interface. SQLite and
+the in-memory test sink are current adapters.
+
+**Coverage** — A contract, inclusive block range, and source recorded only after
+the scope completes without a read, verification, decode, or storage failure.
+
+## Query domain
+
+**Event query** — A transport-independent request containing optional contract,
+event name, topic0, block bounds, limit, and offset.
+
+**Event query outcome** — One of `Results`, `Empty`, `NotIndexed`,
+`MissingCoverage`, or `Capped`. These meanings are explicit domain states, not
+inferred from HTTP codes or row counts.
+
+**Filter plan** — Normalization of JSON-RPC or REST inputs into an `EventQuery`
+or an explicit unsupported/missing-address result.
+
+**Query front door** — The shared RPC/REST path that executes a filter plan and
+maps storage outcomes without duplicating policy in each transport.
+
+**Projection** — Conversion from stored event rows into JSON-RPC logs or REST
+event responses.
+
+**Decode quality** — `Valid`, `Lossy`, or `Invalid` quality attached to parsing
+and projection fallbacks so malformed stored data is not silently treated as
+fully valid.
 
