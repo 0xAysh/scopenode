@@ -1,5 +1,13 @@
 # Architecture Deepening Implementation Plan
 
+**Status:** completed and retained as a historical implementation plan.
+
+The current code contains the coverage store/outcomes, filter plan, shared query
+front door, decode-quality model, E2Store module, archive codec, and explicit
+pipeline sink seams proposed here. `source_manifest.rs` was not created as a
+separate file; source manifest ownership remains in `source.rs`. Unchecked boxes
+below describe the original execution sequence, not outstanding work.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Deepen scopenode's query, filter, decode-quality, and ERA1 source modules so local scope correctness is explicit and easier to test.
