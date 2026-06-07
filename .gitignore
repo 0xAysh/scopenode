@@ -9,7 +9,10 @@ config.test.toml
 .worktrees/
 /graphify-out
 /docs/*
-!/docs/phases
+# Keep generated/non-document artifacts under docs ignored, but version the
+# Markdown knowledge base and its directory structure.
+!/docs/**/
+!/docs/**/*.md
 .context
 
 # ERA1/era data files
