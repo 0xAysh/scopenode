@@ -1,5 +1,13 @@
 # Observability and Benchmarks Implementation Plan
 
+**Status:** planned; not implemented as of 2026-06-07.
+
+The current workspace has no `scopenode-observability` crate, `/metrics`
+endpoint, `--log-format` option, Criterion benchmark targets, or related
+dependencies. This plan is the proposed implementation, not current usage
+documentation. References to “pre-existing uncommitted ERE support” describe
+the repository state when the plan was written; ERE support is now committed.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add structured human/JSON logs, bounded Prometheus metrics at `/metrics`, and local Criterion benchmarks for scopenode's sync and serving paths.
