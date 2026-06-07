@@ -1,5 +1,11 @@
 # Observability and Benchmarks Design
 
+**Status:** approved design; not implemented as of 2026-06-07.
+
+Nothing in this document should be read as an available CLI flag, endpoint, or
+benchmark until the corresponding implementation plan is completed. Current
+behavior is documented in `README.md`.
+
 ## Goal
 
 Add enough observability to diagnose correctness and performance problems in both
