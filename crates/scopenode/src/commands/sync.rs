@@ -96,7 +96,7 @@ pub async fn run(config: Config, db: Db, dry_run: bool, quiet: bool) -> Result<(
     let sink = scopenode_storage::DbEventSink::new(db);
     let pipeline_contracts = plan.pipeline_contracts();
 
-    run_era1_scopes(
+    let report = run_era1_scopes(
         &source,
         &pipeline_contracts,
         &abi_resolver,
@@ -105,6 +105,16 @@ pub async fn run(config: Config, db: Db, dry_run: bool, quiet: bool) -> Result<(
     )
     .await
     .context("ERA1 sync failed")?;
+
+    if !report.is_complete() {
+        for (contract, reason) in &report.incomplete {
+            eprintln!("  {contract}: {}", reason.describe());
+        }
+        anyhow::bail!(
+            "sync incomplete — {} contract scope(s) did not earn coverage; fix the cause and rerun `scopenode sync`",
+            report.incomplete.len()
+        );
+    }
 
     println!("sync complete — run `scopenode serve` to start JSON-RPC server");
     Ok(())

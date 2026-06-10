@@ -11,7 +11,8 @@ use scopenode_core::{
     abi_resolution::{AbiResolver, AbiStore},
     config::{Config, ContractConfig, NodeConfig},
     era_pipeline::{
-        run_era1_scope, run_era1_scopes, CoverageSink, EventSink, InMemoryEventSink, NullReporter,
+        run_era1_scope, run_era1_scopes, CoverageSink, EventSink, InMemoryEventSink,
+        IncompleteReason, NullReporter,
     },
     error::{AbiError, CoreError},
     source::Era1Source,
@@ -72,6 +73,35 @@ impl CoverageSink for FailingStoreSink {
             .await
             .push((contract.to_string(), from_block, to_block));
         Ok(())
+    }
+}
+
+/// Sink that persists events but fails to persist Coverage.
+#[derive(Default)]
+struct FailingCoverageSink {
+    events: Mutex<Vec<DecodedEvent>>,
+}
+
+#[async_trait]
+impl EventSink for FailingCoverageSink {
+    async fn store(&self, events: Vec<DecodedEvent>) -> Result<usize, CoreError> {
+        let count = events.len();
+        self.events.lock().await.extend(events);
+        Ok(count)
+    }
+}
+
+#[async_trait]
+impl CoverageSink for FailingCoverageSink {
+    async fn record_coverage(
+        &self,
+        _contract: &str,
+        _from_block: u64,
+        _to_block: u64,
+    ) -> Result<(), CoreError> {
+        Err(CoreError::Storage(
+            "synthetic coverage write failure".to_string(),
+        ))
     }
 }
 
@@ -590,6 +620,202 @@ async fn era1_pipeline_stores_events_but_withholds_coverage_when_decode_fails() 
     assert!(
         sink.covered_ranges().await.is_empty(),
         "decode failure must not record Coverage for the Contract scope"
+    );
+
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+    let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+}
+
+#[tokio::test]
+async fn era1_pipeline_report_distinguishes_complete_and_incomplete_runs() {
+    let contract = address!("dAC17F958D2ee523a2206206994597C13D831ec7");
+    let transfer_topic0 = keccak256(b"Transfer(address,address,uint256)");
+    let addr_str = contract.to_checksum(None);
+
+    // Clean run → complete report with the scope covered.
+    let dir = tempdir().unwrap();
+    let era1_path = dir.path().join("mainnet-00012-deadbeef.era1");
+    std::fs::write(&era1_path, build_synthetic_era1(contract, transfer_topic0)).unwrap();
+
+    let db_path = unique_db_path();
+    let db = Db::open(db_path.clone()).await.unwrap();
+    db.upsert_contract(&addr_str, Some("USDT"), &transfer_abi_json())
+        .await
+        .unwrap();
+
+    let source = Era1Source::scan(dir.path(), None, 100, 100).unwrap();
+    let config = test_config(contract);
+    let contract_cfg = &config.contracts[0];
+    let abi_resolver = AbiResolver::new(Arc::new(DbAbiStore(db.clone())), None);
+    let sink = InMemoryEventSink::default();
+
+    let report = run_era1_scope(&source, contract_cfg, &abi_resolver, &sink, &NullReporter)
+        .await
+        .unwrap();
+
+    assert!(report.is_complete(), "clean run must report complete");
+    assert_eq!(report.total_events, 1);
+    assert_eq!(report.covered, vec![addr_str.clone()]);
+    assert!(report.incomplete.is_empty());
+
+    // Corrupt receipts_root → incomplete report naming the scope and reason.
+    let log = PrimitiveLog {
+        address: contract,
+        data: LogData::new_unchecked(
+            vec![
+                transfer_topic0,
+                B256::from([0x11u8; 32]),
+                B256::from([0x22u8; 32]),
+            ],
+            Bytes::from(vec![0u8; 32]),
+        ),
+    };
+    std::fs::write(
+        &era1_path,
+        build_synthetic_era1_with_logs_and_root(
+            vec![log],
+            vec![
+                contract.as_slice().to_vec(),
+                transfer_topic0.as_slice().to_vec(),
+            ],
+            Some(B256::from([0xAA; 32])),
+        ),
+    )
+    .unwrap();
+    let source = Era1Source::scan(dir.path(), None, 100, 100).unwrap();
+    let sink = InMemoryEventSink::default();
+
+    let report = run_era1_scope(&source, contract_cfg, &abi_resolver, &sink, &NullReporter)
+        .await
+        .unwrap();
+
+    assert!(
+        !report.is_complete(),
+        "verification failure must report incomplete"
+    );
+    assert!(report.covered.is_empty());
+    assert_eq!(
+        report.incomplete,
+        vec![(addr_str.clone(), IncompleteReason::VerifyFailure)]
+    );
+
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+    let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+}
+
+#[tokio::test]
+async fn era1_pipeline_reports_coverage_write_failure_as_incomplete() {
+    let contract = address!("dAC17F958D2ee523a2206206994597C13D831ec7");
+    let transfer_topic0 = keccak256(b"Transfer(address,address,uint256)");
+    let addr_str = contract.to_checksum(None);
+
+    let dir = tempdir().unwrap();
+    let era1_path = dir.path().join("mainnet-00012-deadbeef.era1");
+    std::fs::write(&era1_path, build_synthetic_era1(contract, transfer_topic0)).unwrap();
+
+    let db_path = unique_db_path();
+    let db = Db::open(db_path.clone()).await.unwrap();
+    db.upsert_contract(&addr_str, Some("USDT"), &transfer_abi_json())
+        .await
+        .unwrap();
+
+    let source = Era1Source::scan(dir.path(), None, 100, 100).unwrap();
+    let config = test_config(contract);
+    let contract_cfg = &config.contracts[0];
+    let abi_resolver = AbiResolver::new(Arc::new(DbAbiStore(db.clone())), None);
+    let sink = FailingCoverageSink::default();
+
+    let report = run_era1_scope(&source, contract_cfg, &abi_resolver, &sink, &NullReporter)
+        .await
+        .unwrap();
+
+    assert!(
+        !report.is_complete(),
+        "a failed Coverage write must not be reported as an unqualified success"
+    );
+    assert_eq!(
+        report.incomplete,
+        vec![(addr_str.clone(), IncompleteReason::CoverageWriteFailed)]
+    );
+    assert_eq!(
+        sink.events.lock().await.len(),
+        1,
+        "events persisted before the Coverage write failure remain stored"
+    );
+
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+    let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+}
+
+#[tokio::test]
+async fn era1_pipeline_rerun_recovers_coverage_after_prior_verify_failure() {
+    let contract = address!("dAC17F958D2ee523a2206206994597C13D831ec7");
+    let transfer_topic0 = keccak256(b"Transfer(address,address,uint256)");
+    let addr_str = contract.to_checksum(None);
+
+    let dir = tempdir().unwrap();
+    let era1_path = dir.path().join("mainnet-00012-deadbeef.era1");
+
+    // First run: corrupt receipts_root → no Coverage.
+    let log = PrimitiveLog {
+        address: contract,
+        data: LogData::new_unchecked(
+            vec![
+                transfer_topic0,
+                B256::from([0x11u8; 32]),
+                B256::from([0x22u8; 32]),
+            ],
+            Bytes::from(vec![0u8; 32]),
+        ),
+    };
+    std::fs::write(
+        &era1_path,
+        build_synthetic_era1_with_logs_and_root(
+            vec![log],
+            vec![
+                contract.as_slice().to_vec(),
+                transfer_topic0.as_slice().to_vec(),
+            ],
+            Some(B256::from([0xAA; 32])),
+        ),
+    )
+    .unwrap();
+
+    let db_path = unique_db_path();
+    let db = Db::open(db_path.clone()).await.unwrap();
+    db.upsert_contract(&addr_str, Some("USDT"), &transfer_abi_json())
+        .await
+        .unwrap();
+
+    let config = test_config(contract);
+    let contract_cfg = &config.contracts[0];
+    let abi_resolver = AbiResolver::new(Arc::new(DbAbiStore(db.clone())), None);
+    let sink = InMemoryEventSink::default();
+
+    let source = Era1Source::scan(dir.path(), None, 100, 100).unwrap();
+    let report = run_era1_scope(&source, contract_cfg, &abi_resolver, &sink, &NullReporter)
+        .await
+        .unwrap();
+    assert!(!report.is_complete());
+    assert!(sink.covered_ranges().await.is_empty());
+
+    // Second run with repaired archive data: the scope recovers Coverage.
+    std::fs::write(&era1_path, build_synthetic_era1(contract, transfer_topic0)).unwrap();
+    let source = Era1Source::scan(dir.path(), None, 100, 100).unwrap();
+    let report = run_era1_scope(&source, contract_cfg, &abi_resolver, &sink, &NullReporter)
+        .await
+        .unwrap();
+
+    assert!(
+        report.is_complete(),
+        "a successful rerun must recover from a prior incomplete run"
+    );
+    assert_eq!(
+        sink.covered_ranges().await,
+        vec![(addr_str.clone(), 100, 100)]
     );
 
     let _ = std::fs::remove_file(&db_path);

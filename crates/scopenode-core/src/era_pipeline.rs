@@ -297,6 +297,56 @@ impl BlockPipeline {
     }
 }
 
+/// Why a Contract scope did not earn Coverage in a run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IncompleteReason {
+    /// An archive file could not be opened or a block could not be read.
+    SourceFailure,
+    /// Receipt verification failed for a block in the scope's range.
+    VerifyFailure,
+    /// One or more events fell back to raw data during decoding.
+    DecodeFailure,
+    /// The event sink failed to persist decoded events.
+    StoreFailure,
+    /// Coverage itself could not be persisted.
+    CoverageWriteFailed,
+}
+
+impl IncompleteReason {
+    /// Human-readable cause for operator-facing output.
+    pub fn describe(&self) -> &'static str {
+        match self {
+            Self::SourceFailure => "archive source read failure",
+            Self::VerifyFailure => "receipt verification failure",
+            Self::DecodeFailure => "event decode failure",
+            Self::StoreFailure => "event storage failure",
+            Self::CoverageWriteFailed => "coverage record failure",
+        }
+    }
+}
+
+/// Completion summary for one pipeline run.
+///
+/// Coverage is recorded per scope only when the scope completes without a
+/// read, verification, decode, or storage failure. `incomplete` names every
+/// scope that did not earn Coverage and why; a successful rerun recovers.
+#[derive(Debug)]
+pub struct SyncReport {
+    /// Events written to the sink across all scopes.
+    pub total_events: usize,
+    /// Contract addresses whose Coverage was recorded this run.
+    pub covered: Vec<String>,
+    /// Contract addresses that did not earn Coverage, with the reason.
+    pub incomplete: Vec<(String, IncompleteReason)>,
+}
+
+impl SyncReport {
+    /// True when every prepared scope earned Coverage.
+    pub fn is_complete(&self) -> bool {
+        self.incomplete.is_empty()
+    }
+}
+
 /// Run the ERA1 indexing pipeline for one contract scope.
 ///
 /// The source's manifest determines which files overlap
@@ -311,7 +361,7 @@ pub async fn run_era1_scope(
     abi_resolver: &AbiResolver,
     sink: &dyn PipelineSink,
     reporter: &dyn ProgressReporter,
-) -> Result<(), CoreError> {
+) -> Result<SyncReport, CoreError> {
     run_era1_scopes(
         source,
         std::slice::from_ref(contract),
@@ -333,7 +383,7 @@ pub async fn run_era1_scopes(
     abi_resolver: &AbiResolver,
     sink: &dyn PipelineSink,
     reporter: &dyn ProgressReporter,
-) -> Result<(), CoreError> {
+) -> Result<SyncReport, CoreError> {
     let mut scopes = Vec::new();
     for contract in contracts {
         match PreparedScope::new(contract, abi_resolver).await {
@@ -346,7 +396,11 @@ pub async fn run_era1_scopes(
     }
 
     if scopes.is_empty() {
-        return Ok(());
+        return Ok(SyncReport {
+            total_events: 0,
+            covered: vec![],
+            incomplete: vec![],
+        });
     }
 
     let ranges: Vec<(u64, u64)> = scopes.iter().map(|scope| (scope.from, scope.to)).collect();
@@ -360,8 +414,9 @@ pub async fn run_era1_scopes(
     let mut had_source_failure = false;
     let mut had_store_failure = false;
     // Scopes that saw an incomplete block (e.g. Receipt verification failure)
-    // and are therefore ineligible for Coverage this run.
-    let mut scope_ineligible = vec![false; pipeline.scopes.len()];
+    // and are therefore ineligible for Coverage this run. The first failure
+    // reason per scope is kept for the run report.
+    let mut scope_ineligible: Vec<Option<IncompleteReason>> = vec![None; pipeline.scopes.len()];
 
     for file in selected_files.files() {
         let facts_iter = match file.block_facts() {
@@ -386,17 +441,19 @@ pub async fn run_era1_scopes(
             reporter.inc();
 
             let block_number = facts.block_number;
-            let (block_events, block_incomplete) = match pipeline.process(&facts) {
-                BlockOutcome::OutsideRange | BlockOutcome::NoBloomMatch => (vec![], false),
-                BlockOutcome::Evaluated(events) => (events, false),
-                BlockOutcome::VerifyFailed => (vec![], true),
-                BlockOutcome::DecodeFailed(events) => (events, true),
+            let (block_events, block_failure) = match pipeline.process(&facts) {
+                BlockOutcome::OutsideRange | BlockOutcome::NoBloomMatch => (vec![], None),
+                BlockOutcome::Evaluated(events) => (events, None),
+                BlockOutcome::VerifyFailed => (vec![], Some(IncompleteReason::VerifyFailure)),
+                BlockOutcome::DecodeFailed(events) => {
+                    (events, Some(IncompleteReason::DecodeFailure))
+                }
             };
 
-            if block_incomplete {
+            if let Some(reason) = block_failure {
                 for (idx, scope) in pipeline.scopes.iter().enumerate() {
-                    if scope.contains_block(block_number) {
-                        scope_ineligible[idx] = true;
+                    if scope.contains_block(block_number) && scope_ineligible[idx].is_none() {
+                        scope_ineligible[idx] = Some(reason);
                     }
                 }
             }
@@ -413,28 +470,51 @@ pub async fn run_era1_scopes(
         }
     }
 
-    if had_source_failure || had_store_failure {
-        warn!("Skipping Coverage record because the ERA1 scope run did not complete cleanly");
+    let run_failure = if had_source_failure {
+        Some(IncompleteReason::SourceFailure)
+    } else if had_store_failure {
+        Some(IncompleteReason::StoreFailure)
     } else {
-        for (idx, scope) in pipeline.scopes.iter().enumerate() {
-            if scope_ineligible[idx] {
-                warn!(contract = %scope.contract, "Skipping Coverage record — scope saw incomplete blocks");
-                continue;
-            }
-            if let Err(e) = sink
-                .record_coverage(&scope.contract, scope.from, scope.to)
-                .await
-            {
+        None
+    };
+
+    let mut covered = Vec::new();
+    let mut incomplete = Vec::new();
+    for (idx, scope) in pipeline.scopes.iter().enumerate() {
+        if let Some(reason) = scope_ineligible[idx].or(run_failure) {
+            warn!(contract = %scope.contract, reason = reason.describe(), "Skipping Coverage record — scope run incomplete");
+            incomplete.push((scope.contract.clone(), reason));
+            continue;
+        }
+        match sink
+            .record_coverage(&scope.contract, scope.from, scope.to)
+            .await
+        {
+            Ok(()) => covered.push(scope.contract.clone()),
+            Err(e) => {
                 warn!(contract = %scope.contract, err = %e, "Coverage record failed");
+                incomplete.push((
+                    scope.contract.clone(),
+                    IncompleteReason::CoverageWriteFailed,
+                ));
             }
         }
     }
 
+    let status = if incomplete.is_empty() {
+        "done"
+    } else {
+        "incomplete"
+    };
     reporter.finish(&format!(
-        "done ({total_events} events across {})",
+        "{status} ({total_events} events across {})",
         scope_names.join(", ")
     ));
-    Ok(())
+    Ok(SyncReport {
+        total_events,
+        covered,
+        incomplete,
+    })
 }
 
 #[cfg(test)]
