@@ -238,7 +238,9 @@ impl Db {
     }
 
     /// Return all indexed contracts with their event count in one query.
-    pub async fn contracts_with_event_counts(&self) -> Result<Vec<(ContractRow, i64)>, DbError> {
+    pub(crate) async fn contracts_with_event_counts(
+        &self,
+    ) -> Result<Vec<(ContractRow, i64)>, DbError> {
         #[derive(sqlx::FromRow)]
         struct Row {
             address: String,
@@ -274,7 +276,7 @@ impl Db {
     }
 
     /// Count the number of indexed contracts.
-    pub async fn count_contracts(&self) -> Result<i64, DbError> {
+    pub(crate) async fn count_contracts(&self) -> Result<i64, DbError> {
         #[derive(sqlx::FromRow)]
         struct Row {
             count: i64,
@@ -346,7 +348,7 @@ impl Db {
     }
 
     /// Count all events across all contracts.
-    pub async fn count_all_events(&self) -> Result<i64, DbError> {
+    pub(crate) async fn count_all_events(&self) -> Result<i64, DbError> {
         #[derive(sqlx::FromRow)]
         struct Row {
             count: i64,

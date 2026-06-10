@@ -144,44 +144,37 @@ async fn get_events(
 async fn get_status(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<StatusResponse>, (axum::http::StatusCode, String)> {
-    let err = |e: scopenode_storage::error::DbError| {
-        (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-    };
-    let (block_number, contract_count, event_count) = tokio::try_join!(
-        async {
-            state
-                .db
-                .latest_block_number()
-                .await
-                .map(|n| n.unwrap_or(0))
-                .map_err(err)
-        },
-        async { state.db.count_contracts().await.map_err(err) },
-        async { state.db.count_all_events().await.map_err(err) },
-    )?;
+    // The storage status read module is the single source of indexed status
+    // facts; this adapter only projects them into the REST response shape.
+    let summary = state
+        .db
+        .status_summary()
+        .await
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(StatusResponse {
-        block_number,
-        contract_count: contract_count as usize,
-        event_count,
+        block_number: summary.latest_block.unwrap_or(0),
+        contract_count: summary.contract_count as usize,
+        event_count: summary.event_count,
     }))
 }
 
 async fn get_contracts(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<ContractsResponse>, (axum::http::StatusCode, String)> {
-    let rows = state
+    let summary = state
         .db
-        .contracts_with_event_counts()
+        .status_summary()
         .await
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let contracts = rows
+    let contracts = summary
+        .contracts
         .into_iter()
-        .map(|(row, event_count)| ContractResponse {
-            address: row.address,
-            name: row.name,
-            event_count,
+        .map(|contract| ContractResponse {
+            address: contract.address,
+            name: contract.name,
+            event_count: contract.total_events,
         })
         .collect();
 

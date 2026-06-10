@@ -212,6 +212,68 @@ async fn rest_flags_malformed_decoded_json_distinguishably_from_stored_null() {
     cleanup(&path);
 }
 
+async fn get_json(db: &Db, uri: &str) -> (axum::http::StatusCode, serde_json::Value) {
+    let router = build_rest_router(db.clone());
+    let request = axum::http::Request::builder()
+        .uri(uri)
+        .body(Body::empty())
+        .unwrap();
+    let response = ServiceExt::<axum::http::Request<Body>>::oneshot(router, request)
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+#[tokio::test]
+async fn rest_status_reports_storage_status_facts() {
+    let (db, path) = open_test_db().await;
+    seed(&db).await;
+
+    let (status, json) = get_json(&db, "/status").await;
+
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(json["block_number"].as_u64(), Some(102));
+    assert_eq!(json["contract_count"].as_u64(), Some(1));
+    assert_eq!(json["event_count"].as_i64(), Some(3));
+
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn rest_status_on_empty_database_reports_zeros() {
+    let (db, path) = open_test_db().await;
+
+    let (status, json) = get_json(&db, "/status").await;
+
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(json["block_number"].as_u64(), Some(0));
+    assert_eq!(json["contract_count"].as_u64(), Some(0));
+    assert_eq!(json["event_count"].as_i64(), Some(0));
+
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn rest_contracts_reports_per_contract_event_counts() {
+    let (db, path) = open_test_db().await;
+    seed(&db).await;
+
+    let (status, json) = get_json(&db, "/contracts").await;
+
+    assert_eq!(status, axum::http::StatusCode::OK);
+    let contracts = json["contracts"].as_array().unwrap();
+    assert_eq!(contracts.len(), 1);
+    assert_eq!(contracts[0]["address"].as_str(), Some(ADDR_STR));
+    assert_eq!(contracts[0]["name"].as_str(), Some("USDC"));
+    assert_eq!(contracts[0]["event_count"].as_i64(), Some(3));
+
+    cleanup(&path);
+}
+
 async fn get_rpc_rows(db: &Db, topic0: Option<&str>) -> Vec<Row> {
     let api = EthApiImpl::new(db.clone());
 
