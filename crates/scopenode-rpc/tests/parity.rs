@@ -113,6 +113,105 @@ async fn parity_topic0_filter() {
     cleanup(&path);
 }
 
+#[tokio::test]
+async fn rpc_fails_explicitly_on_unprojectable_row() {
+    let (db, path) = open_test_db().await;
+    db.upsert_contract(ADDR_STR, Some("USDC"), "[]")
+        .await
+        .unwrap();
+    let mut bad = make_row(100, 0, TOPIC0_TRANSFER);
+    bad.tx_hash = "not_a_hash".into();
+    db.insert_events(&[bad]).await.unwrap();
+
+    let api = EthApiImpl::new(db.clone());
+    let err = EthApiServer::get_logs(&api, Filter::new().address(ADDR))
+        .await
+        .expect_err("an unprojectable stored row must fail the request, not be dropped");
+
+    assert_eq!(err.code(), -32006);
+    assert!(
+        err.message().contains("block 100") && err.message().contains("log 0"),
+        "error must name the offending row, got: {}",
+        err.message()
+    );
+
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn rpc_fails_explicitly_on_lossy_raw_data_row() {
+    let (db, path) = open_test_db().await;
+    db.upsert_contract(ADDR_STR, Some("USDC"), "[]")
+        .await
+        .unwrap();
+    let mut lossy = make_row(100, 0, TOPIC0_TRANSFER);
+    lossy.raw_data = "not_hex!!!".into();
+    db.insert_events(&[lossy]).await.unwrap();
+
+    let api = EthApiImpl::new(db.clone());
+    let err = EthApiServer::get_logs(&api, Filter::new().address(ADDR))
+        .await
+        .expect_err("a lossy row must not be served as fully valid log data");
+
+    assert_eq!(err.code(), -32006);
+
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn rest_flags_malformed_decoded_json_distinguishably_from_stored_null() {
+    let (db, path) = open_test_db().await;
+    db.upsert_contract(ADDR_STR, Some("USDC"), "[]")
+        .await
+        .unwrap();
+    let mut malformed = make_row(100, 0, TOPIC0_TRANSFER);
+    malformed.decoded = "not valid json".into();
+    let mut stored_null = make_row(101, 1, TOPIC0_TRANSFER);
+    stored_null.decoded = "null".into();
+    db.insert_events(&[malformed, stored_null]).await.unwrap();
+
+    let router = build_rest_router(db.clone());
+    let request = axum::http::Request::builder()
+        .uri(format!("/events?contract={ADDR_STR}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = ServiceExt::<axum::http::Request<Body>>::oneshot(router, request)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let events = json["events"].as_array().unwrap();
+    assert_eq!(events.len(), 2, "REST returns every row");
+
+    let by_block = |n: i64| {
+        events
+            .iter()
+            .find(|ev| ev["block_number"].as_i64() == Some(n))
+            .unwrap()
+    };
+
+    let flagged = by_block(100);
+    assert!(flagged["decoded"].is_null());
+    assert_eq!(flagged["decode_quality"]["quality"].as_str(), Some("lossy"));
+    assert!(flagged["decode_quality"]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("decoded JSON"));
+
+    let unflagged = by_block(101);
+    assert!(unflagged["decoded"].is_null());
+    assert!(
+        unflagged.get("decode_quality").is_none(),
+        "a stored JSON null is valid and must not be flagged"
+    );
+
+    cleanup(&path);
+}
+
 async fn get_rpc_rows(db: &Db, topic0: Option<&str>) -> Vec<Row> {
     let api = EthApiImpl::new(db.clone());
 

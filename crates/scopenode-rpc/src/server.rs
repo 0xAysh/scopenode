@@ -5,6 +5,13 @@
 //! - `eth_blockNumber` — highest indexed block
 //! - `eth_chainId` — always `0x1` (Ethereum mainnet)
 //! - `net_peerCount` — always `"0x0"` (ERA1-only; no live peers)
+//!
+//! # Malformed stored rows
+//!
+//! `eth_getLogs` has no per-row quality channel, so a stored row whose
+//! Projection is `Lossy` or `Invalid` fails the whole request with error
+//! `-32006`, naming the offending block and log index. Rows are never
+//! silently dropped or served with fallback data.
 
 use crate::filter_plan::FilterPlan;
 use crate::query_front_door::{
@@ -77,10 +84,19 @@ impl EthApiServer for EthApiImpl {
                 Err(ErrorObject::owned(-32005, RESULT_CAP_MESSAGE, None::<()>))
             }
             EventQueryResponse::Empty => Ok(vec![]),
-            EventQueryResponse::Results(rows) => Ok(rows
-                .iter()
-                .filter_map(crate::projection::project_log)
-                .collect()),
+            EventQueryResponse::Results(rows) => {
+                let mut logs = Vec::with_capacity(rows.len());
+                for row in &rows {
+                    match crate::projection::project_row(row).log {
+                        crate::projection::LogProjection::Valid(log) => logs.push(*log),
+                        crate::projection::LogProjection::Lossy { reason, .. }
+                        | crate::projection::LogProjection::Invalid { reason } => {
+                            return Err(projection_error(row, &reason));
+                        }
+                    }
+                }
+                Ok(logs)
+            }
         }
     }
 
@@ -110,12 +126,26 @@ fn internal_error(msg: &str) -> ErrorObject<'static> {
     ErrorObject::owned(-32603, format!("Internal error: {msg}"), None::<()>)
 }
 
+fn projection_error(
+    row: &scopenode_storage::models::StoredEvent,
+    reason: &str,
+) -> ErrorObject<'static> {
+    ErrorObject::owned(
+        -32006,
+        format!(
+            "stored event failed projection (block {}, log {}): {reason} — local data may be corrupt; resync this range",
+            row.block_number, row.log_index
+        ),
+        None::<()>,
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::projection::project_log;
+    use crate::projection::{project_row, LogProjection};
 
     #[test]
-    fn project_log_parses_valid_row() {
+    fn projection_yields_valid_log_for_valid_row() {
         let row = scopenode_storage::models::StoredEvent {
             contract: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".into(),
             event_name: "Transfer".into(),
@@ -132,7 +162,10 @@ mod tests {
             source: "era1".into(),
             timestamp: 0,
         };
-        let log = project_log(&row).unwrap();
+        let log = match project_row(&row).log {
+            LogProjection::Valid(log) => log,
+            other => panic!("expected Valid projection, got {other:?}"),
+        };
         assert_eq!(log.block_number, Some(100));
         assert!(!log.removed);
     }

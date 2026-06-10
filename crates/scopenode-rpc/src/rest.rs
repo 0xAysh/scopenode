@@ -16,6 +16,13 @@
 //! GET /contracts         — indexed contracts with per-contract event counts
 //! GET /abi/:address      — raw ABI JSON for a contract
 //! ```
+//!
+//! # Malformed stored rows
+//!
+//! `GET /events` returns every stored row. A row whose Projection degraded
+//! carries a `decode_quality` object (`{"quality": "lossy"|"invalid",
+//! "reason": …}`); in particular, a `decoded: null` produced by a JSON parse
+//! fallback is flagged, while a stored JSON `null` is not.
 
 use std::sync::Arc;
 
@@ -30,7 +37,7 @@ use tower_http::cors::CorsLayer;
 use tracing::info;
 
 use crate::filter_plan::FilterPlan;
-use crate::projection::{project_rest_event, EventResponse};
+use crate::projection::{project_row, EventResponse};
 use crate::query_front_door::{
     execute_event_query, EventQueryFrontDoorError, EventQueryResponse, MISSING_COVERAGE_MESSAGE,
     RESULT_CAP_MESSAGE,
@@ -124,7 +131,10 @@ async fn get_events(
             count: 0,
         })),
         EventQueryResponse::Results(rows) => {
-            let events: Vec<EventResponse> = rows.iter().map(project_rest_event).collect();
+            // Every row is returned; degraded rows carry an explicit
+            // `decode_quality` field instead of a silent fallback.
+            let events: Vec<EventResponse> =
+                rows.iter().map(|row| project_row(row).event).collect();
             let count = events.len();
             Ok(Json(EventsResponse { events, count }))
         }

@@ -85,5 +85,8 @@ event responses.
 
 **Decode quality** — `Valid`, `Lossy`, or `Invalid` quality attached to parsing
 and projection fallbacks so malformed stored data is not silently treated as
-fully valid.
+fully valid. Projection classifies every stored row once; adapters map the
+outcome. JSON-RPC fails the request on a `Lossy` or `Invalid` row (no quality
+channel in `eth_getLogs`); REST returns every row and flags degraded ones with
+a `decode_quality` field.
 
