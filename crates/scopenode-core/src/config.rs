@@ -60,7 +60,7 @@ pub struct NodeConfig {
 }
 
 /// Configuration for a single contract to sync.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContractConfig {
     /// Optional human-readable label shown in progress output.

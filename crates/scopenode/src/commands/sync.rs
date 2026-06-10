@@ -94,17 +94,10 @@ pub async fn run(config: Config, db: Db, dry_run: bool, quiet: bool) -> Result<(
 
     let abi_resolver = AbiResolver::new(Arc::new(DbAbiStore(db.clone())), Some(sourcify));
     let sink = scopenode_storage::DbEventSink::new(db);
-    let pipeline_contracts = plan.pipeline_contracts();
 
-    let report = run_era1_scopes(
-        &source,
-        &pipeline_contracts,
-        &abi_resolver,
-        &sink,
-        &reporter,
-    )
-    .await
-    .context("ERA1 sync failed")?;
+    let report = run_era1_scopes(&source, &plan.contracts, &abi_resolver, &sink, &reporter)
+        .await
+        .context("ERA1 sync failed")?;
 
     if !report.is_complete() {
         for (contract, reason) in &report.incomplete {

@@ -1,52 +1,29 @@
-use alloy_primitives::Address;
 use scopenode_core::config::{Config, ContractConfig};
 use std::fmt::Write as _;
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
 
+/// Planning facts for one sync run: the normalized Archive source path, the
+/// immutable Contract scopes exactly as configured, and the Union range.
+///
+/// The configured `ContractConfig` values are passed forward untouched — ABI
+/// resolution and the pipeline consume the same Contract scopes the operator
+/// wrote, with no intermediate copy to drift out of sync.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SyncPlan {
     pub(crate) era_dir: PathBuf,
-    pub(crate) contracts: Vec<ContractScopePlan>,
+    pub(crate) contracts: Vec<ContractConfig>,
     pub(crate) block_range: RangeInclusive<u64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ContractScopePlan {
-    pub(crate) address: Address,
-    pub(crate) name: Option<String>,
-    pub(crate) events: Vec<String>,
-    pub(crate) block_range: RangeInclusive<u64>,
-    pub(crate) abi_override: Option<PathBuf>,
-    pub(crate) impl_address: Option<Address>,
 }
 
 impl SyncPlan {
     pub(crate) fn from_config(config: &Config) -> Self {
-        let contracts: Vec<_> = config
-            .contracts
-            .iter()
-            .map(|contract| ContractScopePlan {
-                address: contract.address,
-                name: contract.name.clone(),
-                events: contract.events.clone(),
-                block_range: contract.from_block
-                    ..=contract
-                        .to_block
-                        .expect("validated config requires to_block for ERA1 sync"),
-                abi_override: contract.abi_override.clone(),
-                impl_address: contract.impl_address,
-            })
-            .collect();
+        let contracts = config.contracts.clone();
 
-        let union_from = contracts
-            .iter()
-            .map(|contract| *contract.block_range.start())
-            .min()
-            .unwrap_or(0);
+        let union_from = contracts.iter().map(|c| c.from_block).min().unwrap_or(0);
         let union_to = contracts
             .iter()
-            .map(|contract| *contract.block_range.end())
+            .filter_map(|c| c.to_block)
             .max()
             .unwrap_or(u64::MAX);
 
@@ -65,6 +42,10 @@ impl SyncPlan {
         writeln!(output, "Contracts to sync:").expect("writing to a String cannot fail");
 
         for contract in &self.contracts {
+            let to_block = contract
+                .to_block
+                .map(|b| b.to_string())
+                .unwrap_or_else(|| "?".to_string());
             writeln!(
                 output,
                 "  {} blocks {}-{}",
@@ -72,28 +53,13 @@ impl SyncPlan {
                     .name
                     .as_deref()
                     .unwrap_or(&contract.address.to_string()),
-                contract.block_range.start(),
-                contract.block_range.end()
+                contract.from_block,
+                to_block
             )
             .expect("writing to a String cannot fail");
         }
 
         output
-    }
-
-    pub(crate) fn pipeline_contracts(&self) -> Vec<ContractConfig> {
-        self.contracts
-            .iter()
-            .map(|contract| ContractConfig {
-                name: contract.name.clone(),
-                address: contract.address,
-                events: contract.events.clone(),
-                from_block: *contract.block_range.start(),
-                to_block: Some(*contract.block_range.end()),
-                abi_override: contract.abi_override.clone(),
-                impl_address: contract.impl_address,
-            })
-            .collect()
     }
 }
 
@@ -135,44 +101,24 @@ mod tests {
     }
 
     #[test]
-    fn plans_single_contract_from_config() {
+    fn plan_passes_contract_scopes_through_unchanged() {
         let address = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
-        let cfg = config(
+        let impl_address = address!("dAC17F958D2ee523a2206206994597C13D831ec7");
+        let mut cfg = config(
             "/tmp/era1",
             vec![contract(address, Some("USDC"), &["Transfer"], 100, 200)],
         );
+        cfg.contracts[0].abi_override = Some(PathBuf::from("./abis/usdc.json"));
+        cfg.contracts[0].impl_address = Some(impl_address);
 
         let plan = SyncPlan::from_config(&cfg);
 
+        assert_eq!(
+            plan.contracts, cfg.contracts,
+            "planned Contract scopes are the configured scopes — no copy, no rebuild"
+        );
         assert_eq!(plan.era_dir, PathBuf::from("/tmp/era1"));
         assert_eq!(plan.block_range, 100..=200);
-        assert_eq!(plan.contracts.len(), 1);
-        assert_eq!(plan.contracts[0].address, address);
-        assert_eq!(plan.contracts[0].name.as_deref(), Some("USDC"));
-        assert_eq!(plan.contracts[0].events, vec!["Transfer"]);
-        assert_eq!(plan.contracts[0].block_range, 100..=200);
-    }
-
-    #[test]
-    fn plans_multiple_contracts_from_config() {
-        let usdc = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
-        let dai = address!("6B175474E89094C44Da98b954EedeAC495271d0F");
-        let cfg = config(
-            "/tmp/era1",
-            vec![
-                contract(usdc, Some("USDC"), &["Transfer", "Approval"], 100, 200),
-                contract(dai, Some("DAI"), &["Transfer"], 300, 400),
-            ],
-        );
-
-        let plan = SyncPlan::from_config(&cfg);
-
-        assert_eq!(plan.contracts.len(), 2);
-        assert_eq!(plan.contracts[0].address, usdc);
-        assert_eq!(plan.contracts[0].events, vec!["Transfer", "Approval"]);
-        assert_eq!(plan.contracts[1].address, dai);
-        assert_eq!(plan.contracts[1].name.as_deref(), Some("DAI"));
-        assert_eq!(plan.contracts[1].block_range, 300..=400);
     }
 
     #[test]
@@ -230,58 +176,17 @@ mod tests {
     }
 
     #[test]
-    fn preserves_missing_contract_display_name() {
-        let address = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
-        let cfg = config(
-            "/tmp/era1",
-            vec![contract(address, None, &["Transfer"], 1, 2)],
-        );
-
-        let plan = SyncPlan::from_config(&cfg);
-
-        assert_eq!(plan.contracts[0].name, None);
-    }
-
-    #[test]
-    fn exposes_pipeline_contracts_without_losing_scope_preparation_fields() {
-        let address = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
-        let impl_address = address!("dAC17F958D2ee523a2206206994597C13D831ec7");
-        let mut cfg = config(
-            "/tmp/era1",
-            vec![contract(address, Some("USDC"), &["Transfer"], 100, 200)],
-        );
-        cfg.contracts[0].abi_override = Some(PathBuf::from("./abis/usdc.json"));
-        cfg.contracts[0].impl_address = Some(impl_address);
-        let plan = SyncPlan::from_config(&cfg);
-
-        let pipeline_contracts = plan.pipeline_contracts();
-
-        assert_eq!(pipeline_contracts.len(), 1);
-        assert_eq!(pipeline_contracts[0].address, address);
-        assert_eq!(pipeline_contracts[0].name.as_deref(), Some("USDC"));
-        assert_eq!(pipeline_contracts[0].events, vec!["Transfer"]);
-        assert_eq!(pipeline_contracts[0].from_block, 100);
-        assert_eq!(pipeline_contracts[0].to_block, Some(200));
-        assert_eq!(
-            pipeline_contracts[0].abi_override,
-            Some(PathBuf::from("./abis/usdc.json"))
-        );
-        assert_eq!(pipeline_contracts[0].impl_address, Some(impl_address));
-    }
-
-    #[test]
     fn renders_dry_run_from_plan_facts() {
         let address = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
         let plan = SyncPlan {
             era_dir: PathBuf::from("/planned/era1"),
-            contracts: vec![crate::sync_plan::ContractScopePlan {
+            contracts: vec![contract(
                 address,
-                name: Some("PlannedUSDC".to_owned()),
-                events: vec!["Transfer".to_owned()],
-                block_range: 123..=456,
-                abi_override: None,
-                impl_address: None,
-            }],
+                Some("PlannedUSDC"),
+                &["Transfer"],
+                123,
+                456,
+            )],
             block_range: 100..=500,
         };
 
@@ -296,14 +201,7 @@ mod tests {
         let address = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
         let plan = SyncPlan {
             era_dir: PathBuf::from("/planned/era1"),
-            contracts: vec![crate::sync_plan::ContractScopePlan {
-                address,
-                name: None,
-                events: vec!["Transfer".to_owned()],
-                block_range: 123..=456,
-                abi_override: None,
-                impl_address: None,
-            }],
+            contracts: vec![contract(address, None, &["Transfer"], 123, 456)],
             block_range: 123..=456,
         };
 
