@@ -28,13 +28,15 @@ main.rs
   → cli.rs
   → commands/sync.rs
   → RuntimeContext::load
-  → SyncPlan::from_config
+  → SyncPlan::from_config          (normalized path, Union range, configured Contract scopes)
   → Era1Source::scan
   → AbiResolver::resolve_events
   → run_era1_scopes
-  → BlockPipeline::process_block
+  → BlockFactStream                (Archive source traversal: file lifecycle + format dispatch)
+  → BlockPipeline::process         (BlockOutcome: valid emptiness vs verify/decode failure)
   → DbEventSink
-  → SQLite
+  → SQLite events + Coverage
+  → SyncReport                     (complete vs incomplete, per-scope reasons)
 ```
 
 ### Read path
@@ -45,9 +47,12 @@ JSON-RPC filter or REST query
   → execute_event_query
   → Db::query_events
   → EventQueryOutcome
-  → projection
-  → transport response
+  → projection (project_row: one pass, Decode quality classified)
+  → transport response (JSON-RPC fails on degraded rows; REST flags them)
 ```
+
+Status reads have one owner: `Db::status_summary` in `scopenode-storage` feeds
+both `scopenode status` and the REST `/status` + `/contracts` endpoints.
 
 If you can explain those two flows without looking at the diagram, you understand
 the architecture well enough to begin making local changes.
