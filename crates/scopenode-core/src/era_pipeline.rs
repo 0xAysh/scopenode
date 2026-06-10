@@ -216,6 +216,10 @@ enum BlockOutcome {
     /// Receipt verification failed — the block is incomplete and every
     /// affected Contract scope is ineligible for Coverage.
     VerifyFailed,
+    /// Receipts verified, but one or more events could not be fully decoded.
+    /// The lossy events are still storable (raw topics and data preserved),
+    /// but every affected Contract scope is ineligible for Coverage.
+    DecodeFailed(Vec<DecodedEvent>),
 }
 
 /// Encapsulates all per-block processing for the ERA1 pipeline.
@@ -281,6 +285,13 @@ impl BlockPipeline {
                 facts.header.timestamp,
                 "era1",
             ));
+        }
+        if events.iter().any(DecodedEvent::has_decode_error) {
+            warn!(
+                block = facts.header.number,
+                "Event decode fell back to raw data — block incomplete"
+            );
+            return BlockOutcome::DecodeFailed(events);
         }
         BlockOutcome::Evaluated(events)
     }
@@ -375,24 +386,27 @@ pub async fn run_era1_scopes(
             reporter.inc();
 
             let block_number = facts.block_number;
-            match pipeline.process(&facts) {
-                BlockOutcome::OutsideRange | BlockOutcome::NoBloomMatch => {}
-                BlockOutcome::Evaluated(block_events) => {
-                    if !block_events.is_empty() {
-                        match sink.store(block_events).await {
-                            Ok(n) => total_events += n,
-                            Err(e) => {
-                                had_store_failure = true;
-                                warn!(block = block_number, err = %e, "Event insert failed");
-                            }
-                        }
+            let (block_events, block_incomplete) = match pipeline.process(&facts) {
+                BlockOutcome::OutsideRange | BlockOutcome::NoBloomMatch => (vec![], false),
+                BlockOutcome::Evaluated(events) => (events, false),
+                BlockOutcome::VerifyFailed => (vec![], true),
+                BlockOutcome::DecodeFailed(events) => (events, true),
+            };
+
+            if block_incomplete {
+                for (idx, scope) in pipeline.scopes.iter().enumerate() {
+                    if scope.contains_block(block_number) {
+                        scope_ineligible[idx] = true;
                     }
                 }
-                BlockOutcome::VerifyFailed => {
-                    for (idx, scope) in pipeline.scopes.iter().enumerate() {
-                        if scope.contains_block(block_number) {
-                            scope_ineligible[idx] = true;
-                        }
+            }
+
+            if !block_events.is_empty() {
+                match sink.store(block_events).await {
+                    Ok(n) => total_events += n,
+                    Err(e) => {
+                        had_store_failure = true;
+                        warn!(block = block_number, err = %e, "Event insert failed");
                     }
                 }
             }
@@ -637,6 +651,74 @@ mod tests {
         assert!(matches!(
             pipeline.process(&facts),
             BlockOutcome::VerifyFailed
+        ));
+    }
+
+    #[test]
+    fn decode_fallback_is_decode_failed_not_clean_evaluation() {
+        use crate::abi::EventInput;
+        use alloy_consensus::{Eip658Value, Receipt, ReceiptWithBloom};
+        use alloy_primitives::{Bytes, Log as PrimitiveLog, LogData};
+
+        let addr = Address::repeat_byte(0xAB);
+        let input = |name: &str, ty: &str, indexed: bool| EventInput {
+            name: name.to_string(),
+            ty: ty.to_string(),
+            indexed,
+            components: vec![],
+        };
+        let transfer = EventAbi {
+            name: "Transfer".to_string(),
+            inputs: vec![
+                input("from", "address", true),
+                input("to", "address", true),
+                input("value", "uint256", false),
+            ],
+        };
+        let topic0 = transfer.topic0();
+        let scope = PreparedScope {
+            contract: addr.to_checksum(None),
+            name: "test".to_string(),
+            from: 100,
+            to: 200,
+            scanner: BloomScanner::new(&[topic0], addr),
+            decoder: EventDecoder::new(&[transfer], addr).unwrap(),
+        };
+        let pipeline = BlockPipeline::with_verifier(vec![scope], Box::new(NoopVerifier));
+
+        let mut bloom = Bloom::default();
+        bloom.accrue(BloomInput::Raw(addr.as_slice()));
+        bloom.accrue(BloomInput::Raw(topic0.as_slice()));
+
+        // 3 bytes of data cannot decode as the ABI's non-indexed uint256.
+        let log = PrimitiveLog {
+            address: addr,
+            data: LogData::new_unchecked(
+                vec![topic0, B256::from([0x11; 32]), B256::from([0x22; 32])],
+                Bytes::from(vec![0xDE, 0xAD, 0xBE]),
+            ),
+        };
+        let receipt = ReceiptEnvelope::Legacy(ReceiptWithBloom::<Receipt<PrimitiveLog>> {
+            receipt: Receipt {
+                status: Eip658Value::Eip658(true),
+                cumulative_gas_used: 21_000,
+                logs: vec![log],
+            },
+            logs_bloom: Bloom::default(),
+        });
+
+        let facts = Era1BlockFacts {
+            header: ScopeHeader {
+                logs_bloom: bloom,
+                ..empty_facts(150).header
+            },
+            receipts: vec![receipt],
+            ..empty_facts(150)
+        };
+        assert!(matches!(
+            pipeline.process(&facts),
+            BlockOutcome::DecodeFailed(events)
+                if events.len() == 1 && events[0].has_decode_error()
         ));
     }
 

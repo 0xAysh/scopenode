@@ -533,6 +533,71 @@ async fn era1_pipeline_does_not_record_coverage_when_receipt_verification_fails(
 }
 
 #[tokio::test]
+async fn era1_pipeline_stores_events_but_withholds_coverage_when_decode_fails() {
+    let contract = address!("dAC17F958D2ee523a2206206994597C13D831ec7");
+    let transfer_topic0 = keccak256(b"Transfer(address,address,uint256)");
+
+    // Receipts are internally consistent (verification passes), but the log
+    // data is 3 bytes — it cannot decode as the ABI's non-indexed uint256.
+    let log = PrimitiveLog {
+        address: contract,
+        data: LogData::new_unchecked(
+            vec![
+                transfer_topic0,
+                B256::from([0x11u8; 32]),
+                B256::from([0x22u8; 32]),
+            ],
+            Bytes::from(vec![0xDE, 0xAD, 0xBE]),
+        ),
+    };
+    let era1_bytes = build_synthetic_era1_with_logs(
+        vec![log],
+        vec![
+            contract.as_slice().to_vec(),
+            transfer_topic0.as_slice().to_vec(),
+        ],
+    );
+
+    let dir = tempdir().unwrap();
+    let era1_path = dir.path().join("mainnet-00012-deadbeef.era1");
+    std::fs::write(&era1_path, &era1_bytes).unwrap();
+
+    let db_path = unique_db_path();
+    let db = Db::open(db_path.clone()).await.unwrap();
+    let addr_str = contract.to_checksum(None);
+    db.upsert_contract(&addr_str, Some("USDT"), &transfer_abi_json())
+        .await
+        .unwrap();
+
+    let source = Era1Source::scan(dir.path(), None, 100, 100).unwrap();
+    let config = test_config(contract);
+    let contract_cfg = &config.contracts[0];
+    let abi_resolver = AbiResolver::new(Arc::new(DbAbiStore(db.clone())), None);
+    let sink = InMemoryEventSink::default();
+
+    run_era1_scope(&source, contract_cfg, &abi_resolver, &sink, &NullReporter)
+        .await
+        .unwrap();
+
+    // The lossy event is still stored — raw topics and data are preserved.
+    let events = sink.events().await;
+    assert_eq!(events.len(), 1, "lossy decoded event must still be stored");
+    assert!(
+        events[0].decoded.get("_decode_error").is_some(),
+        "stored event must carry its decode error marker"
+    );
+    // But the Contract scope must not earn Coverage for the attempted range.
+    assert!(
+        sink.covered_ranges().await.is_empty(),
+        "decode failure must not record Coverage for the Contract scope"
+    );
+
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+    let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+}
+
+#[tokio::test]
 async fn era1_pipeline_indexes_multiple_contracts_in_one_scope_pass() {
     let first = address!("dAC17F958D2ee523a2206206994597C13D831ec7");
     let second = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");

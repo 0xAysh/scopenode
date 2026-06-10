@@ -85,6 +85,17 @@ pub struct DecodedEvent {
     pub timestamp: u64,
 }
 
+/// Key inserted into `decoded` JSON when non-indexed params fail to decode.
+const DECODE_ERROR_KEY: &str = "_decode_error";
+
+impl DecodedEvent {
+    /// True when decoding fell back to raw data: the `decoded` JSON carries a
+    /// `_decode_error` marker instead of fully decoded non-indexed fields.
+    pub fn has_decode_error(&self) -> bool {
+        self.decoded.get(DECODE_ERROR_KEY).is_some()
+    }
+}
+
 /// Block and transaction identity for one raw log.
 #[derive(Debug, Clone, Copy)]
 pub struct LogContext<'a> {
@@ -266,7 +277,7 @@ impl EventDecoder {
                     }
                     Err(e) => {
                         warn!(event = %event.name, err = %e, "Failed to decode non-indexed params");
-                        obj.insert("_decode_error".to_string(), Value::String(e.to_string()));
+                        obj.insert(DECODE_ERROR_KEY.to_string(), Value::String(e.to_string()));
                         obj.insert(
                             "_raw_data".to_string(),
                             Value::String(alloy_primitives::hex::encode(data)),
