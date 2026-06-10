@@ -11,7 +11,7 @@ use crate::era1_reader::Era1BlockFacts;
 use crate::error::{CoreError, VerifyError};
 use crate::headers::BloomScanner;
 use crate::receipts::verify_era1_receipts;
-use crate::source::Era1Source;
+use crate::source::{Era1Source, SourceError};
 use alloy_consensus::ReceiptEnvelope;
 use alloy_primitives::{Log as PrimitiveLog, B256};
 use async_trait::async_trait;
@@ -372,6 +372,20 @@ pub async fn run_era1_scope(
     .await
 }
 
+/// Selected Block facts ready for one pipeline run — the Archive source's
+/// traversal product.
+///
+/// The production adapter is `Era1BlockFactSelection`: it owns file selection,
+/// file lifecycle, and `.era1`/`.ere` format dispatch. Tests substitute an
+/// in-memory stream so pipeline failure paths need no real archive files.
+pub trait BlockFactStream {
+    /// Total blocks the stream will attempt, for progress reporting.
+    fn total_blocks(&self) -> u64;
+    /// Stream every Block fact across all selected files in order. Errors
+    /// carry file path context; traversal continues after a failed file.
+    fn blocks(&self) -> Box<dyn Iterator<Item = Result<Era1BlockFacts, SourceError>> + '_>;
+}
+
 /// Run the ERA1 indexing pipeline for all configured contract scopes in one pass.
 ///
 /// Files are scanned once. For each block, the header is decoded once, bloom
@@ -384,6 +398,47 @@ pub async fn run_era1_scopes(
     sink: &dyn PipelineSink,
     reporter: &dyn ProgressReporter,
 ) -> Result<SyncReport, CoreError> {
+    let scopes = prepare_scopes(contracts, abi_resolver).await?;
+    if scopes.is_empty() {
+        return Ok(SyncReport {
+            total_events: 0,
+            covered: vec![],
+            incomplete: vec![],
+        });
+    }
+
+    let ranges: Vec<(u64, u64)> = scopes.iter().map(|scope| (scope.from, scope.to)).collect();
+    let selection = source.block_facts_for_ranges(&ranges);
+    run_prepared_scopes(scopes, &selection, sink, reporter).await
+}
+
+/// Run the indexing pipeline over an already-selected Block fact stream.
+///
+/// This is the Archive source seam: production callers go through
+/// [`run_era1_scopes`], which selects files from an [`Era1Source`]; tests
+/// drive the same pipeline with an in-memory [`BlockFactStream`] adapter.
+pub async fn run_scopes_over_blocks(
+    blocks: &dyn BlockFactStream,
+    contracts: &[ContractConfig],
+    abi_resolver: &AbiResolver,
+    sink: &dyn PipelineSink,
+    reporter: &dyn ProgressReporter,
+) -> Result<SyncReport, CoreError> {
+    let scopes = prepare_scopes(contracts, abi_resolver).await?;
+    if scopes.is_empty() {
+        return Ok(SyncReport {
+            total_events: 0,
+            covered: vec![],
+            incomplete: vec![],
+        });
+    }
+    run_prepared_scopes(scopes, blocks, sink, reporter).await
+}
+
+async fn prepare_scopes(
+    contracts: &[ContractConfig],
+    abi_resolver: &AbiResolver,
+) -> Result<Vec<PreparedScope>, CoreError> {
     let mut scopes = Vec::new();
     for contract in contracts {
         match PreparedScope::new(contract, abi_resolver).await {
@@ -394,19 +449,16 @@ pub async fn run_era1_scopes(
             }
         }
     }
+    Ok(scopes)
+}
 
-    if scopes.is_empty() {
-        return Ok(SyncReport {
-            total_events: 0,
-            covered: vec![],
-            incomplete: vec![],
-        });
-    }
-
-    let ranges: Vec<(u64, u64)> = scopes.iter().map(|scope| (scope.from, scope.to)).collect();
-    let selected_files = source.block_facts_for_ranges(&ranges);
-
-    reporter.set_total(selected_files.total_blocks().max(1));
+async fn run_prepared_scopes(
+    scopes: Vec<PreparedScope>,
+    blocks: &dyn BlockFactStream,
+    sink: &dyn PipelineSink,
+    reporter: &dyn ProgressReporter,
+) -> Result<SyncReport, CoreError> {
+    reporter.set_total(blocks.total_blocks().max(1));
 
     let scope_names: Vec<String> = scopes.iter().map(|s| s.name.clone()).collect();
     let pipeline = BlockPipeline::new(scopes);
@@ -418,53 +470,40 @@ pub async fn run_era1_scopes(
     // reason per scope is kept for the run report.
     let mut scope_ineligible: Vec<Option<IncompleteReason>> = vec![None; pipeline.scopes.len()];
 
-    for file in selected_files.files() {
-        let facts_iter = match file.block_facts() {
-            Ok(it) => it,
+    for item in blocks.blocks() {
+        let facts = match item {
+            Ok(f) => f,
             Err(e) => {
                 had_source_failure = true;
-                warn!(path = %file.path().display(), err = %e, "Failed to open ERA1 file — skipping");
+                warn!(err = %e, "Archive source read error — skipping");
                 continue;
             }
         };
 
-        for facts_result in facts_iter {
-            let facts = match facts_result {
-                Ok(f) => f,
-                Err(e) => {
-                    had_source_failure = true;
-                    warn!(err = %e, "ERA1 read error — skipping block");
-                    continue;
-                }
-            };
+        reporter.inc();
 
-            reporter.inc();
+        let block_number = facts.block_number;
+        let (block_events, block_failure) = match pipeline.process(&facts) {
+            BlockOutcome::OutsideRange | BlockOutcome::NoBloomMatch => (vec![], None),
+            BlockOutcome::Evaluated(events) => (events, None),
+            BlockOutcome::VerifyFailed => (vec![], Some(IncompleteReason::VerifyFailure)),
+            BlockOutcome::DecodeFailed(events) => (events, Some(IncompleteReason::DecodeFailure)),
+        };
 
-            let block_number = facts.block_number;
-            let (block_events, block_failure) = match pipeline.process(&facts) {
-                BlockOutcome::OutsideRange | BlockOutcome::NoBloomMatch => (vec![], None),
-                BlockOutcome::Evaluated(events) => (events, None),
-                BlockOutcome::VerifyFailed => (vec![], Some(IncompleteReason::VerifyFailure)),
-                BlockOutcome::DecodeFailed(events) => {
-                    (events, Some(IncompleteReason::DecodeFailure))
-                }
-            };
-
-            if let Some(reason) = block_failure {
-                for (idx, scope) in pipeline.scopes.iter().enumerate() {
-                    if scope.contains_block(block_number) && scope_ineligible[idx].is_none() {
-                        scope_ineligible[idx] = Some(reason);
-                    }
+        if let Some(reason) = block_failure {
+            for (idx, scope) in pipeline.scopes.iter().enumerate() {
+                if scope.contains_block(block_number) && scope_ineligible[idx].is_none() {
+                    scope_ineligible[idx] = Some(reason);
                 }
             }
+        }
 
-            if !block_events.is_empty() {
-                match sink.store(block_events).await {
-                    Ok(n) => total_events += n,
-                    Err(e) => {
-                        had_store_failure = true;
-                        warn!(block = block_number, err = %e, "Event insert failed");
-                    }
+        if !block_events.is_empty() {
+            match sink.store(block_events).await {
+                Ok(n) => total_events += n,
+                Err(e) => {
+                    had_store_failure = true;
+                    warn!(block = block_number, err = %e, "Event insert failed");
                 }
             }
         }

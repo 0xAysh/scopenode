@@ -10,12 +10,14 @@ use scopenode_core::{
     abi::DecodedEvent,
     abi_resolution::{AbiResolver, AbiStore},
     config::{Config, ContractConfig, NodeConfig},
+    era1_reader::Era1BlockFacts,
     era_pipeline::{
-        run_era1_scope, run_era1_scopes, CoverageSink, EventSink, InMemoryEventSink,
-        IncompleteReason, NullReporter,
+        run_era1_scope, run_era1_scopes, run_scopes_over_blocks, BlockFactStream, CoverageSink,
+        EventSink, InMemoryEventSink, IncompleteReason, NullReporter,
     },
     error::{AbiError, CoreError},
-    source::Era1Source,
+    source::{Era1Source, SourceError},
+    types::ScopeHeader,
 };
 use scopenode_storage::{Db, DbEventSink};
 use std::io::Write;
@@ -103,6 +105,122 @@ impl CoverageSink for FailingCoverageSink {
             "synthetic coverage write failure".to_string(),
         ))
     }
+}
+
+/// ABI store stub returning a fixed cached ABI — no SQLite needed.
+struct StaticAbiStore(String);
+
+#[async_trait]
+impl AbiStore for StaticAbiStore {
+    async fn load(&self, _address: &str) -> Result<Option<String>, AbiError> {
+        Ok(Some(self.0.clone()))
+    }
+    async fn save(
+        &self,
+        _address: &str,
+        _name: Option<&str>,
+        _abi_json: &str,
+    ) -> Result<(), AbiError> {
+        Ok(())
+    }
+}
+
+/// In-memory Block fact stream — the second adapter for the pipeline's
+/// traversal seam, so failure paths need no real archive files.
+struct StaticBlockFacts {
+    total: u64,
+    items: std::sync::Mutex<Vec<Result<Era1BlockFacts, SourceError>>>,
+}
+
+impl BlockFactStream for StaticBlockFacts {
+    fn total_blocks(&self) -> u64 {
+        self.total
+    }
+    fn blocks(&self) -> Box<dyn Iterator<Item = Result<Era1BlockFacts, SourceError>> + '_> {
+        let items: Vec<_> = self.items.lock().unwrap().drain(..).collect();
+        Box::new(items.into_iter())
+    }
+}
+
+fn eventless_block_facts(block_number: u64) -> Era1BlockFacts {
+    Era1BlockFacts {
+        block_number,
+        header: ScopeHeader {
+            number: block_number,
+            hash: B256::ZERO,
+            parent_hash: B256::ZERO,
+            timestamp: 0,
+            receipts_root: B256::ZERO,
+            logs_bloom: Bloom::default(),
+            gas_used: 0,
+            base_fee_per_gas: None,
+        },
+        receipts: vec![],
+        tx_hashes: vec![],
+    }
+}
+
+#[tokio::test]
+async fn pipeline_records_coverage_over_in_memory_block_fact_stream() {
+    let contract = address!("dAC17F958D2ee523a2206206994597C13D831ec7");
+    let addr_str = contract.to_checksum(None);
+
+    let stream = StaticBlockFacts {
+        total: 1,
+        items: std::sync::Mutex::new(vec![Ok(eventless_block_facts(100))]),
+    };
+    let config = test_config(contract);
+    let abi_resolver = AbiResolver::new(Arc::new(StaticAbiStore(transfer_abi_json())), None);
+    let sink = InMemoryEventSink::default();
+
+    let report = run_scopes_over_blocks(
+        &stream,
+        &config.contracts,
+        &abi_resolver,
+        &sink,
+        &NullReporter,
+    )
+    .await
+    .unwrap();
+
+    assert!(report.is_complete());
+    assert_eq!(report.total_events, 0);
+    assert_eq!(report.covered, vec![addr_str.clone()]);
+    assert_eq!(sink.covered_ranges().await, vec![(addr_str, 100, 100)]);
+}
+
+#[tokio::test]
+async fn pipeline_reports_source_failure_from_in_memory_block_fact_stream() {
+    let contract = address!("dAC17F958D2ee523a2206206994597C13D831ec7");
+    let addr_str = contract.to_checksum(None);
+
+    let stream = StaticBlockFacts {
+        total: 1,
+        items: std::sync::Mutex::new(vec![Err(SourceError::InvalidE2Store {
+            path: PathBuf::from("/era/mainnet-00000.era1"),
+            message: "synthetic mid-stream read failure".into(),
+        })]),
+    };
+    let config = test_config(contract);
+    let abi_resolver = AbiResolver::new(Arc::new(StaticAbiStore(transfer_abi_json())), None);
+    let sink = InMemoryEventSink::default();
+
+    let report = run_scopes_over_blocks(
+        &stream,
+        &config.contracts,
+        &abi_resolver,
+        &sink,
+        &NullReporter,
+    )
+    .await
+    .unwrap();
+
+    assert!(!report.is_complete());
+    assert_eq!(
+        report.incomplete,
+        vec![(addr_str, IncompleteReason::SourceFailure)]
+    );
+    assert!(sink.covered_ranges().await.is_empty());
 }
 
 fn unique_db_path() -> PathBuf {

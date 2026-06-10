@@ -14,6 +14,7 @@ use alloy_primitives::{Log as PrimitiveLog, B256};
 use std::path::Path;
 
 /// Decoded facts extracted from a single ERA1 block entry.
+#[derive(Debug)]
 pub struct Era1BlockFacts {
     /// Canonical block number.
     pub block_number: u64,

@@ -25,6 +25,12 @@ block is evaluated against every applicable scope.
 **Block fact** — The archive-decoded inputs needed by the pipeline for one block:
 block number, header, receipts, and transaction hashes.
 
+**Block fact stream** — The Archive source's traversal product: every selected
+Block fact as one ordered stream plus a progress total. File selection, file
+lifecycle, and format dispatch stay behind this interface; open and read
+failures surface as stream items carrying the file path. The pipeline consumes
+the stream and never coordinates archive files.
+
 **ABI resolution** — Resolution of event definitions through the contract ABI
 cache, a local override, or the remote Sourcify adapter. `impl_address` changes
 the remote lookup address for proxies without changing the log address.

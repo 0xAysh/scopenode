@@ -66,30 +66,52 @@ impl Era1BlockFactSelection {
     pub fn file_count(&self) -> usize {
         self.files.len()
     }
-
-    pub fn files(&self) -> impl Iterator<Item = Era1BlockFactFile<'_>> {
-        self.files
-            .iter()
-            .map(|manifest| Era1BlockFactFile { manifest })
-    }
 }
 
-pub struct Era1BlockFactFile<'a> {
-    manifest: &'a SourceFileManifest,
-}
-
-impl Era1BlockFactFile<'_> {
-    pub fn path(&self) -> &Path {
-        &self.manifest.path
+impl crate::era_pipeline::BlockFactStream for Era1BlockFactSelection {
+    fn total_blocks(&self) -> u64 {
+        self.total_blocks
     }
 
-    pub fn block_facts(
+    /// One stream over every selected file in manifest order. File-open and
+    /// per-block read failures surface as `Err` items carrying the file path;
+    /// traversal continues with the next file. Format dispatch (`.era1` vs
+    /// `.ere`) stays inside the reader this stream wraps.
+    fn blocks(
         &self,
-    ) -> Result<
-        impl Iterator<Item = Result<crate::era1_reader::Era1BlockFacts, SourceError>>,
-        SourceError,
-    > {
-        crate::era1_reader::iter_era1_block_facts(self.manifest.path.clone())
+    ) -> Box<dyn Iterator<Item = Result<crate::era1_reader::Era1BlockFacts, SourceError>> + '_>
+    {
+        Box::new(self.files.iter().flat_map(|manifest| {
+            let path = manifest.path.clone();
+            match crate::era1_reader::iter_era1_block_facts(&manifest.path) {
+                Ok(iter) => {
+                    Box::new(iter.map(move |item| item.map_err(|e| with_file_context(e, &path))))
+                        as Box<
+                            dyn Iterator<
+                                Item = Result<crate::era1_reader::Era1BlockFacts, SourceError>,
+                            >,
+                        >
+                }
+                Err(e) => Box::new(std::iter::once(Err(e)))
+                    as Box<
+                        dyn Iterator<
+                            Item = Result<crate::era1_reader::Era1BlockFacts, SourceError>,
+                        >,
+                    >,
+            }
+        }))
+    }
+}
+
+/// Attach the originating file path to per-block errors that lack one, so the
+/// pipeline can report source failures without coordinating files itself.
+fn with_file_context(err: SourceError, path: &Path) -> SourceError {
+    match err {
+        SourceError::InvalidEra1Header(message) => SourceError::InvalidE2Store {
+            path: path.to_owned(),
+            message,
+        },
+        other => other,
     }
 }
 
@@ -138,16 +160,6 @@ impl Era1Source {
             files,
             total_blocks,
         }
-    }
-
-    pub fn block_facts(
-        &self,
-        file: &SourceFileManifest,
-    ) -> Result<
-        impl Iterator<Item = Result<crate::era1_reader::Era1BlockFacts, SourceError>>,
-        SourceError,
-    > {
-        crate::era1_reader::iter_era1_block_facts(file.path.clone())
     }
 }
 
@@ -649,22 +661,17 @@ mod tests {
     }
 
     #[test]
-    fn era1_source_streams_block_facts_from_scanned_manifest_file() {
+    fn era1_selection_streams_block_facts_without_exposing_files() {
+        use crate::era_pipeline::BlockFactStream;
+
         let dir = tempdir().unwrap();
         let era1 = dir.path().join("mainnet-00000-5ec1ffb8.era1");
         fs::write(&era1, synthetic_decodable_era1(64, &[64, 65])).unwrap();
 
         let source = Era1Source::scan(dir.path(), None, 0, u64::MAX).unwrap();
-        let file = source
-            .files()
-            .first()
-            .expect("scan should find one ERA1 file");
+        let selection = source.block_facts_for_range(64, 65);
 
-        let facts = source
-            .block_facts(file)
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
+        let facts = selection.blocks().collect::<Result<Vec<_>, _>>().unwrap();
 
         assert_eq!(facts.len(), 2);
         assert_eq!(facts[0].block_number, 64);
@@ -674,7 +681,9 @@ mod tests {
     }
 
     #[test]
-    fn ere_source_streams_block_facts_from_sectioned_file() {
+    fn ere_selection_streams_block_facts_with_format_dispatch_hidden() {
+        use crate::era_pipeline::BlockFactStream;
+
         let dir = tempdir().unwrap();
         let ere = dir.path().join("mainnet-00000-4bb7de2e-noproofs.ere");
         fs::write(&ere, synthetic_decodable_ere(64, &[64, 65])).unwrap();
@@ -684,16 +693,12 @@ mod tests {
             .files()
             .first()
             .expect("scan should find one ERE file");
-
         assert_eq!(file.format, "ere");
         assert_eq!(file.ranges[0].from_block, 64);
         assert_eq!(file.ranges[0].to_block, 65);
 
-        let facts = source
-            .block_facts(file)
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
+        let selection = source.block_facts_for_range(64, 65);
+        let facts = selection.blocks().collect::<Result<Vec<_>, _>>().unwrap();
 
         assert_eq!(facts.len(), 2);
         assert_eq!(facts[0].block_number, 64);
@@ -703,6 +708,43 @@ mod tests {
         assert_eq!(receipt.receipt.cumulative_gas_used, 21_000);
         assert_eq!(facts[1].block_number, 65);
         assert_eq!(facts[1].header.number, 65);
+    }
+
+    #[test]
+    fn selection_stream_surfaces_open_failure_with_context_and_continues() {
+        use crate::era_pipeline::BlockFactStream;
+
+        let dir = tempdir().unwrap();
+        let first = dir.path().join("mainnet-00000-5ec1ffb8.era1");
+        fs::write(&first, synthetic_decodable_era1(64, &[64, 65])).unwrap();
+        fs::write(
+            dir.path().join("mainnet-00001-deadbeef.era1"),
+            synthetic_decodable_era1(8192, &[8192]),
+        )
+        .unwrap();
+
+        let source = Era1Source::scan(dir.path(), None, 0, u64::MAX).unwrap();
+        let selection = source.block_facts_for_range(64, 8192);
+        assert_eq!(selection.total_blocks(), 3);
+
+        // The first file disappears between scan and traversal.
+        fs::remove_file(&first).unwrap();
+
+        let items: Vec<_> = selection.blocks().collect();
+        assert_eq!(items.len(), 2, "one open failure plus one streamed block");
+
+        let err = items[0]
+            .as_ref()
+            .expect_err("missing file must surface as a stream error");
+        assert!(
+            err.to_string().contains("mainnet-00000-5ec1ffb8.era1"),
+            "open failure must carry the file path, got: {err}"
+        );
+
+        let facts = items[1]
+            .as_ref()
+            .expect("traversal must continue with the next file");
+        assert_eq!(facts.block_number, 8192);
     }
 
     #[test]
