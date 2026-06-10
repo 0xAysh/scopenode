@@ -706,6 +706,51 @@ async fn era1_pipeline_report_distinguishes_complete_and_incomplete_runs() {
 }
 
 #[tokio::test]
+async fn era1_pipeline_records_coverage_for_valid_eventless_range() {
+    let contract = address!("dAC17F958D2ee523a2206206994597C13D831ec7");
+    let addr_str = contract.to_checksum(None);
+
+    // A consistent block with no logs at all: no Bloom match for the scope,
+    // nothing to verify or decode — valid emptiness, eligible for Coverage.
+    let era1_bytes = build_synthetic_era1_with_logs(vec![], vec![]);
+
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("mainnet-00012-deadbeef.era1"), &era1_bytes).unwrap();
+
+    let db_path = unique_db_path();
+    let db = Db::open(db_path.clone()).await.unwrap();
+    db.upsert_contract(&addr_str, Some("USDT"), &transfer_abi_json())
+        .await
+        .unwrap();
+
+    let source = Era1Source::scan(dir.path(), None, 100, 100).unwrap();
+    let config = test_config(contract);
+    let contract_cfg = &config.contracts[0];
+    let abi_resolver = AbiResolver::new(Arc::new(DbAbiStore(db.clone())), None);
+    let sink = InMemoryEventSink::default();
+
+    let report = run_era1_scope(&source, contract_cfg, &abi_resolver, &sink, &NullReporter)
+        .await
+        .unwrap();
+
+    assert!(
+        report.is_complete(),
+        "an eventless clean run must report complete"
+    );
+    assert_eq!(report.total_events, 0);
+    assert!(sink.events().await.is_empty());
+    assert_eq!(
+        sink.covered_ranges().await,
+        vec![(addr_str.clone(), 100, 100)],
+        "valid emptiness must remain eligible for Coverage"
+    );
+
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+    let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+}
+
+#[tokio::test]
 async fn era1_pipeline_reports_coverage_write_failure_as_incomplete() {
     let contract = address!("dAC17F958D2ee523a2206206994597C13D831ec7");
     let transfer_topic0 = keccak256(b"Transfer(address,address,uint256)");

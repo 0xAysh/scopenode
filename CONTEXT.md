@@ -44,8 +44,20 @@ comparison with the block header's `receipts_root`.
 **Pipeline sink** — The combined event and coverage output interface. SQLite and
 the in-memory test sink are current adapters.
 
+**Block outcome** — The per-block evaluation result. Preserves outside-range,
+no-Bloom-match, valid emptiness, decoded events, verification failure, and
+decode failure as distinct facts until Coverage eligibility is decided. An
+empty block is valid emptiness, not a failure.
+
 **Coverage** — A contract, inclusive block range, and source recorded only after
 the scope completes without a read, verification, decode, or storage failure.
+An incomplete block (verification or decode failure) makes every affected
+contract scope ineligible for Coverage for that run; a successful rerun
+recovers. Lossy decoded events are still stored with raw topics and data.
+
+**Sync report** — The per-run completion summary: total stored events, covered
+contract scopes, and incomplete scopes with their failure reason. A Coverage
+write failure is reported as incomplete, never as unqualified success.
 
 ## Query domain
 
