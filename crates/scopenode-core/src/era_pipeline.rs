@@ -199,16 +199,33 @@ impl PreparedScope {
     }
 }
 
+/// Outcome of evaluating one block against all prepared scopes.
+///
+/// Preserves the distinction between safe emptiness and incomplete evaluation
+/// until Coverage eligibility is decided: a block with no events is still
+/// coverable, a block whose receipts failed verification is not.
+#[derive(Debug)]
+enum BlockOutcome {
+    /// The block is outside every scope's range.
+    OutsideRange,
+    /// In range, but no scope's Bloom matched — safely empty.
+    NoBloomMatch,
+    /// Receipts verified and decoding ran to completion. Events may be empty;
+    /// that is valid emptiness, not a failure.
+    Evaluated(Vec<DecodedEvent>),
+    /// Receipt verification failed — the block is incomplete and every
+    /// affected Contract scope is ineligible for Coverage.
+    VerifyFailed,
+}
+
 /// Encapsulates all per-block processing for the ERA1 pipeline.
 ///
 /// Given one `Era1BlockFacts`, `process()` performs in order: block range
 /// filtering against all scopes, Bloom pre-screening, Merkle root verification
 /// (via the injected [`ReceiptVerifier`]), and per-scope event extraction.
 ///
-/// Returns an empty `Vec` for blocks that produce no events — whether because
-/// no scope's range matches, no Bloom hit, or a verify failure. The outer
-/// file-iteration loop is the only caller; it stays thin and free of
-/// decoding logic.
+/// Returns a [`BlockOutcome`] so the outer file-iteration loop can apply
+/// Coverage policy without inferring completion from an empty event list.
 struct BlockPipeline {
     scopes: Vec<PreparedScope>,
     verifier: Box<dyn ReceiptVerifier>,
@@ -227,14 +244,14 @@ impl BlockPipeline {
         Self { scopes, verifier }
     }
 
-    fn process(&self, facts: &Era1BlockFacts) -> Vec<DecodedEvent> {
+    fn process(&self, facts: &Era1BlockFacts) -> BlockOutcome {
         let in_range: Vec<&PreparedScope> = self
             .scopes
             .iter()
             .filter(|s| s.contains_block(facts.block_number))
             .collect();
         if in_range.is_empty() {
-            return vec![];
+            return BlockOutcome::OutsideRange;
         }
 
         let bloom_matches: Vec<&PreparedScope> = in_range
@@ -242,7 +259,7 @@ impl BlockPipeline {
             .filter(|s| s.scanner.matches(&facts.header.logs_bloom))
             .collect();
         if bloom_matches.is_empty() {
-            return vec![];
+            return BlockOutcome::NoBloomMatch;
         }
 
         if let Err(e) = self.verifier.verify(
@@ -250,8 +267,8 @@ impl BlockPipeline {
             facts.header.receipts_root,
             facts.header.number,
         ) {
-            warn!(block = facts.header.number, err = %e, "Receipt Merkle verify failed — skipping");
-            return vec![];
+            warn!(block = facts.header.number, err = %e, "Receipt Merkle verify failed — block incomplete");
+            return BlockOutcome::VerifyFailed;
         }
 
         let mut events = Vec::new();
@@ -265,7 +282,7 @@ impl BlockPipeline {
                 "era1",
             ));
         }
-        events
+        BlockOutcome::Evaluated(events)
     }
 }
 
@@ -275,7 +292,8 @@ impl BlockPipeline {
 /// `[contract.from_block, contract.to_block]`.
 ///
 /// Each file is read sequentially in one pass. Bloom hits trigger full receipt
-/// decode and Merkle verification. Verification failures are logged and skipped.
+/// decode and Merkle verification. A verification failure makes every affected
+/// Contract scope ineligible for Coverage for this run; a rerun can recover.
 pub async fn run_era1_scope(
     source: &Era1Source,
     contract: &ContractConfig,
@@ -330,6 +348,9 @@ pub async fn run_era1_scopes(
     let mut total_events = 0usize;
     let mut had_source_failure = false;
     let mut had_store_failure = false;
+    // Scopes that saw an incomplete block (e.g. Receipt verification failure)
+    // and are therefore ineligible for Coverage this run.
+    let mut scope_ineligible = vec![false; pipeline.scopes.len()];
 
     for file in selected_files.files() {
         let facts_iter = match file.block_facts() {
@@ -354,13 +375,24 @@ pub async fn run_era1_scopes(
             reporter.inc();
 
             let block_number = facts.block_number;
-            let block_events = pipeline.process(&facts);
-            if !block_events.is_empty() {
-                match sink.store(block_events).await {
-                    Ok(n) => total_events += n,
-                    Err(e) => {
-                        had_store_failure = true;
-                        warn!(block = block_number, err = %e, "Event insert failed");
+            match pipeline.process(&facts) {
+                BlockOutcome::OutsideRange | BlockOutcome::NoBloomMatch => {}
+                BlockOutcome::Evaluated(block_events) => {
+                    if !block_events.is_empty() {
+                        match sink.store(block_events).await {
+                            Ok(n) => total_events += n,
+                            Err(e) => {
+                                had_store_failure = true;
+                                warn!(block = block_number, err = %e, "Event insert failed");
+                            }
+                        }
+                    }
+                }
+                BlockOutcome::VerifyFailed => {
+                    for (idx, scope) in pipeline.scopes.iter().enumerate() {
+                        if scope.contains_block(block_number) {
+                            scope_ineligible[idx] = true;
+                        }
                     }
                 }
             }
@@ -370,7 +402,11 @@ pub async fn run_era1_scopes(
     if had_source_failure || had_store_failure {
         warn!("Skipping Coverage record because the ERA1 scope run did not complete cleanly");
     } else {
-        for scope in pipeline.scopes.iter() {
+        for (idx, scope) in pipeline.scopes.iter().enumerate() {
+            if scope_ineligible[idx] {
+                warn!(contract = %scope.contract, "Skipping Coverage record — scope saw incomplete blocks");
+                continue;
+            }
             if let Err(e) = sink
                 .record_coverage(&scope.contract, scope.from, scope.to)
                 .await
@@ -446,25 +482,34 @@ mod tests {
     }
 
     #[test]
-    fn block_out_of_range_returns_empty() {
+    fn block_out_of_range_is_outside_range() {
         let pipeline = BlockPipeline::new(vec![make_scope(100, 200)]);
-        assert!(pipeline.process(&empty_facts(99)).is_empty());
-        assert!(pipeline.process(&empty_facts(201)).is_empty());
+        assert!(matches!(
+            pipeline.process(&empty_facts(99)),
+            BlockOutcome::OutsideRange
+        ));
+        assert!(matches!(
+            pipeline.process(&empty_facts(201)),
+            BlockOutcome::OutsideRange
+        ));
     }
 
     #[test]
-    fn bloom_no_match_returns_empty() {
+    fn bloom_no_match_is_distinguished_from_outside_range() {
         let addr = Address::repeat_byte(0xAB);
         let topic0 = keccak256(b"Transfer(address,address,uint256)");
         let pipeline = BlockPipeline::new(vec![make_scope_with_target(100, 200, addr, topic0)]);
 
         // Facts with empty bloom — scanner's address/topic0 are not present.
         let facts = empty_facts(150);
-        assert!(pipeline.process(&facts).is_empty());
+        assert!(matches!(
+            pipeline.process(&facts),
+            BlockOutcome::NoBloomMatch
+        ));
     }
 
     #[test]
-    fn bloom_match_with_empty_receipts_returns_empty() {
+    fn bloom_match_with_unverifiable_receipts_is_verify_failed() {
         let addr = Address::repeat_byte(0xAB);
         let topic0 = keccak256(b"Transfer(address,address,uint256)");
         let pipeline = BlockPipeline::new(vec![make_scope_with_target(100, 200, addr, topic0)]);
@@ -480,14 +525,45 @@ mod tests {
             },
             ..empty_facts(150)
         };
-        // Empty receipts list → no events extracted (Merkle verify passes for empty list
-        // only if receipts_root matches — MerkleVerifier may reject; either way, no events).
-        // The important thing is: no panic, and result is empty.
-        assert!(pipeline.process(&facts).is_empty());
+        // Empty receipts against a zero receipts_root: the empty trie root is
+        // not B256::ZERO, so the real MerkleVerifier must report VerifyFailed —
+        // not silently produce a valid empty evaluation.
+        assert!(matches!(
+            pipeline.process(&facts),
+            BlockOutcome::VerifyFailed
+        ));
     }
 
     #[test]
-    fn merkle_verify_failure_returns_empty() {
+    fn bloom_match_with_verified_empty_receipts_is_valid_emptiness() {
+        let addr = Address::repeat_byte(0xAB);
+        let topic0 = keccak256(b"Transfer(address,address,uint256)");
+        let pipeline = BlockPipeline::with_verifier(
+            vec![make_scope_with_target(100, 200, addr, topic0)],
+            Box::new(NoopVerifier),
+        );
+
+        let mut bloom = Bloom::default();
+        bloom.accrue(BloomInput::Raw(addr.as_slice()));
+        bloom.accrue(BloomInput::Raw(topic0.as_slice()));
+
+        let facts = Era1BlockFacts {
+            header: ScopeHeader {
+                logs_bloom: bloom,
+                ..empty_facts(150).header
+            },
+            ..empty_facts(150)
+        };
+        // A verified block with no matching events is valid emptiness —
+        // it must stay eligible for Coverage.
+        assert!(matches!(
+            pipeline.process(&facts),
+            BlockOutcome::Evaluated(events) if events.is_empty()
+        ));
+    }
+
+    #[test]
+    fn merkle_verify_failure_is_verify_failed_not_valid_emptiness() {
         use alloy_consensus::{Eip658Value, Receipt, ReceiptWithBloom};
         use alloy_primitives::Log as PrimitiveLog;
 
@@ -519,11 +595,14 @@ mod tests {
             receipts: vec![receipt],
             ..empty_facts(150)
         };
-        assert!(pipeline.process(&facts).is_empty());
+        assert!(matches!(
+            pipeline.process(&facts),
+            BlockOutcome::VerifyFailed
+        ));
     }
 
     #[test]
-    fn always_fail_verifier_returns_empty_for_in_range_bloom_hit() {
+    fn always_fail_verifier_is_verify_failed_for_in_range_bloom_hit() {
         use alloy_consensus::{Eip658Value, Receipt, ReceiptWithBloom};
         use alloy_primitives::Log as PrimitiveLog;
 
@@ -555,13 +634,19 @@ mod tests {
             receipts: vec![receipt],
             ..empty_facts(150)
         };
-        assert!(pipeline.process(&facts).is_empty());
+        assert!(matches!(
+            pipeline.process(&facts),
+            BlockOutcome::VerifyFailed
+        ));
     }
 
     #[test]
-    fn no_scopes_returns_empty() {
+    fn no_scopes_is_outside_range() {
         let pipeline = BlockPipeline::new(vec![]);
-        assert!(pipeline.process(&empty_facts(100)).is_empty());
+        assert!(matches!(
+            pipeline.process(&empty_facts(100)),
+            BlockOutcome::OutsideRange
+        ));
     }
 
     #[test]

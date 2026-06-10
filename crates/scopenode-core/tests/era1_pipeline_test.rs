@@ -120,6 +120,14 @@ fn rlp_encode_index(i: usize) -> Vec<u8> {
 }
 
 fn build_synthetic_era1_with_logs(logs: Vec<PrimitiveLog>, bloom_inputs: Vec<Vec<u8>>) -> Vec<u8> {
+    build_synthetic_era1_with_logs_and_root(logs, bloom_inputs, None)
+}
+
+fn build_synthetic_era1_with_logs_and_root(
+    logs: Vec<PrimitiveLog>,
+    bloom_inputs: Vec<Vec<u8>>,
+    receipts_root_override: Option<B256>,
+) -> Vec<u8> {
     let mut bloom = Bloom::default();
     for input in bloom_inputs {
         bloom.accrue(BloomInput::Raw(&input));
@@ -140,7 +148,7 @@ fn build_synthetic_era1_with_logs(logs: Vec<PrimitiveLog>, bloom_inputs: Vec<Vec
     envelope.encode_2718(&mut value);
     let mut hb = HashBuilder::default();
     hb.add_leaf(Nibbles::unpack(&key), &value);
-    let receipts_root = hb.root();
+    let receipts_root = receipts_root_override.unwrap_or_else(|| hb.root());
 
     let header = Header {
         number: 100,
@@ -455,6 +463,68 @@ async fn era1_pipeline_does_not_record_coverage_when_selected_file_cannot_open()
     assert!(
         sink.covered_ranges().await.is_empty(),
         "unopened ERA1 source files must not record Coverage for the Contract scope"
+    );
+
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+    let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+}
+
+#[tokio::test]
+async fn era1_pipeline_does_not_record_coverage_when_receipt_verification_fails() {
+    let contract = address!("dAC17F958D2ee523a2206206994597C13D831ec7");
+    let transfer_topic0 = keccak256(b"Transfer(address,address,uint256)");
+
+    // Bloom matches the contract scope, but the header carries a receipts_root
+    // that cannot match the receipts — Receipt verification must fail.
+    let log = PrimitiveLog {
+        address: contract,
+        data: LogData::new_unchecked(
+            vec![
+                transfer_topic0,
+                B256::from([0x11u8; 32]),
+                B256::from([0x22u8; 32]),
+            ],
+            Bytes::from(vec![0u8; 32]),
+        ),
+    };
+    let era1_bytes = build_synthetic_era1_with_logs_and_root(
+        vec![log],
+        vec![
+            contract.as_slice().to_vec(),
+            transfer_topic0.as_slice().to_vec(),
+        ],
+        Some(B256::from([0xAA; 32])),
+    );
+
+    let dir = tempdir().unwrap();
+    let era1_path = dir.path().join("mainnet-00012-deadbeef.era1");
+    std::fs::write(&era1_path, &era1_bytes).unwrap();
+
+    let db_path = unique_db_path();
+    let db = Db::open(db_path.clone()).await.unwrap();
+    let addr_str = contract.to_checksum(None);
+    db.upsert_contract(&addr_str, Some("USDT"), &transfer_abi_json())
+        .await
+        .unwrap();
+
+    let source = Era1Source::scan(dir.path(), None, 100, 100).unwrap();
+    let config = test_config(contract);
+    let contract_cfg = &config.contracts[0];
+    let abi_resolver = AbiResolver::new(Arc::new(DbAbiStore(db.clone())), None);
+    let sink = InMemoryEventSink::default();
+
+    run_era1_scope(&source, contract_cfg, &abi_resolver, &sink, &NullReporter)
+        .await
+        .unwrap();
+
+    assert!(
+        sink.events().await.is_empty(),
+        "unverified receipts must not produce stored events"
+    );
+    assert!(
+        sink.covered_ranges().await.is_empty(),
+        "Receipt verification failure must not record Coverage for the Contract scope"
     );
 
     let _ = std::fs::remove_file(&db_path);
