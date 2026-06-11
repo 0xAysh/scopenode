@@ -1,11 +1,13 @@
-//! Archive block codec.
+//! Archive block codec: Snappy/RLP decoding for headers, receipts, and body
+//! transaction hashes.
 //!
 //! One receipt decode loop owns Snappy decompression, RLP list iteration, and
 //! receipt-type dispatch for both archive formats. The ERA1/ERE difference is
 //! confined to a small per-item layout adapter selected via [`ReceiptLayout`].
 
-use alloy_consensus::{Eip658Value, Receipt, ReceiptEnvelope, ReceiptWithBloom};
-use alloy_primitives::{logs_bloom, Log as PrimitiveLog};
+use crate::types::ScopeHeader;
+use alloy_consensus::{Eip658Value, Header, Receipt, ReceiptEnvelope, ReceiptWithBloom};
+use alloy_primitives::{keccak256, logs_bloom, Log as PrimitiveLog, B256};
 use alloy_rlp::Decodable;
 use snap::read::FrameDecoder;
 use std::io::Read;
@@ -168,6 +170,117 @@ fn decode_slim_receipt(
         return Ok(ReceiptEnvelope::Legacy(with_bloom));
     }
     typed_envelope(receipt_type, with_bloom)
+}
+
+/// Decode a Snappy-compressed RLP block header. Both archive formats share
+/// this header encoding.
+pub fn decode_era1_header(compressed_header: &[u8]) -> Result<ScopeHeader, CodecError> {
+    let err = |message: String| CodecError {
+        what: "block header",
+        message,
+    };
+
+    let mut decoder = FrameDecoder::new(compressed_header);
+    let mut rlp = Vec::new();
+    decoder
+        .read_to_end(&mut rlp)
+        .map_err(|source| err(source.to_string()))?;
+
+    let mut slice = rlp.as_slice();
+    let header = Header::decode(&mut slice).map_err(|source| err(source.to_string()))?;
+
+    Ok(ScopeHeader {
+        number: header.number,
+        hash: header.hash_slow(),
+        parent_hash: header.parent_hash,
+        timestamp: header.timestamp,
+        receipts_root: header.receipts_root,
+        logs_bloom: header.logs_bloom,
+        gas_used: header.gas_used,
+        base_fee_per_gas: header.base_fee_per_gas.map(|fee| fee as u128),
+    })
+}
+
+/// Compute transaction hashes from a Snappy-compressed RLP block body. Both
+/// archive formats share this body encoding.
+pub(crate) fn decode_era1_tx_hashes(compressed: &[u8]) -> Result<Vec<B256>, CodecError> {
+    let err = |message: String| CodecError {
+        what: "block body",
+        message,
+    };
+
+    let mut raw = Vec::new();
+    FrameDecoder::new(compressed)
+        .read_to_end(&mut raw)
+        .map_err(|e| err(e.to_string()))?;
+
+    let mut slice = raw.as_slice();
+
+    let body_header = alloy_rlp::Header::decode(&mut slice).map_err(|e| err(e.to_string()))?;
+    if !body_header.list {
+        return Err(err("body is not an RLP list".into()));
+    }
+
+    let tx_list_header = alloy_rlp::Header::decode(&mut slice).map_err(|e| err(e.to_string()))?;
+    if !tx_list_header.list {
+        return Err(err("body transactions is not an RLP list".into()));
+    }
+
+    let mut tx_payload = &slice[..tx_list_header.payload_length];
+    let mut hashes = Vec::new();
+
+    while !tx_payload.is_empty() {
+        let Some(&first) = tx_payload.first() else {
+            break;
+        };
+
+        let raw_tx: Vec<u8> = if first >= 0xc0 {
+            let start = tx_payload;
+            let h = match alloy_rlp::Header::decode(&mut tx_payload) {
+                Ok(h) => h,
+                Err(_) => {
+                    hashes.push(B256::ZERO);
+                    break;
+                }
+            };
+            let consumed = start.len() - tx_payload.len();
+            let item = start[..consumed + h.payload_length].to_vec();
+            tx_payload = &tx_payload[h.payload_length..];
+            item
+        } else if first >= 0x80 {
+            let h = match alloy_rlp::Header::decode(&mut tx_payload) {
+                Ok(h) => h,
+                Err(_) => {
+                    hashes.push(B256::ZERO);
+                    break;
+                }
+            };
+            let bytes = tx_payload[..h.payload_length].to_vec();
+            tx_payload = &tx_payload[h.payload_length..];
+            bytes
+        } else {
+            let type_byte = first;
+            tx_payload = &tx_payload[1..];
+            let start = tx_payload;
+            let h = match alloy_rlp::Header::decode(&mut tx_payload) {
+                Ok(h) => h,
+                Err(_) => {
+                    hashes.push(B256::ZERO);
+                    break;
+                }
+            };
+            let consumed = start.len() - tx_payload.len();
+            let body_len = consumed + h.payload_length;
+            let mut bytes = vec![type_byte];
+            bytes.extend_from_slice(&start[..body_len]);
+            tx_payload = &tx_payload[h.payload_length..];
+            bytes
+        };
+
+        hashes.push(keccak256(&raw_tx));
+    }
+
+    Ok(hashes)
 }
 
 #[cfg(test)]
@@ -474,5 +587,16 @@ mod tests {
     fn ere_garbage_snappy_errors() {
         let err = decode_receipts(ReceiptLayout::EreSlim, &[0xDE, 0xAD, 0xBE, 0xEF]).unwrap_err();
         assert!(err.to_string().contains("ERE"), "unexpected error: {err}");
+    }
+
+    // ── Block body ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn decodes_empty_body_as_no_tx_hashes() {
+        // RLP of [[],[]] — empty transactions list and empty uncles list.
+        let compressed = snappy_bytes(&rlp_list(&[0xC0, 0xC0]));
+
+        let hashes = decode_era1_tx_hashes(&compressed).unwrap();
+        assert!(hashes.is_empty());
     }
 }

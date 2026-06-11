@@ -12,7 +12,6 @@ pub mod codec;
 pub mod config;
 pub mod decode_quality;
 mod e2store;
-pub mod era1_codec;
 pub mod era1_reader;
 pub mod era_pipeline;
 pub mod error;

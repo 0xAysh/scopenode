@@ -1,13 +1,14 @@
 //! High-level ERA1 block reader.
 //!
 //! Wraps the low-level [`crate::source`] primitives and exposes decoded block
-//! facts to callers, hiding `Era1BlockTuple`, `decode_era1_header`,
-//! `decode_era1_receipts`, and `decode_era1_tx_hashes` behind the
-//! [`iter_era1_block_facts`] function.
+//! facts to callers, hiding `Era1BlockTuple` and the [`crate::codec`]
+//! functions behind the [`iter_era1_block_facts`] function.
 
+use crate::codec::{
+    decode_era1_header, decode_era1_tx_hashes, decode_receipts, CodecError, ReceiptLayout,
+};
 use crate::e2store::iter_era1_block_tuples;
-use crate::era1_codec::decode_ere_slim_receipts;
-use crate::source::{decode_era1_header, decode_era1_receipts, decode_era1_tx_hashes, SourceError};
+use crate::source::SourceError;
 use crate::types::ScopeHeader;
 use alloy_consensus::ReceiptEnvelope;
 use alloy_primitives::{Log as PrimitiveLog, B256};
@@ -43,17 +44,23 @@ pub struct Era1BlockFacts {
 pub fn iter_era1_block_facts(
     path: impl AsRef<Path>,
 ) -> Result<impl Iterator<Item = Result<Era1BlockFacts, SourceError>>, SourceError> {
-    let is_ere = path.as_ref().extension().and_then(|ext| ext.to_str()) == Some("ere");
+    let path = path.as_ref();
+    let layout = if path.extension().and_then(|ext| ext.to_str()) == Some("ere") {
+        ReceiptLayout::EreSlim
+    } else {
+        ReceiptLayout::Era1Full
+    };
     let iter = iter_era1_block_tuples(path)?;
+    let path = path.to_owned();
     let mapped = iter.map(move |tuple_result| {
         let tuple = tuple_result?;
-
-        let header = decode_era1_header(&tuple.compressed_header)?;
-        let receipts = if is_ere {
-            decode_ere_slim_receipts(&tuple.compressed_receipts)?
-        } else {
-            decode_era1_receipts(&tuple.compressed_receipts)?
+        let decode_err = |e: CodecError| SourceError::InvalidE2Store {
+            path: path.clone(),
+            message: e.to_string(),
         };
+
+        let header = decode_era1_header(&tuple.compressed_header).map_err(decode_err)?;
+        let receipts = decode_receipts(layout, &tuple.compressed_receipts).map_err(decode_err)?;
         let tx_hashes = decode_era1_tx_hashes(&tuple.compressed_body).unwrap_or_default();
 
         Ok(Era1BlockFacts {

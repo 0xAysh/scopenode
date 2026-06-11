@@ -1,8 +1,8 @@
 //! Local historical source scanning.
 
+pub use crate::codec::decode_era1_header;
 use crate::e2store::read_era1_block_index_range;
 pub use crate::e2store::read_era1_block_tuple;
-pub use crate::era1_codec::decode_era1_header;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
@@ -32,9 +32,6 @@ pub enum SourceError {
 
     #[error("invalid e2store source file {path}: {message}")]
     InvalidE2Store { path: PathBuf, message: String },
-
-    #[error("invalid ERA1 header: {0}")]
-    InvalidEra1Header(String),
 
     #[error("block range overflow for {path}")]
     RangeOverflow { path: PathBuf },
@@ -76,22 +73,20 @@ impl crate::era_pipeline::BlockFactStream for Era1BlockFactSelection {
     /// One stream over every selected file in manifest order. File-open and
     /// per-block read failures surface as `Err` items carrying the file path;
     /// traversal continues with the next file. Format dispatch (`.era1` vs
-    /// `.ere`) stays inside the reader this stream wraps.
+    /// `.ere`) stays inside the reader this stream wraps, and decode errors
+    /// are born carrying the file path and format identity.
     fn blocks(
         &self,
     ) -> Box<dyn Iterator<Item = Result<crate::era1_reader::Era1BlockFacts, SourceError>> + '_>
     {
         Box::new(self.files.iter().flat_map(|manifest| {
-            let path = manifest.path.clone();
             match crate::era1_reader::iter_era1_block_facts(&manifest.path) {
-                Ok(iter) => {
-                    Box::new(iter.map(move |item| item.map_err(|e| with_file_context(e, &path))))
-                        as Box<
-                            dyn Iterator<
-                                Item = Result<crate::era1_reader::Era1BlockFacts, SourceError>,
-                            >,
-                        >
-                }
+                Ok(iter) => Box::new(iter)
+                    as Box<
+                        dyn Iterator<
+                            Item = Result<crate::era1_reader::Era1BlockFacts, SourceError>,
+                        >,
+                    >,
                 Err(e) => Box::new(std::iter::once(Err(e)))
                     as Box<
                         dyn Iterator<
@@ -100,18 +95,6 @@ impl crate::era_pipeline::BlockFactStream for Era1BlockFactSelection {
                     >,
             }
         }))
-    }
-}
-
-/// Attach the originating file path to per-block errors that lack one, so the
-/// pipeline can report source failures without coordinating files itself.
-fn with_file_context(err: SourceError, path: &Path) -> SourceError {
-    match err {
-        SourceError::InvalidEra1Header(message) => SourceError::InvalidE2Store {
-            path: path.to_owned(),
-            message,
-        },
-        other => other,
     }
 }
 
@@ -356,8 +339,6 @@ pub fn scan_era1_source(
         files,
     })
 }
-
-pub(crate) use crate::era1_codec::{decode_era1_receipts, decode_era1_tx_hashes};
 
 fn parse_era1_filename(path: &Path, network_override: Option<&str>) -> Option<Era1FileName> {
     let extension = path.extension().and_then(|ext| ext.to_str())?;
@@ -710,6 +691,66 @@ mod tests {
         assert_eq!(facts[1].header.number, 65);
     }
 
+    /// A decode failure on an `.ere` file must name the ERE format and carry
+    /// the file path from the moment it is constructed — no downstream layer
+    /// rewrites an ERA1-named error into an honest one.
+    #[test]
+    fn ere_decode_failure_names_ere_format_and_path() {
+        use crate::era_pipeline::BlockFactStream;
+
+        let dir = tempdir().unwrap();
+        let ere = dir.path().join("mainnet-00000-4bb7de2e-noproofs.ere");
+        fs::write(&ere, synthetic_ere_with_garbage_receipts(64)).unwrap();
+
+        let source = Era1Source::scan(dir.path(), None, 0, u64::MAX).unwrap();
+        let selection = source.block_facts_for_range(64, 64);
+
+        let items: Vec<_> = selection.blocks().collect();
+        let err = items[0]
+            .as_ref()
+            .expect_err("garbage slim receipts must surface as a stream error");
+
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("mainnet-00000-4bb7de2e-noproofs.ere"),
+            "decode failure must carry the file path, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("ERE"),
+            "decode failure on an .ere file must name the ERE format, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("ERA1"),
+            "decode failure on an .ere file must not blame ERA1, got: {rendered}"
+        );
+    }
+
+    /// Single-block ERE binary whose slim-receipts entry holds garbage bytes
+    /// (valid e2store framing, invalid snappy payload).
+    fn synthetic_ere_with_garbage_receipts(block_number: u64) -> Vec<u8> {
+        let header = alloy_consensus::Header {
+            number: block_number,
+            ..Default::default()
+        };
+
+        let mut bytes = Vec::new();
+        bytes.extend(e2store_entry([0x65, 0x32], &[]));
+        bytes.extend(e2store_entry([0x03, 0x00], &snappy_rlp(&header)));
+        bytes.extend(e2store_entry([0x04, 0x00], &snappy_empty_body()));
+        bytes.extend(e2store_entry([0x0a, 0x00], &[0xDE, 0xAD, 0xBE, 0xEF]));
+
+        let component_count = 3_u64;
+        let mut index = Vec::new();
+        index.extend_from_slice(&block_number.to_le_bytes());
+        for slot in 0..component_count {
+            index.extend_from_slice(&(-(100 + slot as i64)).to_le_bytes());
+        }
+        index.extend_from_slice(&component_count.to_le_bytes());
+        index.extend_from_slice(&1_u64.to_le_bytes());
+        bytes.extend(e2store_entry([0x67, 0x32], &index));
+        bytes
+    }
+
     #[test]
     fn selection_stream_surfaces_open_failure_with_context_and_continues() {
         use crate::era_pipeline::BlockFactStream;
@@ -900,98 +941,6 @@ mod tests {
         bytes.extend_from_slice(&0u16.to_le_bytes());
         bytes.extend_from_slice(data);
         bytes
-    }
-
-    #[test]
-    fn decodes_empty_receipt_list() {
-        use std::io::Write;
-
-        // RLP of an empty list: 0xC0
-        let rlp_empty_list = vec![0xC0u8];
-        let mut compressed = Vec::new();
-        {
-            let mut enc = snap::write::FrameEncoder::new(&mut compressed);
-            enc.write_all(&rlp_empty_list).unwrap();
-            enc.flush().unwrap();
-        }
-
-        let receipts = decode_era1_receipts(&compressed).unwrap();
-        assert!(receipts.is_empty());
-    }
-
-    #[test]
-    fn decodes_single_legacy_receipt() {
-        use alloy_consensus::{Eip658Value, Receipt, ReceiptWithBloom};
-        use alloy_primitives::{Bloom, Log as PrimitiveLog};
-        use alloy_rlp::{Encodable, Header as RlpHeader};
-        use std::io::Write;
-
-        let receipt = ReceiptWithBloom::<Receipt<PrimitiveLog>> {
-            receipt: Receipt {
-                status: Eip658Value::Eip658(true),
-                cumulative_gas_used: 21_000,
-                logs: vec![],
-            },
-            logs_bloom: Bloom::default(),
-        };
-
-        let mut item_buf = Vec::new();
-        receipt.encode(&mut item_buf);
-
-        let outer_header = RlpHeader {
-            list: true,
-            payload_length: item_buf.len(),
-        };
-        let mut list_buf = Vec::new();
-        outer_header.encode(&mut list_buf);
-        list_buf.extend_from_slice(&item_buf);
-
-        let mut compressed = Vec::new();
-        {
-            let mut enc = snap::write::FrameEncoder::new(&mut compressed);
-            enc.write_all(&list_buf).unwrap();
-            enc.flush().unwrap();
-        }
-
-        let receipts = decode_era1_receipts(&compressed).unwrap();
-        assert_eq!(receipts.len(), 1);
-        let inner = receipts[0].as_receipt_with_bloom().unwrap();
-        assert_eq!(inner.receipt.cumulative_gas_used, 21_000);
-    }
-
-    #[test]
-    fn decodes_empty_body_as_no_tx_hashes() {
-        use alloy_rlp::Header as RlpHeader;
-        use std::io::Write;
-
-        // RLP of [[],[]] — empty transactions list and empty uncles list
-        let empty = RlpHeader {
-            list: true,
-            payload_length: 0,
-        };
-        let mut txs = Vec::new();
-        empty.encode(&mut txs);
-        let mut uncles = Vec::new();
-        empty.encode(&mut uncles);
-        let body_payload = txs.len() + uncles.len();
-        let body_h = RlpHeader {
-            list: true,
-            payload_length: body_payload,
-        };
-        let mut body_buf = Vec::new();
-        body_h.encode(&mut body_buf);
-        body_buf.extend_from_slice(&txs);
-        body_buf.extend_from_slice(&uncles);
-
-        let mut compressed = Vec::new();
-        {
-            let mut enc = snap::write::FrameEncoder::new(&mut compressed);
-            enc.write_all(&body_buf).unwrap();
-            enc.flush().unwrap();
-        }
-
-        let hashes = decode_era1_tx_hashes(&compressed).unwrap();
-        assert!(hashes.is_empty());
     }
 
     fn snappy_empty_body() -> Vec<u8> {
