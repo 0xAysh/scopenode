@@ -2,6 +2,7 @@
 
 #![deny(warnings)]
 
+pub mod abi_store;
 pub mod coverage;
 pub mod db;
 pub mod error;
@@ -10,6 +11,7 @@ pub mod query;
 pub mod sink;
 pub mod types;
 
+pub use abi_store::DbAbiStore;
 pub use coverage::MissingCoverage;
 pub use db::Db;
 pub use error::DbError;

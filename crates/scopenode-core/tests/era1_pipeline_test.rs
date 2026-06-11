@@ -19,36 +19,13 @@ use scopenode_core::{
     source::{Era1Source, SourceError},
     types::ScopeHeader,
 };
-use scopenode_storage::{Db, DbEventSink};
+use scopenode_storage::{Db, DbAbiStore, DbEventSink};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tempfile::tempdir;
 use tokio::sync::Mutex;
-
-struct DbAbiStore(Db);
-
-#[async_trait]
-impl AbiStore for DbAbiStore {
-    async fn load(&self, address: &str) -> Result<Option<String>, AbiError> {
-        self.0
-            .get_contract_abi(address)
-            .await
-            .map_err(|e| AbiError::Cache(e.to_string()))
-    }
-    async fn save(
-        &self,
-        address: &str,
-        name: Option<&str>,
-        abi_json: &str,
-    ) -> Result<(), AbiError> {
-        self.0
-            .upsert_contract(address, name, abi_json)
-            .await
-            .map_err(|e| AbiError::Cache(e.to_string()))
-    }
-}
 
 #[derive(Default)]
 struct FailingStoreSink {
