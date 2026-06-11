@@ -725,6 +725,72 @@ mod tests {
         );
     }
 
+    /// The ERE adapter must satisfy the streaming contract: Block facts come
+    /// out incrementally, so a file whose defect lies at its end still yields
+    /// every intact block before the defect, instead of buffering the whole
+    /// file and failing upfront with nothing streamed.
+    #[test]
+    fn ere_blocks_stream_incrementally_before_end_of_file_defect() {
+        use crate::era_pipeline::BlockFactStream;
+
+        let dir = tempdir().unwrap();
+        let ere = dir.path().join("mainnet-00000-4bb7de2e-noproofs.ere");
+        fs::write(&ere, synthetic_ere_missing_last_receipt(64, 2)).unwrap();
+
+        let source = Era1Source::scan(dir.path(), None, 0, u64::MAX).unwrap();
+        let selection = source.block_facts_for_range(64, 65);
+        let items: Vec<_> = selection.blocks().collect();
+
+        assert_eq!(items.len(), 2, "one intact block plus one error");
+        let facts = items[0]
+            .as_ref()
+            .expect("block 64 is intact and must stream out before the defect is reached");
+        assert_eq!(facts.block_number, 64);
+
+        let err = items[1]
+            .as_ref()
+            .expect_err("the missing final receipt must surface as an error");
+        assert!(
+            err.to_string().contains("ERE"),
+            "error must name the ERE format, got: {err}"
+        );
+    }
+
+    /// ERE binary with `count` headers and bodies but only `count - 1` slim
+    /// receipt entries, while the dynamic block index records `count` blocks.
+    fn synthetic_ere_missing_last_receipt(starting_number: u64, count: u64) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend(e2store_entry([0x65, 0x32], &[]));
+
+        for block_number in starting_number..starting_number + count {
+            let header = alloy_consensus::Header {
+                number: block_number,
+                ..Default::default()
+            };
+            bytes.extend(e2store_entry([0x03, 0x00], &snappy_rlp(&header)));
+        }
+        for _ in 0..count {
+            bytes.extend(e2store_entry([0x04, 0x00], &snappy_empty_body()));
+        }
+        for _ in 0..count - 1 {
+            bytes.extend(e2store_entry([0x0a, 0x00], &snappy_one_slim_receipt()));
+        }
+
+        let component_count = 3_u64;
+        let mut index = Vec::new();
+        index.extend_from_slice(&starting_number.to_le_bytes());
+        for i in 0..count {
+            for slot in 0..component_count {
+                let offset = -(((i as i64) + 1) * 100 + slot as i64);
+                index.extend_from_slice(&offset.to_le_bytes());
+            }
+        }
+        index.extend_from_slice(&component_count.to_le_bytes());
+        index.extend_from_slice(&count.to_le_bytes());
+        bytes.extend(e2store_entry([0x67, 0x32], &index));
+        bytes
+    }
+
     /// Single-block ERE binary whose slim-receipts entry holds garbage bytes
     /// (valid e2store framing, invalid snappy payload).
     fn synthetic_ere_with_garbage_receipts(block_number: u64) -> Vec<u8> {

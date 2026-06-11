@@ -78,22 +78,119 @@ pub fn read_era1_block_tuple(
     Ok(None)
 }
 
-/// A sequential iterator over every [`Era1BlockTuple`] in an ERA1 file.
+/// Per-format e2store traversal knowledge. The traversal loop is shared; a
+/// format differs only in which entry types carry receipts, which entry ends
+/// the block section, and whether blocks interleave a total-difficulty entry.
+struct TraversalFormat {
+    name: &'static str,
+    receipts_entry: [u8; 2],
+    block_index_entry: [u8; 2],
+    /// ERA1 interleaves one total-difficulty entry per block; ERE carries
+    /// none, so its tuples get an empty `total_difficulty`.
+    has_difficulty: bool,
+}
+
+const ERA1_TRAVERSAL: TraversalFormat = TraversalFormat {
+    name: "ERA1",
+    receipts_entry: ERA1_COMPRESSED_RECEIPTS,
+    block_index_entry: ERA1_BLOCK_INDEX,
+    has_difficulty: true,
+};
+
+const ERE_TRAVERSAL: TraversalFormat = TraversalFormat {
+    name: "ERE",
+    receipts_entry: ERE_COMPRESSED_SLIM_RECEIPTS,
+    block_index_entry: ERE_DYNAMIC_BLOCK_INDEX,
+    has_difficulty: false,
+};
+
+/// A sequential iterator over every [`Era1BlockTuple`] in an archive file.
 ///
-/// Reads the file in a single O(N) pass. Construct via [`iter_era1_block_tuples`].
-pub struct Era1BlockIter {
+/// Reads the file in a single O(N) pass with pending-slot queues: a block
+/// tuple is yielded as soon as all of its components have been read, never
+/// after buffering the whole file. Construct via [`iter_era1_block_tuples`].
+pub(crate) struct BlockTupleIter {
     file: fs::File,
     path: PathBuf,
+    format: &'static TraversalFormat,
     from_block: u64,
-    pending_header: Option<Vec<u8>>,
-    pending_body: Option<Vec<u8>>,
-    pending_receipts: Option<Vec<u8>>,
-    pending_difficulty: Option<Vec<u8>>,
-    block_index: usize,
+    expected_blocks: u64,
+    yielded: u64,
+    headers: VecDeque<Vec<u8>>,
+    bodies: VecDeque<Vec<u8>>,
+    receipts: VecDeque<Vec<u8>>,
+    difficulties: VecDeque<Vec<u8>>,
     done: bool,
 }
 
-impl Iterator for Era1BlockIter {
+impl BlockTupleIter {
+    /// Pop one complete block tuple if every component is pending.
+    fn try_pop_block(&mut self) -> Option<Era1BlockTuple> {
+        if self.headers.is_empty()
+            || self.bodies.is_empty()
+            || self.receipts.is_empty()
+            || (self.format.has_difficulty && self.difficulties.is_empty())
+        {
+            return None;
+        }
+
+        let compressed_header = self.headers.pop_front()?;
+        let compressed_body = self.bodies.pop_front()?;
+        let compressed_receipts = self.receipts.pop_front()?;
+        let total_difficulty = if self.format.has_difficulty {
+            self.difficulties.pop_front()?
+        } else {
+            Vec::new()
+        };
+
+        let tuple = Era1BlockTuple {
+            block_number: self.from_block + self.yielded,
+            compressed_header,
+            compressed_body,
+            compressed_receipts,
+            total_difficulty,
+        };
+        self.yielded += 1;
+        Some(tuple)
+    }
+
+    /// End of the block section: report leftover components or a shortfall
+    /// against the block index, then stop.
+    fn finish(&mut self) -> Option<Result<Era1BlockTuple, SourceError>> {
+        self.done = true;
+
+        if !self.headers.is_empty()
+            || !self.bodies.is_empty()
+            || !self.receipts.is_empty()
+            || !self.difficulties.is_empty()
+        {
+            return Some(Err(SourceError::InvalidE2Store {
+                path: self.path.clone(),
+                message: format!(
+                    "{} file ended mid-block: {} header(s), {} body(ies), {} receipt(s) left unmatched",
+                    self.format.name,
+                    self.headers.len(),
+                    self.bodies.len(),
+                    self.receipts.len(),
+                ),
+            }));
+        }
+
+        if self.yielded != self.expected_blocks {
+            return Some(Err(SourceError::InvalidE2Store {
+                path: self.path.clone(),
+                message: format!(
+                    "{} block index records {} blocks but the file contains {}",
+                    self.format.name, self.expected_blocks, self.yielded,
+                ),
+            }));
+        }
+
+        None
+    }
+}
+
+impl Iterator for BlockTupleIter {
     type Item = Result<Era1BlockTuple, SourceError>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -102,28 +199,13 @@ impl Iterator for Era1BlockIter {
         }
 
         loop {
-            if self.pending_header.is_some()
-                && self.pending_body.is_some()
-                && self.pending_receipts.is_some()
-                && self.pending_difficulty.is_some()
-            {
-                let tuple = Era1BlockTuple {
-                    block_number: self.from_block + self.block_index as u64,
-                    compressed_header: self.pending_header.take().unwrap(),
-                    compressed_body: self.pending_body.take().unwrap(),
-                    compressed_receipts: self.pending_receipts.take().unwrap(),
-                    total_difficulty: self.pending_difficulty.take().unwrap(),
-                };
-                self.block_index += 1;
+            if let Some(tuple) = self.try_pop_block() {
                 return Some(Ok(tuple));
             }
 
             let entry = match read_e2store_entry(&mut self.file, &self.path) {
                 Ok(Some(e)) => e,
-                Ok(None) => {
-                    self.done = true;
-                    return None;
-                }
+                Ok(None) => return self.finish(),
                 Err(e) => {
                     self.done = true;
                     return Some(Err(e));
@@ -131,14 +213,12 @@ impl Iterator for Era1BlockIter {
             };
 
             match entry.entry_type {
-                E2STORE_VERSION => {}
-                ERA1_COMPRESSED_HEADER => self.pending_header = Some(entry.data),
-                ERA1_COMPRESSED_BODY => self.pending_body = Some(entry.data),
-                ERA1_COMPRESSED_RECEIPTS => self.pending_receipts = Some(entry.data),
-                ERA1_TOTAL_DIFFICULTY => self.pending_difficulty = Some(entry.data),
-                ERA1_BLOCK_INDEX => {
-                    self.done = true;
-                    return None;
+                t if t == self.format.block_index_entry => return self.finish(),
+                t if t == self.format.receipts_entry => self.receipts.push_back(entry.data),
+                ERA1_COMPRESSED_HEADER => self.headers.push_back(entry.data),
+                ERA1_COMPRESSED_BODY => self.bodies.push_back(entry.data),
+                ERA1_TOTAL_DIFFICULTY if self.format.has_difficulty => {
+                    self.difficulties.push_back(entry.data)
                 }
                 _ => {}
             }
@@ -146,131 +226,44 @@ impl Iterator for Era1BlockIter {
     }
 }
 
-pub(crate) enum BlockTupleIter {
-    Era1(Era1BlockIter),
-    Ere(std::vec::IntoIter<Result<Era1BlockTuple, SourceError>>),
-}
-
-impl Iterator for BlockTupleIter {
-    type Item = Result<Era1BlockTuple, SourceError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            Self::Era1(iter) => iter.next(),
-            Self::Ere(iter) => iter.next(),
-        }
-    }
-}
-
 /// Open an era file and return an iterator that yields every block tuple in order.
 ///
-/// The block index at the end of the file is read first to determine `from_block`,
-/// then the file is rewound to the beginning for the sequential one-pass read.
+/// The block index at the end of the file is read first to determine the
+/// block range, then the file is rewound to the beginning for the sequential
+/// one-pass read.
 pub(crate) fn iter_era1_block_tuples(
     path: impl AsRef<Path>,
 ) -> Result<BlockTupleIter, SourceError> {
     let path = path.as_ref();
-    if path.extension().and_then(|ext| ext.to_str()) == Some("ere") {
-        return iter_ere_block_tuples(path).map(BlockTupleIter::Ere);
-    }
+    let format = if path.extension().and_then(|ext| ext.to_str()) == Some("ere") {
+        &ERE_TRAVERSAL
+    } else {
+        &ERA1_TRAVERSAL
+    };
 
     let range = read_era1_block_index_range(path)?.ok_or_else(|| SourceError::InvalidE2Store {
         path: path.to_owned(),
-        message: "no block index found in ERA1 file".into(),
+        message: format!("no block index found in {} file", format.name),
     })?;
-    let from_block = range.from_block;
 
     let file = fs::File::open(path).map_err(|source| SourceError::ReadFile {
         path: path.to_owned(),
         source,
     })?;
 
-    Ok(BlockTupleIter::Era1(Era1BlockIter {
+    Ok(BlockTupleIter {
         file,
         path: path.to_owned(),
-        from_block,
-        pending_header: None,
-        pending_body: None,
-        pending_receipts: None,
-        pending_difficulty: None,
-        block_index: 0,
+        format,
+        from_block: range.from_block,
+        expected_blocks: range.to_block.saturating_sub(range.from_block) + 1,
+        yielded: 0,
+        headers: VecDeque::new(),
+        bodies: VecDeque::new(),
+        receipts: VecDeque::new(),
+        difficulties: VecDeque::new(),
         done: false,
-    }))
-}
-
-fn iter_ere_block_tuples(
-    path: &Path,
-) -> Result<std::vec::IntoIter<Result<Era1BlockTuple, SourceError>>, SourceError> {
-    let range = read_era1_block_index_range(path)?.ok_or_else(|| SourceError::InvalidE2Store {
-        path: path.to_owned(),
-        message: "no dynamic block index found in Ere file".into(),
-    })?;
-
-    let mut file = fs::File::open(path).map_err(|source| SourceError::ReadFile {
-        path: path.to_owned(),
-        source,
-    })?;
-
-    let mut headers = Vec::new();
-    let mut bodies = Vec::new();
-    let mut receipts = Vec::new();
-    let mut difficulties = Vec::new();
-
-    while let Some(entry) = read_e2store_entry(&mut file, path)? {
-        match entry.entry_type {
-            E2STORE_VERSION => {}
-            ERA1_COMPRESSED_HEADER => headers.push(entry.data),
-            ERA1_COMPRESSED_BODY => bodies.push(entry.data),
-            ERE_COMPRESSED_SLIM_RECEIPTS => receipts.push(entry.data),
-            ERA1_TOTAL_DIFFICULTY => difficulties.push(entry.data),
-            ERE_DYNAMIC_BLOCK_INDEX => break,
-            _ => {}
-        }
-    }
-
-    let count = range.to_block.saturating_sub(range.from_block) as usize + 1;
-    if headers.len() != count || bodies.len() != count {
-        return Err(SourceError::InvalidE2Store {
-            path: path.to_owned(),
-            message: format!(
-                "Ere header/body count mismatch: headers={}, bodies={}, index={count}",
-                headers.len(),
-                bodies.len()
-            ),
-        });
-    }
-    if receipts.len() != count {
-        return Err(SourceError::InvalidE2Store {
-            path: path.to_owned(),
-            message: "Ere file does not contain one slim receipts entry per block".into(),
-        });
-    }
-    if !difficulties.is_empty() && difficulties.len() != count {
-        return Err(SourceError::InvalidE2Store {
-            path: path.to_owned(),
-            message: "Ere total difficulty section must be absent or one entry per block".into(),
-        });
-    }
-
-    let tuples = headers
-        .into_iter()
-        .zip(bodies)
-        .zip(receipts)
-        .enumerate()
-        .map(
-            |(index, ((compressed_header, compressed_body), compressed_receipts))| {
-                Ok(Era1BlockTuple {
-                    block_number: range.from_block + index as u64,
-                    compressed_header,
-                    compressed_body,
-                    compressed_receipts,
-                    total_difficulty: difficulties.get(index).cloned().unwrap_or_default(),
-                })
-            },
-        )
-        .collect::<Vec<_>>();
-
-    Ok(tuples.into_iter())
+    })
 }
 
 pub(crate) fn read_era1_block_index_range(
