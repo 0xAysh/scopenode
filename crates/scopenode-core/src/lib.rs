@@ -8,6 +8,7 @@
 pub mod abi;
 pub mod abi_resolution;
 pub use abi_resolution::AbiFetcher;
+pub mod codec;
 pub mod config;
 pub mod decode_quality;
 mod e2store;
