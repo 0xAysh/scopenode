@@ -445,11 +445,9 @@ fn build_synthetic_era1(contract: Address, transfer_topic0: B256) -> Vec<u8> {
     file
 }
 
-/// ABI JSON in the cache format used by AbiCache::get_or_fetch.
-/// This is NOT the raw Ethereum ABI format — it uses {name, inputs} objects
-/// matching parse_cached_events expectations.
+/// ABI JSON in the pinned ABI cache format (see `abi_resolution::parse_event_entries`).
 fn transfer_abi_json() -> String {
-    r#"[{"name":"Transfer","inputs":[
+    r#"[{"type":"event","name":"Transfer","inputs":[
         {"name":"from","type":"address","indexed":true,"components":[]},
         {"name":"to","type":"address","indexed":true,"components":[]},
         {"name":"value","type":"uint256","indexed":false,"components":[]}

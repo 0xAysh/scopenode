@@ -44,7 +44,8 @@ impl AbiResolver {
         let addr_str = contract.address.to_checksum(None);
 
         if let Ok(Some(cached)) = self.store.load(&addr_str).await {
-            let all_events = parse_cached_events(contract.address, &cached)?;
+            let abi_array = parse_abi_json(contract.address, &cached)?;
+            let all_events = parse_event_entries(&abi_array);
             return filter_events(all_events, &contract.events, contract.address);
         }
 
@@ -52,10 +53,13 @@ impl AbiResolver {
             match load_abi_override(override_path, contract.address) {
                 Ok(all_events) => {
                     let json = serialize_events_to_json(&all_events);
-                    let _ = self
+                    if let Err(e) = self
                         .store
                         .save(&addr_str, contract.name.as_deref(), &json)
-                        .await;
+                        .await
+                    {
+                        warn!(address = %contract.address, error = %e, "failed to write ABI to cache");
+                    }
                     return filter_events(all_events, &contract.events, contract.address);
                 }
                 Err(_) => {
@@ -70,14 +74,16 @@ impl AbiResolver {
                 warn!(address = %fetch_addr, "no abi_override set, falling back to remote ABI fetch");
             }
             if let Ok(raw_json) = fetcher.fetch(fetch_addr).await {
-                let abi_array: Vec<Value> = serde_json::from_str(&raw_json)
-                    .map_err(|e| AbiError::ParseFailed(contract.address, e.to_string()))?;
-                let all_events = parse_events_from_abi(contract.address, &abi_array)?;
+                let abi_array = parse_abi_json(contract.address, &raw_json)?;
+                let all_events = parse_event_entries(&abi_array);
                 let normalized = serialize_events_to_json(&all_events);
-                let _ = self
+                if let Err(e) = self
                     .store
                     .save(&addr_str, contract.name.as_deref(), &normalized)
-                    .await;
+                    .await
+                {
+                    warn!(address = %contract.address, error = %e, "failed to write ABI to cache");
+                }
                 return filter_events(all_events, &contract.events, contract.address);
             }
         }
@@ -92,16 +98,21 @@ pub fn load_abi_override(
     address: Address,
 ) -> Result<Vec<EventAbi>, AbiError> {
     let content = std::fs::read_to_string(path)?;
-    let abi_array: Vec<Value> = serde_json::from_str(&content)
-        .map_err(|e| AbiError::ParseFailed(address, e.to_string()))?;
-    parse_events_from_abi(address, &abi_array)
+    let abi_array = parse_abi_json(address, &content)?;
+    Ok(parse_event_entries(&abi_array))
 }
 
-fn parse_events_from_abi(
-    _address: Address,
-    abi_array: &[Value],
-) -> Result<Vec<EventAbi>, AbiError> {
-    let events: Vec<EventAbi> = abi_array
+/// Parse a JSON string into an ABI entry array, regardless of whether it
+/// originated from an override file, a Sourcify response, or the ABI cache.
+fn parse_abi_json(address: Address, json: &str) -> Result<Vec<Value>, AbiError> {
+    serde_json::from_str(json).map_err(|e| AbiError::ParseFailed(address, e.to_string()))
+}
+
+/// Extract event definitions from ABI entries. Used for ABI override files,
+/// Sourcify responses, and the round-tripped ABI cache alike — all three
+/// represent events as `{"type": "event", "name": ..., "inputs": [...]}`.
+fn parse_event_entries(abi_array: &[Value]) -> Vec<EventAbi> {
+    abi_array
         .iter()
         .filter(|entry| entry["type"].as_str() == Some("event"))
         .filter_map(|entry| {
@@ -116,32 +127,7 @@ fn parse_events_from_abi(
                 .unwrap_or_default();
             Some(EventAbi { name, inputs })
         })
-        .collect();
-
-    Ok(events)
-}
-
-fn parse_cached_events(address: Address, cached_json: &str) -> Result<Vec<EventAbi>, AbiError> {
-    let entries: Vec<Value> = serde_json::from_str(cached_json)
-        .map_err(|e| AbiError::ParseFailed(address, e.to_string()))?;
-
-    let events = entries
-        .iter()
-        .filter_map(|entry| {
-            let name = entry["name"].as_str()?.to_string();
-            let inputs = entry["inputs"]
-                .as_array()
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|i| serde_json::from_value::<EventInput>(i.clone()).ok())
-                        .collect()
-                })
-                .unwrap_or_default();
-            Some(EventAbi { name, inputs })
-        })
-        .collect();
-
-    Ok(events)
+        .collect()
 }
 
 fn serialize_event_input(i: &EventInput) -> Value {
@@ -159,6 +145,7 @@ fn serialize_events_to_json(events: &[EventAbi]) -> String {
             .iter()
             .map(|e| {
                 serde_json::json!({
+                    "type": "event",
                     "name": e.name,
                     "inputs": e.inputs.iter().map(serialize_event_input).collect::<Vec<_>>(),
                 })
@@ -303,6 +290,7 @@ mod tests {
 
     fn cached_transfer_json() -> String {
         serde_json::json!([{
+            "type": "event",
             "name": "Transfer",
             "inputs": [
                 {"name": "from", "type": "address", "indexed": true, "components": []},
@@ -451,6 +439,52 @@ mod tests {
         let err = resolver.resolve_events(&cfg).await.unwrap_err();
 
         assert!(matches!(err, AbiError::EventNotFound(ref name, _) if name == "Mint"));
+    }
+
+    #[test]
+    fn cache_round_trip_preserves_events() {
+        let events = vec![EventAbi {
+            name: "Transfer".to_string(),
+            inputs: vec![
+                EventInput {
+                    name: "from".to_string(),
+                    ty: "address".to_string(),
+                    indexed: true,
+                    components: vec![],
+                },
+                EventInput {
+                    name: "value".to_string(),
+                    ty: "uint256".to_string(),
+                    indexed: false,
+                    components: vec![],
+                },
+            ],
+        }];
+
+        let json = serialize_events_to_json(&events);
+        let abi_array = parse_abi_json(ADDR, &json).unwrap();
+        let parsed = parse_event_entries(&abi_array);
+
+        assert_eq!(parsed, events);
+    }
+
+    #[test]
+    fn parse_event_entries_filters_non_events_and_malformed() {
+        let abi_array: Vec<Value> = serde_json::from_str(
+            r#"[
+                {"type":"function","name":"transfer","inputs":[]},
+                {"type":"event","name":"Transfer","inputs":[
+                    {"name":"from","type":"address","indexed":true,"components":[]}
+                ]},
+                {"type":"event","inputs":[]}
+            ]"#,
+        )
+        .unwrap();
+
+        let events = parse_event_entries(&abi_array);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].name, "Transfer");
     }
 
     #[tokio::test]

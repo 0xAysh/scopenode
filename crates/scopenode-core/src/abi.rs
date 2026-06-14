@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use tracing::warn;
 
 /// A single input parameter definition from a Solidity event ABI.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct EventInput {
     pub name: String,
     #[serde(rename = "type")]
@@ -28,7 +28,7 @@ pub struct EventInput {
 }
 
 /// Parsed ABI for a single Solidity event.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct EventAbi {
     pub name: String,
     pub inputs: Vec<EventInput>,
