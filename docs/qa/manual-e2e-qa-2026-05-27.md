@@ -150,7 +150,8 @@ In another terminal, verify:
 - `net_peerCount` returns `0x0`;
 - `eth_blockNumber` returns the latest stored-event block or `0x0`;
 - `eth_getLogs` returns correctly projected logs for one indexed address;
-- missing address and multiple addresses are rejected;
+- missing address returns `-32602` (Invalid params) with a message naming the field;
+- multiple addresses returns `-32002`;
 - topic0 OR and topics beyond topic0 are rejected;
 - an unindexed contract returns `-32000`;
 - an uncovered explicit range returns `-32001`;
@@ -171,10 +172,11 @@ GET /events?contract=...&event=...&topic0=...&fromBlock=...&toBlock=...
 Check:
 
 - limit defaults to 100 and is clamped to 10,000;
-- offset pagination is stable;
+- offset pagination works: `limit=100&offset=100` returns the next page;
 - covered empty queries return an empty list;
 - unindexed contracts return an empty list, intentionally differing from RPC;
-- uncovered explicit ranges and oversized results return HTTP 400;
+- uncovered explicit ranges return HTTP 400;
+- queries that would materialise more than 10,000 rows return HTTP 400 (the 10k hard cap, not the user-supplied limit);
 - missing ABIs return HTTP 404.
 
 ## 8. Operational failures

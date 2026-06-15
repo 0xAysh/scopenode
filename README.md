@@ -173,11 +173,12 @@ The server binds to `127.0.0.1:<node.port>`.
 
 `eth_getLogs` rejects:
 
-- missing or multiple addresses;
+- missing address (`-32602` Invalid params);
+- multiple addresses (`-32002`);
 - topic0 OR filters;
 - topic filters beyond topic0;
-- uncovered explicit ranges;
-- result sets over 10,000 rows.
+- uncovered explicit ranges (`-32001`);
+- result sets over 10,000 rows (`-32005`).
 
 Example:
 
@@ -205,9 +206,12 @@ GET /contracts
 GET /abi/:address
 ```
 
-`limit` defaults to 100 and is clamped to 10,000. The event query path is shared
-with JSON-RPC, so coverage and result-cap policy remain consistent. REST returns
-an empty result for an unindexed contract; JSON-RPC returns a not-indexed error.
+`limit` defaults to 100 and is clamped to 10,000. Offset pagination is functional:
+supplying `limit=100&offset=100` returns the next page. HTTP 400 is returned only
+when a query would materialise more than 10,000 rows regardless of the
+user-supplied limit. The event query path is shared with JSON-RPC, so coverage
+policy is consistent. REST returns an empty result for an unindexed contract;
+JSON-RPC returns a not-indexed error (`-32000`).
 
 ## Storage
 
@@ -229,7 +233,7 @@ repeated syncs idempotent.
 
 ```text
 crates/scopenode/
-  cli.rs, runtime.rs, sync_plan.rs
+  cli.rs, runtime.rs
   commands/{sync,serve,status}.rs
   sourcify.rs
 

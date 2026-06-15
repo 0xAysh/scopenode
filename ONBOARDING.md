@@ -28,7 +28,7 @@ main.rs
   → cli.rs
   → commands/sync.rs
   → RuntimeContext::load
-  → SyncPlan::from_config          (normalized path, Union range, configured Contract scopes)
+  → expand_tilde + union_block_range (inline: normalized era_dir, Union range from contract scopes)
   → Era1Source::scan
   → AbiResolver::resolve_events
   → run_era1_scopes
@@ -172,7 +172,7 @@ Read `coverage.rs`, then `query.rs`, then the completion logic at the end of
 2. `crates/scopenode/src/main.rs`
 3. `crates/scopenode/src/runtime.rs`
 4. `crates/scopenode-core/src/config.rs`
-5. `crates/scopenode/src/sync_plan.rs`
+5. `crates/scopenode/src/commands/sync.rs` (top of file: `union_block_range`, `render_dry_run`)
 
 Goal: explain how a TOML file becomes validated runtime state and contract
 scopes.
@@ -227,7 +227,6 @@ These reveal the intended cross-crate contracts more reliably than comments.
 | Module | Owns | Must not own |
 |---|---|---|
 | CLI/runtime | command parsing, config/data-dir startup | archive or query policy |
-| sync plan | immutable scope/range planning | I/O |
 | source | archive discovery, manifests, file selection | ABI or SQLite |
 | reader/codec/e2store | archive byte interpretation | contract selection |
 | ABI resolution | cache/local/remote lookup order | receipt traversal |
