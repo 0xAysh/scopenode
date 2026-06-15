@@ -274,7 +274,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn capped_when_result_exceeds_limit() {
+    async fn capped_only_at_hard_ten_thousand_cap() {
+        let (db, _guard) = open_test_db().await;
+        db.upsert_contract(CONTRACT, None, "[]").await.unwrap();
+        let events: Vec<_> = (0i64..10_001)
+            .map(|i| make_event(CONTRACT, 1_000 + i, i))
+            .collect();
+        db.insert_events(&events).await.unwrap();
+        let outcome = db
+            .query_events(&EventQuery {
+                contract: Some(CONTRACT.to_string()),
+                limit: 10_000,
+                ..EventQuery::default()
+            })
+            .await
+            .unwrap();
+        assert!(matches!(outcome, EventQueryOutcome::Capped { cap: 10_000, .. }));
+    }
+
+    #[tokio::test]
+    async fn limit_below_hard_cap_returns_results_not_capped() {
         let (db, _guard) = open_test_db().await;
         db.upsert_contract(CONTRACT, None, "[]").await.unwrap();
         let events: Vec<_> = (0..5).map(|i| make_event(CONTRACT, 100 + i, i)).collect();
@@ -287,7 +306,10 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(matches!(outcome, EventQueryOutcome::Capped { cap: 3, .. }));
+        assert!(
+            matches!(&outcome, EventQueryOutcome::Results(rows) if rows.len() == 3),
+            "limit=3 with 5 events must be Results(3), not Capped"
+        );
     }
 
     // ── 10,000 / 10,001 cap boundary ─────────────────────────────────────────

@@ -67,7 +67,7 @@ impl EthApiServer for EthApiImpl {
         let response = execute_event_query(&self.db, FilterPlan::from_rpc_filter(&filter))
             .await
             .map_err(|err| match err {
-                EventQueryFrontDoorError::MissingAddress => not_indexed_error(),
+                EventQueryFrontDoorError::MissingAddress => missing_address_error(),
                 EventQueryFrontDoorError::Unsupported { reason } => {
                     ErrorObject::owned(-32002, reason, None::<()>)
                 }
@@ -118,6 +118,14 @@ fn not_indexed_error() -> ErrorObject<'static> {
     ErrorObject::owned(
         -32000,
         "Contract not indexed. Run `scopenode status` to see what's indexed.",
+        None::<()>,
+    )
+}
+
+fn missing_address_error() -> ErrorObject<'static> {
+    ErrorObject::owned(
+        -32602,
+        "address filter is required for eth_getLogs",
         None::<()>,
     )
 }

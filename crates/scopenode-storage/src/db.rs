@@ -292,9 +292,10 @@ impl Db {
 
     /// Query events with the given filter.
     ///
-    /// When `filter.limit > 0` the storage layer queries `limit + 1` rows
-    /// internally. Returns [`QueryResult::Capped`] when the result exceeds
-    /// `limit`; [`QueryResult::Results`] otherwise.
+    /// [`QueryResult::Capped`] is returned only when `filter.limit == 10_000`
+    /// (the hard global cap) and the result set exceeds that limit. For any
+    /// smaller `limit` value the SQL `LIMIT` clause enforces the constraint
+    /// directly and the result is always [`QueryResult::Results`].
     pub(crate) async fn query_events_for_filter(
         &self,
         filter: &EventFilter,
@@ -305,11 +306,17 @@ impl Db {
         let has_event_name = filter.event_name.is_some();
         let has_topic0 = filter.topic0.is_some();
 
-        let query_limit = if filter.limit > 0 {
-            filter.limit + 1
+        const HARD_CAP: u64 = 10_000;
+        let (query_limit, check_overflow) = if filter.limit == 0 {
+            (i64::MAX as u64, false)
+        } else if filter.limit == HARD_CAP {
+            // Query one extra row to detect overflow at the hard cap.
+            (HARD_CAP + 1, true)
         } else {
-            i64::MAX as u64
+            // Below the hard cap: SQL LIMIT enforces truncation directly.
+            (filter.limit, false)
         };
+
         let sql = format!(
             "{} LIMIT ? OFFSET ?",
             filter_sql_base(has_contract, has_event_name, has_topic0)
@@ -336,11 +343,11 @@ impl Db {
             .await
             .map_err(|e| DbError::Query(e.to_string()))?;
 
-        if filter.limit > 0 && rows.len() as u64 > filter.limit {
-            rows.truncate(filter.limit as usize);
+        if check_overflow && rows.len() as u64 > HARD_CAP {
+            rows.truncate(HARD_CAP as usize);
             return Ok(QueryResult::Capped {
                 results: rows,
-                cap: filter.limit,
+                cap: HARD_CAP,
             });
         }
 
@@ -535,7 +542,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn query_events_for_filter_returns_capped_when_cap_exceeded() {
+    async fn query_events_for_filter_returns_capped_only_at_hard_cap() {
+        let (db, _guard) = open_test_db().await;
+        let contract = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
+        db.upsert_contract(contract, None, "[]").await.unwrap();
+        let events: Vec<_> = (0i64..10_001)
+            .map(|i| {
+                make_event(
+                    contract,
+                    1_000 + i,
+                    &format!("0x{:04x}", i),
+                    &format!("0x{:04x}", i),
+                    0,
+                )
+            })
+            .collect();
+        db.insert_events(&events).await.unwrap();
+
+        let result = db
+            .query_events_for_filter(&EventFilter {
+                contract: Some(contract.to_string()),
+                limit: 10_000,
+                ..EventFilter::default()
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(&result, QueryResult::Capped { results, cap: 10_000 } if results.len() == 10_000),
+            "expected Capped with 10,000 rows, got: {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn query_events_for_filter_returns_results_not_capped_below_hard_cap() {
         let (db, _guard) = open_test_db().await;
         let contract = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
         db.upsert_contract(contract, None, "[]").await.unwrap();
@@ -562,8 +603,8 @@ mod tests {
             .unwrap();
 
         assert!(
-            matches!(&result, QueryResult::Capped { results, cap: 3 } if results.len() == 3),
-            "expected Capped with 3 rows, got: {:?}",
+            matches!(&result, QueryResult::Results(rows) if rows.len() == 3),
+            "limit=3 with 5 events must return Results(3), not Capped, got: {:?}",
             result
         );
     }

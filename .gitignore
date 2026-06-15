@@ -3,7 +3,6 @@
 *.db-wal
 *.db-shm
 *.db.snap
-config.test.toml
 .env
 .claude
 .worktrees/

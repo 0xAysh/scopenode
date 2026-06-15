@@ -423,3 +423,102 @@ async fn rpc_rejects_more_than_ten_thousand_logs() {
 
     cleanup(&path);
 }
+
+#[tokio::test]
+async fn rest_pagination_default_limit_returns_200_with_100_rows() {
+    let (db, path) = open_test_db().await;
+    seed_many(&db, 101).await;
+
+    let (status, json) = get_json(&db, &format!("/events?contract={ADDR_STR}")).await;
+
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(
+        json["events"].as_array().unwrap().len(),
+        100,
+        "default limit=100 must return 100 rows even when 101 exist"
+    );
+    assert_eq!(json["count"].as_u64(), Some(100));
+
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn rest_pagination_offset_returns_remaining_rows() {
+    let (db, path) = open_test_db().await;
+    seed_many(&db, 101).await;
+
+    let (status, json) =
+        get_json(&db, &format!("/events?contract={ADDR_STR}&limit=100&offset=100")).await;
+
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(
+        json["events"].as_array().unwrap().len(),
+        1,
+        "offset=100 with 101 total must return 1 remaining row"
+    );
+
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn rest_pagination_offset_beyond_total_returns_empty() {
+    let (db, path) = open_test_db().await;
+    seed_many(&db, 5).await;
+
+    let (status, json) =
+        get_json(&db, &format!("/events?contract={ADDR_STR}&limit=100&offset=10")).await;
+
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(
+        json["events"].as_array().unwrap().len(),
+        0,
+        "offset beyond total event count must return empty array"
+    );
+    assert_eq!(json["count"].as_u64(), Some(0));
+
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn rpc_missing_address_returns_invalid_params() {
+    let (db, path) = open_test_db().await;
+    seed(&db).await;
+
+    let api = EthApiImpl::new(db.clone());
+    let err = EthApiServer::get_logs(&api, Filter::new())
+        .await
+        .expect_err("missing address must return an error");
+
+    assert_eq!(
+        err.code(),
+        -32602,
+        "missing address must use -32602 (Invalid params), got code {}",
+        err.code()
+    );
+    assert!(
+        err.message().to_lowercase().contains("address"),
+        "error message must name the missing field, got: {}",
+        err.message()
+    );
+
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn rpc_missing_address_error_does_not_mention_sync() {
+    let (db, path) = open_test_db().await;
+    seed(&db).await;
+
+    let api = EthApiImpl::new(db.clone());
+    let err = EthApiServer::get_logs(&api, Filter::new())
+        .await
+        .expect_err("missing address must return an error");
+
+    assert!(
+        !err.message().contains("indexed") && !err.message().contains("sync"),
+        "missing-address error must not mention sync state, got: {}",
+        err.message()
+    );
+
+    cleanup(&path);
+}

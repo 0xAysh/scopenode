@@ -1,0 +1,38 @@
+# config.test.toml
+[node]
+port = 18545
+rest_port = 18546
+data_dir = "~/.scopenode-staging"
+era_dir = "./fixtures/era1/mainnet"
+
+# Small, user-shaped smoke scope: multiple high-volume contracts over a narrow
+# range so manual REST/RPC testing has realistic filters without huge result sets.
+# This range sits inside fixtures/era1/mainnet/mainnet-01510-87aec91b.era1.
+[[contracts]]
+name = "WETH"
+address = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+events = ["Deposit", "Withdrawal", "Transfer"]
+from_block = 12369920
+to_block = 12370020
+
+[[contracts]]
+name = "USDC"
+address = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+impl_address = "0x43506849D7C04F9138D1A2050bbF3A0c054402dd"
+events = ["Transfer", "Approval"]
+from_block = 12369920
+to_block = 12370020
+
+[[contracts]]
+name = "USDT"
+address = "0xdAC17F958D2ee523a2206206994597C13D831ec7"
+events = ["Transfer", "Approval"]
+from_block = 12369920
+to_block = 12370020
+
+[[contracts]]
+name = "Uniswap V3 ETH/USDC 0.3%"
+address = "0x8ad599c3A0ff1De082011EFDDc58f1908eb6e6D8"
+events = ["Swap", "Mint", "Burn", "Collect"]
+from_block = 12369920
+to_block = 12370200

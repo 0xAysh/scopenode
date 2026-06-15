@@ -83,15 +83,16 @@ mod tests {
         drop(file);
         let db = Db::open(path.to_path_buf()).await.unwrap();
         db.upsert_contract(CONTRACT, None, "[]").await.unwrap();
-        db.insert_events(&[make_event(100, 0), make_event(101, 1)])
-            .await
-            .unwrap();
+        let events: Vec<_> = (0i64..10_001)
+            .map(|i| make_event(1_000 + i, i))
+            .collect();
+        db.insert_events(&events).await.unwrap();
 
         let response = execute_event_query(
             &db,
             FilterPlan::Query(EventQuery {
                 contract: Some(CONTRACT.to_string()),
-                limit: 1,
+                limit: 10_000,
                 ..EventQuery::default()
             }),
         )
@@ -100,7 +101,7 @@ mod tests {
 
         assert!(matches!(
             response,
-            EventQueryResponse::TooManyResults { cap: 1 }
+            EventQueryResponse::TooManyResults { cap: 10_000 }
         ));
     }
 }
