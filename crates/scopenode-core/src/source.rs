@@ -3,13 +3,18 @@
 pub use crate::codec::decode_era1_header;
 use crate::e2store::read_era1_block_index_range;
 pub use crate::e2store::read_era1_block_tuple;
-use sha2::{Digest, Sha256};
-use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Read};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 use thiserror::Error;
+
+mod checksum;
+mod filename;
+
+pub use checksum::ChecksumStatus;
+use checksum::{read_checksum_index, sha256_file};
+use filename::parse_era1_filename;
 
 pub const ERA1_BLOCKS_PER_FILE: u64 = 8192;
 
@@ -183,46 +188,6 @@ impl RangeCompleteness {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ChecksumStatus {
-    Verified,
-    Mismatched { expected: String },
-    Missing,
-    Unavailable,
-}
-
-impl ChecksumStatus {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Verified => "verified",
-            Self::Mismatched { .. } => "mismatched",
-            Self::Missing => "missing",
-            Self::Unavailable => "unavailable",
-        }
-    }
-
-    pub fn expected_sha256(&self) -> Option<&str> {
-        match self {
-            Self::Mismatched { expected } => Some(expected),
-            Self::Verified | Self::Missing | Self::Unavailable => None,
-        }
-    }
-
-    pub fn is_mismatched(&self) -> bool {
-        matches!(self, Self::Mismatched { .. })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Era1FileName {
-    format: String,
-    network: String,
-    epoch: u64,
-    file_hash: String,
-    from_block: u64,
-    to_block: u64,
-}
-
 /// Scan a directory for ERA1 files and return a manifest.
 ///
 /// `from_block`/`to_block` define the union range of interest. Files whose
@@ -340,164 +305,11 @@ pub fn scan_era1_source(
     })
 }
 
-fn parse_era1_filename(path: &Path, network_override: Option<&str>) -> Option<Era1FileName> {
-    let extension = path.extension().and_then(|ext| ext.to_str())?;
-    if extension != "era1" && extension != "ere" {
-        return None;
-    }
-
-    let stem = path.file_stem()?.to_str()?;
-    let parts = stem.split('-').collect::<Vec<_>>();
-    if (extension == "era1" && parts.len() != 3) || (extension == "ere" && parts.len() < 3) {
-        return None;
-    }
-
-    let network = network_override.unwrap_or(parts[0]).to_string();
-    let epoch = parts[1].parse::<u64>().ok()?;
-    let file_hash = parts[2].to_string();
-    if file_hash.len() != 8 || !file_hash.chars().all(|c| c.is_ascii_hexdigit()) {
-        return None;
-    }
-    if extension == "ere"
-        && !parts[3..]
-            .iter()
-            .all(|profile| !profile.is_empty() && profile.chars().all(|c| c.is_ascii_lowercase()))
-    {
-        return None;
-    }
-    let from_block = epoch.checked_mul(ERA1_BLOCKS_PER_FILE)?;
-    let to_block = from_block.checked_add(ERA1_BLOCKS_PER_FILE - 1)?;
-
-    Some(Era1FileName {
-        format: extension.to_string(),
-        network,
-        epoch,
-        file_hash,
-        from_block,
-        to_block,
-    })
-}
-
-#[derive(Debug, Default)]
-struct ChecksumIndex {
-    ordered: Vec<String>,
-    by_filename: HashMap<String, String>,
-    available: bool,
-}
-
-impl ChecksumIndex {
-    fn status_for(&self, filename: &str, epoch: u64, actual: &str) -> ChecksumStatus {
-        if !self.available {
-            return ChecksumStatus::Unavailable;
-        }
-
-        let expected = self
-            .by_filename
-            .get(filename)
-            .or_else(|| self.ordered.get(epoch as usize));
-
-        match expected {
-            Some(expected) if expected == actual => ChecksumStatus::Verified,
-            Some(expected) => ChecksumStatus::Mismatched {
-                expected: expected.clone(),
-            },
-            None => ChecksumStatus::Missing,
-        }
-    }
-}
-
-fn read_checksum_index(path: &Path) -> ChecksumIndex {
-    let checksum_path = path.join("checksums.txt");
-    let Ok(content) = fs::read_to_string(checksum_path) else {
-        return ChecksumIndex::default();
-    };
-
-    let mut index = ChecksumIndex {
-        ordered: Vec::new(),
-        by_filename: HashMap::new(),
-        available: true,
-    };
-
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let mut parts = line.split_whitespace();
-        let Some(raw_hash) = parts.next() else {
-            continue;
-        };
-        let Some(hash) = normalize_sha256(raw_hash) else {
-            continue;
-        };
-        if let Some(name) = parts.next() {
-            index.by_filename.insert(name.to_string(), hash.clone());
-        }
-        index.ordered.push(hash);
-    }
-
-    index
-}
-
-fn normalize_sha256(value: &str) -> Option<String> {
-    let stripped = value.strip_prefix("0x").unwrap_or(value);
-    if stripped.len() == 64 && stripped.chars().all(|c| c.is_ascii_hexdigit()) {
-        Some(stripped.to_ascii_lowercase())
-    } else {
-        None
-    }
-}
-
-fn sha256_file(path: &Path) -> Result<String, SourceError> {
-    let mut file = fs::File::open(path).map_err(|source| SourceError::ReadFile {
-        path: path.to_owned(),
-        source,
-    })?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|source| SourceError::ReadFile {
-                path: path.to_owned(),
-                source,
-            })?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(alloy_primitives::hex::encode(hasher.finalize()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::e2store::iter_era1_block_tuples;
     use tempfile::tempdir;
-
-    #[test]
-    fn parses_standard_era1_filename() {
-        let parsed = parse_era1_filename(Path::new("mainnet-00000-5ec1ffb8.era1"), None).unwrap();
-
-        assert_eq!(parsed.network, "mainnet");
-        assert_eq!(parsed.epoch, 0);
-        assert_eq!(parsed.file_hash, "5ec1ffb8");
-        assert_eq!(parsed.from_block, 0);
-        assert_eq!(parsed.to_block, 8191);
-    }
-
-    #[test]
-    fn parses_standard_ere_filename_with_profile() {
-        let parsed =
-            parse_era1_filename(Path::new("mainnet-00012-4bb7de2e-noproofs.ere"), None).unwrap();
-
-        assert_eq!(parsed.network, "mainnet");
-        assert_eq!(parsed.epoch, 12);
-        assert_eq!(parsed.file_hash, "4bb7de2e");
-        assert_eq!(parsed.from_block, 98_304);
-        assert_eq!(parsed.to_block, 106_495);
-    }
 
     #[test]
     fn scan_without_checksum_index_skips_sha256_hashing() {
