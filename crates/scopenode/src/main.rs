@@ -6,7 +6,6 @@ mod cli;
 mod commands;
 mod runtime;
 mod sourcify;
-mod sync_plan;
 
 use anyhow::Result;
 use clap::Parser;
