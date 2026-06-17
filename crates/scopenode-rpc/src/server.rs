@@ -15,8 +15,7 @@
 
 use crate::filter_plan::FilterPlan;
 use crate::query_front_door::{
-    execute_event_query, EventQueryFrontDoorError, EventQueryResponse, MISSING_COVERAGE_MESSAGE,
-    RESULT_CAP_MESSAGE,
+    execute_event_query, EventQueryResponse, MISSING_COVERAGE_MESSAGE, RESULT_CAP_MESSAGE,
 };
 use alloy::rpc::types::{Filter, Log};
 use async_trait::async_trait;
@@ -66,14 +65,12 @@ impl EthApiServer for EthApiImpl {
     async fn get_logs(&self, filter: Filter) -> RpcResult<Vec<Log>> {
         let response = execute_event_query(&self.db, FilterPlan::from_rpc_filter(&filter))
             .await
-            .map_err(|err| match err {
-                EventQueryFrontDoorError::MissingAddress => missing_address_error(),
-                EventQueryFrontDoorError::Unsupported { reason } => {
-                    ErrorObject::owned(-32002, reason, None::<()>)
-                }
-                EventQueryFrontDoorError::Storage(e) => internal_error(&e.to_string()),
-            })?;
+            .map_err(|e| internal_error(&e.to_string()))?;
         match response {
+            EventQueryResponse::MissingAddress => Err(missing_address_error()),
+            EventQueryResponse::Unsupported { reason } => {
+                Err(ErrorObject::owned(-32002, reason, None::<()>))
+            }
             EventQueryResponse::NotIndexed => Err(not_indexed_error()),
             EventQueryResponse::MissingCoverage => Err(ErrorObject::owned(
                 -32001,

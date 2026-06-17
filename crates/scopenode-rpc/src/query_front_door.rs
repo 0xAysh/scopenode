@@ -7,6 +7,8 @@ pub const RESULT_CAP_MESSAGE: &str = "result set exceeds 10,000 rows — narrow 
 pub const MISSING_COVERAGE_MESSAGE: &str = "requested range is outside local coverage — run `scopenode sync` for this contract and block range";
 
 pub enum EventQueryResponse {
+    MissingAddress,
+    Unsupported { reason: String },
     NotIndexed,
     MissingCoverage,
     TooManyResults { cap: u64 },
@@ -14,29 +16,19 @@ pub enum EventQueryResponse {
     Results(Vec<StoredEvent>),
 }
 
-#[derive(Debug)]
-pub enum EventQueryFrontDoorError {
-    MissingAddress,
-    Unsupported { reason: String },
-    Storage(DbError),
-}
-
 pub async fn execute_event_query(
     db: &Db,
     plan: FilterPlan,
-) -> Result<EventQueryResponse, EventQueryFrontDoorError> {
+) -> Result<EventQueryResponse, DbError> {
     let query = match plan {
         FilterPlan::Query(query) => query,
-        FilterPlan::MissingAddress => return Err(EventQueryFrontDoorError::MissingAddress),
+        FilterPlan::MissingAddress => return Ok(EventQueryResponse::MissingAddress),
         FilterPlan::Unsupported { reason } => {
-            return Err(EventQueryFrontDoorError::Unsupported { reason });
+            return Ok(EventQueryResponse::Unsupported { reason });
         }
     };
 
-    db.query_events(&query)
-        .await
-        .map(map_event_query_outcome)
-        .map_err(EventQueryFrontDoorError::Storage)
+    db.query_events(&query).await.map(map_event_query_outcome)
 }
 
 pub fn map_event_query_outcome(outcome: EventQueryOutcome) -> EventQueryResponse {
@@ -74,6 +66,42 @@ mod tests {
             source: "era1".to_string(),
             timestamp: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn filter_plan_missing_address_returns_missing_address_response() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let (file, path) = tmp.into_parts();
+        drop(file);
+        let db = Db::open(path.to_path_buf()).await.unwrap();
+
+        let response = execute_event_query(&db, FilterPlan::MissingAddress)
+            .await
+            .unwrap();
+
+        assert!(matches!(response, EventQueryResponse::MissingAddress));
+    }
+
+    #[tokio::test]
+    async fn filter_plan_unsupported_returns_unsupported_response() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let (file, path) = tmp.into_parts();
+        drop(file);
+        let db = Db::open(path.to_path_buf()).await.unwrap();
+
+        let response = execute_event_query(
+            &db,
+            FilterPlan::Unsupported {
+                reason: "test reason".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            response,
+            EventQueryResponse::Unsupported { reason } if reason == "test reason"
+        ));
     }
 
     #[tokio::test]

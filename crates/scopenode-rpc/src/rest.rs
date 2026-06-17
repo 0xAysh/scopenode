@@ -39,8 +39,7 @@ use tracing::info;
 use crate::filter_plan::FilterPlan;
 use crate::projection::{project_row, EventResponse};
 use crate::query_front_door::{
-    execute_event_query, EventQueryFrontDoorError, EventQueryResponse, MISSING_COVERAGE_MESSAGE,
-    RESULT_CAP_MESSAGE,
+    execute_event_query, EventQueryResponse, MISSING_COVERAGE_MESSAGE, RESULT_CAP_MESSAGE,
 };
 use scopenode_storage::Db;
 
@@ -104,20 +103,16 @@ async fn get_events(
 
     let response = execute_event_query(&state.db, plan)
         .await
-        .map_err(|err| match err {
-            EventQueryFrontDoorError::MissingAddress => (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                "missing REST query plan".to_string(),
-            ),
-            EventQueryFrontDoorError::Unsupported { reason } => {
-                (axum::http::StatusCode::BAD_REQUEST, reason)
-            }
-            EventQueryFrontDoorError::Storage(e) => {
-                (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-            }
-        })?;
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     match response {
+        EventQueryResponse::MissingAddress => Err((
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "missing REST query plan".to_string(),
+        )),
+        EventQueryResponse::Unsupported { reason } => {
+            Err((axum::http::StatusCode::BAD_REQUEST, reason))
+        }
         EventQueryResponse::TooManyResults { .. } => Err((
             axum::http::StatusCode::BAD_REQUEST,
             RESULT_CAP_MESSAGE.into(),
