@@ -46,7 +46,11 @@ impl AbiResolver {
         if let Ok(Some(cached)) = self.store.load(&addr_str).await {
             let abi_array = parse_abi_json(contract.address, &cached)?;
             let all_events = parse_event_entries(&abi_array);
-            return filter_events(all_events, &contract.events, contract.address);
+            let is_wildcard = contract.events == ["*"];
+            if !all_events.is_empty() || is_wildcard {
+                return filter_events(all_events, &contract.events, contract.address);
+            }
+            warn!(address = %contract.address, "ABI cache has no event definitions (stale format?); falling through to re-resolve");
         }
 
         if let Some(override_path) = &contract.abi_override {
@@ -485,6 +489,111 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].name, "Transfer");
+    }
+
+    fn stale_abi_json() -> &'static str {
+        // Old format: missing "type": "event" discriminator, so parse_event_entries returns empty.
+        r#"[{"name":"Transfer","inputs":[
+            {"name":"from","type":"address","indexed":true,"components":[]},
+            {"name":"value","type":"uint256","indexed":false,"components":[]}
+        ]}]"#
+    }
+
+    #[tokio::test]
+    async fn stale_cache_non_wildcard_falls_through_to_abi_override() {
+        let store = StubAbiStore::with_entry(&ADDR.to_checksum(None), stale_abi_json());
+        let resolver = resolver(
+            Arc::clone(&store) as Arc<dyn AbiStore>,
+            Some(Arc::new(PanicFetcher)),
+        );
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(transfer_raw_abi().as_bytes()).unwrap();
+
+        let mut cfg = contract_cfg(vec!["Transfer"]);
+        cfg.abi_override = Some(tmp.path().to_path_buf());
+
+        let events = resolver.resolve_events(&cfg).await.unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].name, "Transfer");
+    }
+
+    #[tokio::test]
+    async fn stale_cache_non_wildcard_falls_through_to_fetcher() {
+        let store = StubAbiStore::with_entry(&ADDR.to_checksum(None), stale_abi_json());
+        let fetcher = StubAbiFetcher::ok(transfer_raw_abi());
+        let resolver = resolver(
+            Arc::clone(&store) as Arc<dyn AbiStore>,
+            Some(Arc::clone(&fetcher) as Arc<dyn AbiFetcher>),
+        );
+
+        let events = resolver
+            .resolve_events(&contract_cfg(vec!["Transfer"]))
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].name, "Transfer");
+        assert_eq!(fetcher.last_address(), Some(ADDR));
+    }
+
+    #[tokio::test]
+    async fn stale_cache_fallthrough_re_saves_in_canonical_format() {
+        let store = StubAbiStore::with_entry(&ADDR.to_checksum(None), stale_abi_json());
+        let fetcher = StubAbiFetcher::ok(transfer_raw_abi());
+        let resolver = resolver(
+            Arc::clone(&store) as Arc<dyn AbiStore>,
+            Some(Arc::clone(&fetcher) as Arc<dyn AbiFetcher>),
+        );
+
+        resolver
+            .resolve_events(&contract_cfg(vec!["Transfer"]))
+            .await
+            .unwrap();
+
+        let saved = store.get(&ADDR.to_checksum(None)).unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&saved).unwrap();
+        assert_eq!(parsed[0]["type"].as_str(), Some("event"),
+            "cache must be re-saved with canonical \"type\": \"event\" field");
+    }
+
+    #[tokio::test]
+    async fn healed_cache_not_fallen_through_on_second_resolve() {
+        // First call: stale cache falls through to fetcher, heals cache.
+        let store = StubAbiStore::with_entry(&ADDR.to_checksum(None), stale_abi_json());
+        let fetcher = StubAbiFetcher::ok(transfer_raw_abi());
+        let r = resolver(
+            Arc::clone(&store) as Arc<dyn AbiStore>,
+            Some(Arc::clone(&fetcher) as Arc<dyn AbiFetcher>),
+        );
+        r.resolve_events(&contract_cfg(vec!["Transfer"])).await.unwrap();
+
+        // Second call: cache now canonical — PanicFetcher must not fire.
+        let r2 = resolver(Arc::clone(&store) as Arc<dyn AbiStore>, Some(Arc::new(PanicFetcher)));
+        let events = r2
+            .resolve_events(&contract_cfg(vec!["Transfer"]))
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].name, "Transfer");
+    }
+
+    #[tokio::test]
+    async fn stale_cache_with_wildcard_does_not_fall_through() {
+        // Wildcard with empty events is valid — empty stale cache must not fall through.
+        let store = StubAbiStore::with_entry(&ADDR.to_checksum(None), stale_abi_json());
+        let resolver = resolver(
+            Arc::clone(&store) as Arc<dyn AbiStore>,
+            Some(Arc::new(PanicFetcher)),
+        );
+
+        let events = resolver
+            .resolve_events(&contract_cfg(vec!["*"]))
+            .await
+            .unwrap();
+
+        assert!(events.is_empty());
     }
 
     #[tokio::test]

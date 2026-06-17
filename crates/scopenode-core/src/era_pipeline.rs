@@ -300,6 +300,8 @@ impl BlockPipeline {
 /// Why a Contract scope did not earn Coverage in a run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IncompleteReason {
+    /// ABI resolution or scope setup failed before the pipeline could run.
+    PreparationFailed,
     /// An archive file could not be opened or a block could not be read.
     SourceFailure,
     /// Receipt verification failed for a block in the scope's range.
@@ -316,6 +318,7 @@ impl IncompleteReason {
     /// Human-readable cause for operator-facing output.
     pub fn describe(&self) -> &'static str {
         match self {
+            Self::PreparationFailed => "ABI resolution failure",
             Self::SourceFailure => "archive source read failure",
             Self::VerifyFailure => "receipt verification failure",
             Self::DecodeFailure => "event decode failure",
@@ -398,18 +401,20 @@ pub async fn run_era1_scopes(
     sink: &dyn PipelineSink,
     reporter: &dyn ProgressReporter,
 ) -> Result<SyncReport, CoreError> {
-    let scopes = prepare_scopes(contracts, abi_resolver).await?;
+    let (scopes, prep_failures) = prepare_scopes(contracts, abi_resolver).await?;
     if scopes.is_empty() {
         return Ok(SyncReport {
             total_events: 0,
             covered: vec![],
-            incomplete: vec![],
+            incomplete: prep_failures,
         });
     }
 
     let ranges: Vec<(u64, u64)> = scopes.iter().map(|scope| (scope.from, scope.to)).collect();
     let selection = source.block_facts_for_ranges(&ranges);
-    run_prepared_scopes(scopes, &selection, sink, reporter).await
+    let mut report = run_prepared_scopes(scopes, &selection, sink, reporter).await?;
+    report.incomplete.extend(prep_failures);
+    Ok(report)
 }
 
 /// Run the indexing pipeline over an already-selected Block fact stream.
@@ -424,32 +429,40 @@ pub async fn run_scopes_over_blocks(
     sink: &dyn PipelineSink,
     reporter: &dyn ProgressReporter,
 ) -> Result<SyncReport, CoreError> {
-    let scopes = prepare_scopes(contracts, abi_resolver).await?;
+    let (scopes, prep_failures) = prepare_scopes(contracts, abi_resolver).await?;
     if scopes.is_empty() {
         return Ok(SyncReport {
             total_events: 0,
             covered: vec![],
-            incomplete: vec![],
+            incomplete: prep_failures,
         });
     }
-    run_prepared_scopes(scopes, blocks, sink, reporter).await
+    let mut report = run_prepared_scopes(scopes, blocks, sink, reporter).await?;
+    report.incomplete.extend(prep_failures);
+    Ok(report)
 }
 
 async fn prepare_scopes(
     contracts: &[ContractConfig],
     abi_resolver: &AbiResolver,
-) -> Result<Vec<PreparedScope>, CoreError> {
+) -> Result<(Vec<PreparedScope>, Vec<(String, IncompleteReason)>), CoreError> {
     let mut scopes = Vec::new();
+    let mut failed: Vec<(String, IncompleteReason)> = Vec::new();
     for contract in contracts {
         match PreparedScope::new(contract, abi_resolver).await {
             Ok(scope) => scopes.push(scope),
             Err(err) if contracts.len() == 1 => return Err(err),
             Err(err) => {
-                warn!(contract = %contract.address, err = %err, "Skipping scope preparation failure")
+                let label = contract
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| contract.address.to_checksum(None));
+                warn!(contract = %contract.address, err = %err, "Skipping scope preparation failure");
+                failed.push((label, IncompleteReason::PreparationFailed));
             }
         }
     }
-    Ok(scopes)
+    Ok((scopes, failed))
 }
 
 async fn run_prepared_scopes(

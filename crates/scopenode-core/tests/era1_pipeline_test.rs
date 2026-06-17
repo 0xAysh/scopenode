@@ -19,6 +19,7 @@ use scopenode_core::{
     source::{Era1Source, SourceError},
     types::ScopeHeader,
 };
+use std::collections::HashMap;
 use scopenode_storage::{Db, DbAbiStore, DbEventSink};
 use std::io::Write;
 use std::path::PathBuf;
@@ -81,6 +82,20 @@ impl CoverageSink for FailingCoverageSink {
         Err(CoreError::Storage(
             "synthetic coverage write failure".to_string(),
         ))
+    }
+}
+
+/// ABI store stub with per-address entries — used in tests that need different
+/// ABIs for different contracts in the same pipeline run.
+struct MapAbiStore(HashMap<String, String>);
+
+#[async_trait]
+impl AbiStore for MapAbiStore {
+    async fn load(&self, address: &str) -> Result<Option<String>, AbiError> {
+        Ok(self.0.get(address).cloned())
+    }
+    async fn save(&self, _: &str, _: Option<&str>, _: &str) -> Result<(), AbiError> {
+        Ok(())
     }
 }
 
@@ -1048,4 +1063,66 @@ async fn era1_pipeline_indexes_multiple_contracts_in_one_scope_pass() {
     let _ = std::fs::remove_file(&db_path);
     let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
     let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+}
+
+#[tokio::test]
+async fn era1_pipeline_scope_preparation_failure_reported_in_incomplete() {
+    // Contract A: stale ABI (no "type":"event") + no fetcher → AbiRequired → prep failure.
+    // Contract B: canonical ABI → prep succeeds.
+    // Expected: report.incomplete contains Contract A with PreparationFailed.
+    let addr_a = address!("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    let addr_b = address!("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB");
+
+    let stale_abi = r#"[{"name":"Transfer","inputs":[]}]"#;
+    let canonical_abi = r#"[{"type":"event","name":"Transfer","inputs":[]}]"#;
+
+    let mut map = HashMap::new();
+    map.insert(addr_a.to_checksum(None), stale_abi.to_string());
+    map.insert(addr_b.to_checksum(None), canonical_abi.to_string());
+
+    let store = Arc::new(MapAbiStore(map));
+    let abi_resolver = AbiResolver::new(store, None);
+
+    let contracts = vec![
+        ContractConfig {
+            name: Some("ContractA".to_string()),
+            address: addr_a,
+            events: vec!["Transfer".to_string()],
+            from_block: 1,
+            to_block: Some(10),
+            abi_override: None,
+            impl_address: None,
+        },
+        ContractConfig {
+            name: Some("ContractB".to_string()),
+            address: addr_b,
+            events: vec!["Transfer".to_string()],
+            from_block: 1,
+            to_block: Some(10),
+            abi_override: None,
+            impl_address: None,
+        },
+    ];
+
+    let blocks = StaticBlockFacts {
+        total: 0,
+        items: std::sync::Mutex::new(vec![]),
+    };
+    let sink = InMemoryEventSink::default();
+
+    let report = run_scopes_over_blocks(&blocks, &contracts, &abi_resolver, &sink, &NullReporter)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        report.covered,
+        vec![addr_b.to_checksum(None)],
+        "ContractB should be covered"
+    );
+    assert_eq!(report.incomplete.len(), 1, "ContractA should appear in incomplete");
+    assert_eq!(report.incomplete[0].0, "ContractA");
+    assert!(
+        matches!(report.incomplete[0].1, IncompleteReason::PreparationFailed),
+        "reason should be PreparationFailed"
+    );
 }
