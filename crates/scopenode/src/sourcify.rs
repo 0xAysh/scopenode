@@ -110,6 +110,7 @@ mod tests {
 
     fn test_client(timeout_ms: u64) -> reqwest::Client {
         reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_millis(timeout_ms))
             .timeout(std::time::Duration::from_millis(timeout_ms))
             .build()
             .unwrap()
@@ -168,7 +169,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn both_404_returns_actionable_error_mentioning_abi_override() {
+    async fn both_404_returns_actionable_error_mentioning_abi_override_and_address() {
         let server = MockServer::start().await;
         let addr_str = TEST_ADDR.to_checksum(None);
 
@@ -186,10 +187,51 @@ mod tests {
 
         let fetcher = SourcifyClient::new_with_base_url(test_client(10_000), server.uri());
         let err = fetcher.fetch(TEST_ADDR).await.unwrap_err();
+        let msg = err.to_string();
 
         assert!(
-            err.to_string().contains("abi_override"),
-            "double-404 error must mention abi_override, got: {err}"
+            msg.contains("abi_override"),
+            "double-404 error must mention abi_override, got: {msg}"
+        );
+        assert!(
+            msg.to_lowercase().contains(&addr_str.to_lowercase()),
+            "double-404 error must include contract address, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hung_connection_times_out_with_actionable_error() {
+        // Simulates a server that accepts the TCP connection but never sends an
+        // HTTP response — the scenario that caused indefinite hangs before
+        // connect_timeout was added to the production client.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let _ = listener.accept().await;
+                // Accept TCP, never send data.
+            }
+        });
+
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_millis(50))
+            .timeout(std::time::Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let fetcher =
+            SourcifyClient::new_with_base_url(client, format!("http://127.0.0.1:{}", port));
+
+        let err = fetcher.fetch(TEST_ADDR).await.unwrap_err();
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("abi_override"),
+            "hung-connection error must mention abi_override, got: {msg}"
+        );
+        assert!(
+            msg.to_lowercase()
+                .contains(&TEST_ADDR.to_checksum(None).to_lowercase()),
+            "hung-connection error must include contract address, got: {msg}"
         );
     }
 

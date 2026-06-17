@@ -92,7 +92,8 @@ pub async fn run(config: Config, db: Db, dry_run: bool, quiet: bool) -> Result<(
     let reporter = IndicatifReporter(pb);
 
     let http_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(15))
         .build()
         .context("Failed to build HTTP client")?;
     let sourcify = Arc::new(SourcifyClient::new(http_client));
