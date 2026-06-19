@@ -30,11 +30,8 @@ dirs              = "6"
 jsonrpsee         = { version = "0.26", features = ["server", "macros"] }
 axum              = { version = "0.7", features = ["tokio"] }
 tower-http        = { version = "0.5", features = ["cors"] }
-futures-core      = "0.3"
 wiremock          = "0.6"
-futures           = "0.3"
 tempfile          = "3"
-hex               = "0.4"
 sha2              = "0.10"
 snap              = "1"
 scopenode-core    = { path = "crates/scopenode-core" }

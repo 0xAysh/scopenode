@@ -7,7 +7,6 @@ edition = "2021"
 sqlx             = { workspace = true }
 tokio            = { workspace = true }
 thiserror        = { workspace = true }
-serde            = { workspace = true }
 serde_json       = { workspace = true }
 tracing          = { workspace = true }
 alloy-primitives = { workspace = true }
@@ -15,5 +14,4 @@ async-trait      = { workspace = true }
 scopenode-core   = { workspace = true }
 
 [dev-dependencies]
-tempfile     = "3"
-futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+tempfile = "3"

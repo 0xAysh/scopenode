@@ -6,7 +6,6 @@ edition = "2021"
 [dependencies]
 jsonrpsee        = { workspace = true }
 tokio            = { workspace = true }
-thiserror        = { workspace = true }
 serde            = { workspace = true }
 serde_json       = { workspace = true }
 tracing          = { workspace = true }
@@ -14,11 +13,9 @@ alloy            = { workspace = true }
 alloy-primitives = { workspace = true }
 async-trait      = { workspace = true }
 scopenode-storage = { workspace = true }
-scopenode-core    = { workspace = true }
 anyhow            = { workspace = true }
 axum              = { workspace = true }
 tower-http        = { workspace = true }
-hex               = { workspace = true }
 
 [dev-dependencies]
 tower    = { version = "0.5", features = ["util"] }
