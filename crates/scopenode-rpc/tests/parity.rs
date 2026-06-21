@@ -522,3 +522,94 @@ async fn rpc_missing_address_error_does_not_mention_sync() {
 
     cleanup(&path);
 }
+
+// ── REST /events query param binding (camelCase + snake_case + unknown) ───────
+
+async fn get_raw(db: &Db, uri: &str) -> (axum::http::StatusCode, String) {
+    let router = build_rest_router(db.clone());
+    let request = axum::http::Request::builder()
+        .uri(uri)
+        .body(Body::empty())
+        .unwrap();
+    let response = ServiceExt::<axum::http::Request<Body>>::oneshot(router, request)
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, String::from_utf8_lossy(&bytes).to_string())
+}
+
+/// Seed three rows (blocks 100, 101, 102) and record full coverage so a block
+/// range filter resolves to real results rather than a coverage error.
+async fn seed_with_coverage(db: &Db) {
+    seed(db).await;
+    db.record_covered_range(ADDR_STR, 100, 102).await.unwrap();
+}
+
+#[tokio::test]
+async fn rest_camel_case_block_range_binds_and_filters() {
+    let (db, path) = open_test_db().await;
+    seed_with_coverage(&db).await;
+
+    let (status, json) = get_json(
+        &db,
+        &format!("/events?contract={ADDR_STR}&fromBlock=101&toBlock=102"),
+    )
+    .await;
+
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(
+        json["events"].as_array().unwrap().len(),
+        2,
+        "camelCase fromBlock/toBlock must filter to blocks 101..=102 (2 of 3 rows)"
+    );
+
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn rest_snake_case_block_range_binds_and_filters() {
+    let (db, path) = open_test_db().await;
+    seed_with_coverage(&db).await;
+
+    let (status, json) = get_json(
+        &db,
+        &format!("/events?contract={ADDR_STR}&from_block=101&to_block=102"),
+    )
+    .await;
+
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(
+        json["events"].as_array().unwrap().len(),
+        2,
+        "snake_case from_block/to_block must filter just like camelCase, not be silently dropped"
+    );
+
+    cleanup(&path);
+}
+
+#[tokio::test]
+async fn rest_unknown_query_param_returns_400_naming_the_param() {
+    let (db, path) = open_test_db().await;
+    seed_with_coverage(&db).await;
+
+    let (status, body) = get_raw(
+        &db,
+        &format!("/events?contract={ADDR_STR}&fromBlk=99999999"),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        axum::http::StatusCode::BAD_REQUEST,
+        "an unknown/misspelled query param must be rejected, not silently ignored"
+    );
+    assert!(
+        body.contains("fromBlk"),
+        "the 400 body must name the offending parameter, got: {body}"
+    );
+
+    cleanup(&path);
+}

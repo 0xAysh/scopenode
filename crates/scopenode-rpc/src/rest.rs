@@ -7,8 +7,8 @@
 //!       ?contract=0x...   — filter by contract address
 //!       &event=Swap       — filter by event name
 //!       &topic0=0xddf252… — filter by raw topic0 hash
-//!       &fromBlock=N      — inclusive lower bound
-//!       &toBlock=N        — inclusive upper bound
+//!       &fromBlock=N      — inclusive lower bound (alias: from_block)
+//!       &toBlock=N        — inclusive upper bound (alias: to_block)
 //!       &limit=100        — max rows (default 100, hard cap 10_000)
 //!       &offset=0         — pagination offset
 //!
@@ -16,6 +16,9 @@
 //! GET /contracts         — indexed contracts with per-contract event counts
 //! GET /abi/:address      — raw ABI JSON for a contract
 //! ```
+//!
+//! Block-range bounds accept both camelCase and snake_case. Unknown query
+//! parameters are rejected with `HTTP 400` rather than silently ignored.
 //!
 //! # Malformed stored rows
 //!
@@ -49,13 +52,16 @@ struct AppState {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct EventsQuery {
     contract: Option<String>,
     event: Option<String>,
     topic0: Option<String>,
-    #[serde(rename = "fromBlock")]
+    // Block-range bounds accept both camelCase (the documented form) and
+    // snake_case (the natural guess). Either casing binds; neither is dropped.
+    #[serde(alias = "fromBlock")]
     from_block: Option<u64>,
-    #[serde(rename = "toBlock")]
+    #[serde(alias = "toBlock")]
     to_block: Option<u64>,
     limit: Option<usize>,
     offset: Option<u64>,
