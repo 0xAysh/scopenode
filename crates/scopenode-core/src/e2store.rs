@@ -104,6 +104,17 @@ const ERE_TRAVERSAL: TraversalFormat = TraversalFormat {
     has_difficulty: false,
 };
 
+/// True when the archive at `path` uses the ERE/eraE slim-receipt layout, as
+/// opposed to the ERA1 full-receipt layout. Both `.ere` and `.erae` share the
+/// slim receipts (`0x0a`) and dynamic block index (`0x67 0x32`); only the file
+/// extension distinguishes them from legacy `.era1` archives.
+pub(crate) fn is_slim_receipt_format(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some("ere") | Some("erae")
+    )
+}
+
 /// A sequential iterator over every [`Era1BlockTuple`] in an archive file.
 ///
 /// Reads the file in a single O(N) pass with pending-slot queues: a block
@@ -235,7 +246,7 @@ pub(crate) fn iter_era1_block_tuples(
     path: impl AsRef<Path>,
 ) -> Result<BlockTupleIter, SourceError> {
     let path = path.as_ref();
-    let format = if path.extension().and_then(|ext| ext.to_str()) == Some("ere") {
+    let format = if is_slim_receipt_format(path) {
         &ERE_TRAVERSAL
     } else {
         &ERA1_TRAVERSAL
@@ -483,4 +494,22 @@ fn parse_dynamic_block_index_entry(
         to_block,
         completeness: RangeCompleteness::FileIndex,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slim_format_detected_for_ere_and_erae() {
+        assert!(is_slim_receipt_format(Path::new("mainnet-00012-4bb7de2e.ere")));
+        assert!(is_slim_receipt_format(Path::new("mainnet-00000-5ec1ffb8.erae")));
+    }
+
+    #[test]
+    fn slim_format_not_detected_for_era1() {
+        assert!(!is_slim_receipt_format(Path::new(
+            "mainnet-00000-5ec1ffb8.era1"
+        )));
+    }
 }

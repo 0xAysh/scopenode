@@ -45,7 +45,7 @@ pub fn iter_era1_block_facts(
     path: impl AsRef<Path>,
 ) -> Result<impl Iterator<Item = Result<Era1BlockFacts, SourceError>>, SourceError> {
     let path = path.as_ref();
-    let layout = if path.extension().and_then(|ext| ext.to_str()) == Some("ere") {
+    let layout = if crate::e2store::is_slim_receipt_format(path) {
         ReceiptLayout::EreSlim
     } else {
         ReceiptLayout::Era1Full

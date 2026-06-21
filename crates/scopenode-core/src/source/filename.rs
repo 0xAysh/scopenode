@@ -18,13 +18,16 @@ pub(super) fn parse_era1_filename(
     network_override: Option<&str>,
 ) -> Option<Era1FileName> {
     let extension = path.extension().and_then(|ext| ext.to_str())?;
-    if extension != "era1" && extension != "ere" {
+    // ERE and eraE share the slim-receipt layout and the same filename grammar:
+    // `network-epoch-hash[-profile…]`. ERA1 is the fixed three-part legacy form.
+    let is_slim = extension == "ere" || extension == "erae";
+    if extension != "era1" && !is_slim {
         return None;
     }
 
     let stem = path.file_stem()?.to_str()?;
     let parts = stem.split('-').collect::<Vec<_>>();
-    if (extension == "era1" && parts.len() != 3) || (extension == "ere" && parts.len() < 3) {
+    if (extension == "era1" && parts.len() != 3) || (is_slim && parts.len() < 3) {
         return None;
     }
 
@@ -34,7 +37,7 @@ pub(super) fn parse_era1_filename(
     if file_hash.len() != 8 || !file_hash.chars().all(|c| c.is_ascii_hexdigit()) {
         return None;
     }
-    if extension == "ere"
+    if is_slim
         && !parts[3..]
             .iter()
             .all(|profile| !profile.is_empty() && profile.chars().all(|c| c.is_ascii_lowercase()))
@@ -79,6 +82,38 @@ mod tests {
         assert_eq!(parsed.file_hash, "4bb7de2e");
         assert_eq!(parsed.from_block, 98_304);
         assert_eq!(parsed.to_block, 106_495);
+    }
+
+    #[test]
+    fn parses_erae_filename_without_profile() {
+        let parsed = parse_era1_filename(Path::new("mainnet-00000-5ec1ffb8.erae"), None).unwrap();
+
+        assert_eq!(parsed.format, "erae");
+        assert_eq!(parsed.network, "mainnet");
+        assert_eq!(parsed.epoch, 0);
+        assert_eq!(parsed.file_hash, "5ec1ffb8");
+        assert_eq!(parsed.from_block, 0);
+        assert_eq!(parsed.to_block, 8191);
+    }
+
+    #[test]
+    fn parses_erae_filename_with_profile() {
+        let parsed =
+            parse_era1_filename(Path::new("mainnet-00012-4bb7de2e-noproofs.erae"), None).unwrap();
+
+        assert_eq!(parsed.format, "erae");
+        assert_eq!(parsed.network, "mainnet");
+        assert_eq!(parsed.epoch, 12);
+        assert_eq!(parsed.file_hash, "4bb7de2e");
+        assert_eq!(parsed.from_block, 98_304);
+        assert_eq!(parsed.to_block, 106_495);
+    }
+
+    #[test]
+    fn rejects_erae_filename_with_invalid_profile_characters() {
+        assert!(
+            parse_era1_filename(Path::new("mainnet-00012-4bb7de2e-NoProofs.erae"), None).is_none()
+        );
     }
 
     #[test]
