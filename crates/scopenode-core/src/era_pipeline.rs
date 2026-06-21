@@ -298,6 +298,11 @@ impl BlockPipeline {
 }
 
 /// Why a Contract scope did not earn Coverage in a run.
+///
+/// [`Self::NoSourceData`] means the blocks have no backing archive file at all
+/// (empty `era_dir`, missing epoch, or a range past the available files) and is
+/// kept distinct from the "present but unusable" reasons
+/// ([`Self::VerifyFailure`], [`Self::DecodeFailure`], [`Self::SourceFailure`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IncompleteReason {
     /// ABI resolution or scope setup failed before the pipeline could run.
@@ -312,18 +317,25 @@ pub enum IncompleteReason {
     StoreFailure,
     /// Coverage itself could not be persisted.
     CoverageWriteFailed,
+    /// Part (or all) of the requested range had no backing archive file, so it
+    /// was never read. Carries the missing block sub-range.
+    NoSourceData { from_block: u64, to_block: u64 },
 }
 
 impl IncompleteReason {
     /// Human-readable cause for operator-facing output.
-    pub fn describe(&self) -> &'static str {
+    pub fn describe(&self) -> String {
         match self {
-            Self::PreparationFailed => "ABI resolution failure",
-            Self::SourceFailure => "archive source read failure",
-            Self::VerifyFailure => "receipt verification failure",
-            Self::DecodeFailure => "event decode failure",
-            Self::StoreFailure => "event storage failure",
-            Self::CoverageWriteFailed => "coverage record failure",
+            Self::PreparationFailed => "ABI resolution failure".to_string(),
+            Self::SourceFailure => "archive source read failure".to_string(),
+            Self::VerifyFailure => "receipt verification failure".to_string(),
+            Self::DecodeFailure => "event decode failure".to_string(),
+            Self::StoreFailure => "event storage failure".to_string(),
+            Self::CoverageWriteFailed => "coverage record failure".to_string(),
+            Self::NoSourceData {
+                from_block,
+                to_block,
+            } => format!("no backing source data for blocks {from_block}-{to_block}"),
         }
     }
 }
@@ -465,6 +477,34 @@ async fn prepare_scopes(
     Ok((scopes, failed))
 }
 
+/// Extend the trailing interval with `block`, or open a new one. Assumes blocks
+/// arrive in non-descending order (the archive stream's natural order); a block
+/// adjacent to or inside the last interval coalesces, otherwise it starts a gap.
+fn push_present_block(intervals: &mut Vec<(u64, u64)>, block: u64) {
+    match intervals.last_mut() {
+        Some((_, end)) if block == *end + 1 => *end = block,
+        Some((_, end)) if block <= *end => {} // already covered (duplicate)
+        _ => intervals.push((block, block)),
+    }
+}
+
+/// Sub-ranges of `[from, to]` not covered by `present` (which is ascending,
+/// non-overlapping, and contained in `[from, to]`).
+fn missing_subranges(from: u64, to: u64, present: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let mut gaps = Vec::new();
+    let mut cursor = from;
+    for &(start, end) in present {
+        if start > cursor {
+            gaps.push((cursor, start - 1));
+        }
+        cursor = cursor.max(end.saturating_add(1));
+    }
+    if cursor <= to {
+        gaps.push((cursor, to));
+    }
+    gaps
+}
+
 async fn run_prepared_scopes(
     scopes: Vec<PreparedScope>,
     blocks: &dyn BlockFactStream,
@@ -482,6 +522,11 @@ async fn run_prepared_scopes(
     // and are therefore ineligible for Coverage this run. The first failure
     // reason per scope is kept for the run report.
     let mut scope_ineligible: Vec<Option<IncompleteReason>> = vec![None; pipeline.scopes.len()];
+    // Per scope, the contiguous block sub-ranges actually present in the source
+    // and read this run. Coverage is recorded only for these — never for blocks
+    // that no archive file backed. Blocks arrive in ascending order, so each new
+    // in-range block either extends the last interval or opens a new one.
+    let mut scope_present: Vec<Vec<(u64, u64)>> = vec![Vec::new(); pipeline.scopes.len()];
 
     for item in blocks.blocks() {
         let facts = match item {
@@ -503,9 +548,13 @@ async fn run_prepared_scopes(
             BlockOutcome::DecodeFailed(events) => (events, Some(IncompleteReason::DecodeFailure)),
         };
 
-        if let Some(reason) = block_failure {
-            for (idx, scope) in pipeline.scopes.iter().enumerate() {
-                if scope.contains_block(block_number) && scope_ineligible[idx].is_none() {
+        for (idx, scope) in pipeline.scopes.iter().enumerate() {
+            if !scope.contains_block(block_number) {
+                continue;
+            }
+            push_present_block(&mut scope_present[idx], block_number);
+            if let Some(reason) = block_failure {
+                if scope_ineligible[idx].is_none() {
                     scope_ineligible[idx] = Some(reason);
                 }
             }
@@ -533,21 +582,42 @@ async fn run_prepared_scopes(
     let mut covered = Vec::new();
     let mut incomplete = Vec::new();
     for (idx, scope) in pipeline.scopes.iter().enumerate() {
+        // "Present but unusable" failures (verify/decode/source/store) take
+        // precedence over the "no source data" verdict and withhold all coverage.
         if let Some(reason) = scope_ineligible[idx].or(run_failure) {
             warn!(contract = %scope.contract, reason = reason.describe(), "Skipping Coverage record — scope run incomplete");
             incomplete.push((scope.contract.clone(), reason));
             continue;
         }
-        match sink
-            .record_coverage(&scope.contract, scope.from, scope.to)
-            .await
-        {
-            Ok(()) => covered.push(scope.contract.clone()),
-            Err(e) => {
+
+        // Record coverage only for the sub-ranges actually read this run.
+        let present = &scope_present[idx];
+        let mut write_failed = false;
+        for &(from, to) in present {
+            if let Err(e) = sink.record_coverage(&scope.contract, from, to).await {
                 warn!(contract = %scope.contract, err = %e, "Coverage record failed");
+                incomplete.push((scope.contract.clone(), IncompleteReason::CoverageWriteFailed));
+                write_failed = true;
+                break;
+            }
+        }
+        if write_failed {
+            continue;
+        }
+
+        // Any portion of the requested range with no backing source is reported
+        // as incomplete so `sync` exits non-zero and the operator backfills it.
+        let missing = missing_subranges(scope.from, scope.to, present);
+        match missing.first() {
+            None => covered.push(scope.contract.clone()),
+            Some(&(from_block, to_block)) => {
+                warn!(contract = %scope.contract, from_block, to_block, "No source data for sub-range — scope incomplete");
                 incomplete.push((
                     scope.contract.clone(),
-                    IncompleteReason::CoverageWriteFailed,
+                    IncompleteReason::NoSourceData {
+                        from_block,
+                        to_block,
+                    },
                 ));
             }
         }
@@ -615,6 +685,51 @@ mod tests {
             receipts: vec![],
             tx_hashes: vec![],
         }
+    }
+
+    #[test]
+    fn push_present_block_coalesces_adjacent_and_opens_gaps() {
+        let mut intervals = Vec::new();
+        for b in [100, 101, 102] {
+            push_present_block(&mut intervals, b);
+        }
+        // A gap (skip 103, 104) opens a new interval.
+        push_present_block(&mut intervals, 105);
+        push_present_block(&mut intervals, 106);
+        // A duplicate inside the last interval is ignored.
+        push_present_block(&mut intervals, 106);
+        assert_eq!(intervals, vec![(100, 102), (105, 106)]);
+    }
+
+    #[test]
+    fn missing_subranges_full_coverage_has_no_gaps() {
+        assert!(missing_subranges(100, 110, &[(100, 110)]).is_empty());
+    }
+
+    #[test]
+    fn missing_subranges_empty_present_is_whole_range() {
+        assert_eq!(missing_subranges(100, 110, &[]), vec![(100, 110)]);
+    }
+
+    #[test]
+    fn missing_subranges_partial_prefix_reports_tail_gap() {
+        assert_eq!(missing_subranges(100, 110, &[(100, 105)]), vec![(106, 110)]);
+    }
+
+    #[test]
+    fn missing_subranges_interior_gap_between_two_present_ranges() {
+        assert_eq!(
+            missing_subranges(100, 200, &[(100, 120), (160, 200)]),
+            vec![(121, 159)]
+        );
+    }
+
+    #[test]
+    fn missing_subranges_leading_and_trailing_gaps() {
+        assert_eq!(
+            missing_subranges(100, 200, &[(120, 150)]),
+            vec![(100, 119), (151, 200)]
+        );
     }
 
     #[test]

@@ -181,6 +181,191 @@ async fn pipeline_records_coverage_over_in_memory_block_fact_stream() {
     assert_eq!(sink.covered_ranges().await, vec![(addr_str, 100, 100)]);
 }
 
+/// Config with a custom block range, for coverage-correctness tests that need
+/// a range wider than a single block.
+fn test_config_range(contract_address: Address, from_block: u64, to_block: u64) -> Config {
+    Config {
+        node: NodeConfig {
+            port: 18545,
+            rest_port: 8546,
+            data_dir: None,
+            era_dir: PathBuf::from("/tmp/era1"),
+        },
+        contracts: vec![ContractConfig {
+            name: Some("USDT".into()),
+            address: contract_address,
+            events: vec!["Transfer".into()],
+            from_block,
+            to_block: Some(to_block),
+            abi_override: None,
+            impl_address: None,
+        }],
+    }
+}
+
+fn block_stream(blocks: std::ops::RangeInclusive<u64>) -> StaticBlockFacts {
+    let items: Vec<_> = blocks.clone().map(|n| Ok(eventless_block_facts(n))).collect();
+    StaticBlockFacts {
+        total: (blocks.end() - blocks.start() + 1),
+        items: std::sync::Mutex::new(items),
+    }
+}
+
+#[tokio::test]
+async fn pipeline_zero_blocks_present_reports_no_source_data_without_coverage() {
+    let contract = address!("dAC17F958D2ee523a2206206994597C13D831ec7");
+    let addr_str = contract.to_checksum(None);
+
+    // Requested range [100, 110], but the source streams no blocks at all
+    // (empty era_dir / missing epoch). Coverage must NOT be recorded.
+    let stream = StaticBlockFacts {
+        total: 0,
+        items: std::sync::Mutex::new(vec![]),
+    };
+    let config = test_config_range(contract, 100, 110);
+    let abi_resolver = AbiResolver::new(Arc::new(StaticAbiStore(transfer_abi_json())), None);
+    let sink = InMemoryEventSink::default();
+
+    let report = run_scopes_over_blocks(
+        &stream,
+        &config.contracts,
+        &abi_resolver,
+        &sink,
+        &NullReporter,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        !report.is_complete(),
+        "a scope with no backing source data must not report complete"
+    );
+    assert!(report.covered.is_empty());
+    assert_eq!(
+        report.incomplete,
+        vec![(
+            addr_str,
+            IncompleteReason::NoSourceData {
+                from_block: 100,
+                to_block: 110,
+            }
+        )]
+    );
+    assert!(
+        sink.covered_ranges().await.is_empty(),
+        "no coverage row may be written for blocks that were never read"
+    );
+}
+
+#[tokio::test]
+async fn pipeline_partial_overlap_covers_verified_subrange_and_reports_gap() {
+    let contract = address!("dAC17F958D2ee523a2206206994597C13D831ec7");
+    let addr_str = contract.to_checksum(None);
+
+    // Requested [100, 110]; the source only has [100, 105].
+    let stream = block_stream(100..=105);
+    let config = test_config_range(contract, 100, 110);
+    let abi_resolver = AbiResolver::new(Arc::new(StaticAbiStore(transfer_abi_json())), None);
+    let sink = InMemoryEventSink::default();
+
+    let report = run_scopes_over_blocks(
+        &stream,
+        &config.contracts,
+        &abi_resolver,
+        &sink,
+        &NullReporter,
+    )
+    .await
+    .unwrap();
+
+    assert!(!report.is_complete(), "a partially-sourced scope is incomplete");
+    assert!(report.covered.is_empty());
+    assert_eq!(
+        report.incomplete,
+        vec![(
+            addr_str.clone(),
+            IncompleteReason::NoSourceData {
+                from_block: 106,
+                to_block: 110,
+            }
+        )],
+        "the gap [106, 110] must be reported as the missing sub-range"
+    );
+    assert_eq!(
+        sink.covered_ranges().await,
+        vec![(addr_str, 100, 105)],
+        "only the verified sub-range [100, 105] earns coverage"
+    );
+}
+
+#[tokio::test]
+async fn pipeline_full_overlap_records_full_coverage() {
+    let contract = address!("dAC17F958D2ee523a2206206994597C13D831ec7");
+    let addr_str = contract.to_checksum(None);
+
+    let stream = block_stream(100..=110);
+    let config = test_config_range(contract, 100, 110);
+    let abi_resolver = AbiResolver::new(Arc::new(StaticAbiStore(transfer_abi_json())), None);
+    let sink = InMemoryEventSink::default();
+
+    let report = run_scopes_over_blocks(
+        &stream,
+        &config.contracts,
+        &abi_resolver,
+        &sink,
+        &NullReporter,
+    )
+    .await
+    .unwrap();
+
+    assert!(report.is_complete());
+    assert_eq!(report.covered, vec![addr_str.clone()]);
+    assert_eq!(sink.covered_ranges().await, vec![(addr_str, 100, 110)]);
+}
+
+#[tokio::test]
+async fn pipeline_rerun_with_filled_gap_converges_to_full_coverage() {
+    let contract = address!("dAC17F958D2ee523a2206206994597C13D831ec7");
+    let addr_str = contract.to_checksum(None);
+
+    let config = test_config_range(contract, 100, 110);
+    let abi_resolver = AbiResolver::new(Arc::new(StaticAbiStore(transfer_abi_json())), None);
+    let sink = InMemoryEventSink::default();
+
+    // First run: only [100, 105] available → incomplete, partial coverage.
+    let first = run_scopes_over_blocks(
+        &block_stream(100..=105),
+        &config.contracts,
+        &abi_resolver,
+        &sink,
+        &NullReporter,
+    )
+    .await
+    .unwrap();
+    assert!(!first.is_complete());
+
+    // Second run after the missing epoch is added → the full range streams.
+    let second = run_scopes_over_blocks(
+        &block_stream(100..=110),
+        &config.contracts,
+        &abi_resolver,
+        &sink,
+        &NullReporter,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        second.is_complete(),
+        "a rerun with the gap filled must converge to complete coverage"
+    );
+    assert_eq!(second.covered, vec![addr_str.clone()]);
+    assert!(
+        sink.covered_ranges().await.contains(&(addr_str, 100, 110)),
+        "the rerun records a coverage row spanning the full requested range"
+    );
+}
+
 #[tokio::test]
 async fn pipeline_reports_source_failure_from_in_memory_block_fact_stream() {
     let contract = address!("dAC17F958D2ee523a2206206994597C13D831ec7");
@@ -1104,10 +1289,9 @@ async fn era1_pipeline_scope_preparation_failure_reported_in_incomplete() {
         },
     ];
 
-    let blocks = StaticBlockFacts {
-        total: 0,
-        items: std::sync::Mutex::new(vec![]),
-    };
+    // The full [1, 10] range is present in the source, so ContractB earns
+    // coverage and the only incompleteness is ContractA's preparation failure.
+    let blocks = block_stream(1..=10);
     let sink = InMemoryEventSink::default();
 
     let report = run_scopes_over_blocks(&blocks, &contracts, &abi_resolver, &sink, &NullReporter)
