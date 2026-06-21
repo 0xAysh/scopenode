@@ -7,7 +7,7 @@ JSON-RPC and REST.
 
 Current scope:
 
-- local `.era1` and `.ere` archive files;
+- local `.era1`, `.ere`, and `.erae` archive files;
 - Ethereum mainnet (`eth_chainId` returns `0x1`);
 - configured contracts, events, and finite block ranges;
 - decoded events rather than general Ethereum state;
@@ -24,7 +24,7 @@ config.toml
     └─ ABI resolution: SQLite cache → local file → Sourcify
                     │
                     ▼
-local .era1/.ere archives
+local .era1/.ere/.erae archives
     │
     ├─ select overlapping files once for the union range
     ├─ decode block headers, receipts, and transaction hashes
@@ -49,7 +49,7 @@ results when that range is not covered.
 Prerequisites:
 
 - a recent stable Rust toolchain;
-- local Ethereum execution-history archives in `.era1` or `.ere` format.
+- local Ethereum execution-history archives in `.era1`, `.ere`, or `.erae` format.
 
 ```bash
 git clone https://github.com/0xAysh/scopenode
